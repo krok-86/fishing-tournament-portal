@@ -1,0 +1,13 @@
+{
+  "name": "fishing-tournament-portal",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "front:dev": "npm run dev -w apps/front",
+    "back:dev": "npm run dev -w apps/back"
+  }
+}
