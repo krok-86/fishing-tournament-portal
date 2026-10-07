@@ -71,6 +71,8 @@ export interface TournamentOpenedEvent extends TournamentEventBase {
   payload: {
     rulesetId: RulesetId;
     name: string;
+    /** День проведения, ISO `YYYY-MM-DD`. Пусто у турниров, открытых до этого поля. */
+    date?: string;
     periodsPerRound: typeof QUALIFYING_PERIOD_COUNT;
     rounds: 2;
     /** Сколько секторов на водоёме зафиксировано при открытии. */
@@ -107,7 +109,7 @@ export type MatrixDuelBase = {
   sectorId: string;
 };
 
-/** Пара из загруженной матрицы. Слева — меньший номер. */
+/** Пара из загруженной матрицы. Слева — левый борт сектора. */
 export interface MatrixPair extends MatrixDuelBase {
   kind: "pair";
   leftSlotId: string;

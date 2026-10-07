@@ -87,7 +87,7 @@ export type MatrixDuelBase = {
     zoneId: ZoneId;
     sectorId: string;
 };
-/** Пара из загруженной матрицы. Слева — меньший номер. */
+/** Пара из загруженной матрицы. Слева — левый борт сектора. */
 export interface MatrixPair extends MatrixDuelBase {
     kind: "pair";
     leftSlotId: string;

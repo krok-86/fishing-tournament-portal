@@ -1,6 +1,7 @@
 import { previewPlayoffScore, scorePlayoffDuel } from "../../../../packages/shared/src/calculator.ts";
 import type { PlayoffBracketMatch, PlayoffStage } from "../../../../packages/shared/src/types.ts";
 import { useMatchStore } from "../store.ts";
+import { confirmAndToast } from "../toast.ts";
 
 export function playoffStageTitle(stage: PlayoffStage): string {
   if (stage === "quarterfinal") return "1/4 финала";
@@ -176,7 +177,7 @@ export function PlayoffEntryDialog() {
           type="button"
           className="mt-3 h-14 w-full rounded-2xl bg-amber-400 text-base font-black tracking-wide text-slate-950 disabled:bg-slate-700 disabled:text-slate-400"
           disabled={saving || confirmed}
-          onClick={() => void confirmPeriod()}
+          onClick={() => void confirmAndToast(confirmPeriod)}
         >
           {saving ? "Сохраняем..." : confirmed ? "Дуэль сохранена" : "Подтвердить поимки"}
         </button>

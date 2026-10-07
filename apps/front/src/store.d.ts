@@ -121,7 +121,7 @@ export declare function requiredSectorCount(participantCount: number): number;
 /** Имя фантома. Номер жеребьёвки в имени — тот же слот, не новый участник. */
 export declare function phantomName(bibNumber: number): string;
 /**
- * Период 1 полной сетки: пары по порядку номеров, меньший слева.
+ * Период 1 полной сетки. Борт чередуется по номеру, а не по тому, чей номер меньше.
  * Фантом место не освобождает: живой соперник остаётся один.
  */
 export declare function planPeriodOne(participants: readonly RegisteredParticipant[], sectorCount: number): MatrixDuel[];

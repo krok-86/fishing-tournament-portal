@@ -13,14 +13,11 @@ export declare function scorePlayoffDuel(fishA: FishCount, fishB: FishCount, pla
 export declare function calculateDuels(events: readonly TournamentEvent[]): DuelResult[];
 export declare function generateLeaderboard(events: readonly TournamentEvent[]): LeaderboardEntry[];
 /**
- * Матрица переходов кругом Бергера.
- * Порядок `participantIds` — порядок регистрации: номер 1, 2, 3…
- * Период 1: пары 1–2, 3–4, 5–6…
- * Дальше список крутится, один участник закреплён, остальные сдвигаются.
- * В первых турах пары не повторяются. Если периодов больше, чем уникальных туров,
- * круг начинается сначала — повторы только в хвосте.
- * Сектор пары: 1, 2, 3… и сдвигается каждый период. Меньший номер стоит слева.
- * Нечётный список получает пропуск: в этом периоде у спортсмена нет соперника.
+ * Сетка переходов.
+ * Нечётный номер меняет борт каждый период, начиная слева. Чётный — начиная справа.
+ * Сектор тоже меняется каждый период. Повтор пары при 9 участниках на 8 периодах
+ * бывает не больше одного раза и не в соседних турах.
+ * Нечётный список: один спортсмен периода сидит без соперника, его борт входит в баланс.
  */
 export declare function generateTournamentGrid(participantIds: string[], periodsCount: number): GridSlot[];
 export declare function readTransitionGrid(events: readonly TournamentEvent[]): GridSlot[];

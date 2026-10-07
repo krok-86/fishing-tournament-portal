@@ -1,15 +1,15 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { QRCodeSVG } from "qrcode.react";
-import type { MatrixDuel } from "../../../../packages/shared/src/types.ts";
+import type { GridSlot, PeriodIndex } from "../../../../packages/shared/src/types.ts";
 import { encodeStartSnapshot, periodStatusLabel, seatsFromGrid, type StartSnapshot } from "../qrSync.ts";
 import {
-  ghostSeatPartner,
-  loneNeighborSlotId,
-  planPeriodOne,
-  waitingParticipants,
+  scheduleGrid,
+  sectorsForPeriod,
   useMatchStore,
+  type PeriodSector,
   type RegisteredParticipant,
 } from "../store.ts";
+import { toast } from "../toast.ts";
 
 export function TournamentInit() {
   const participants = useMatchStore((state) => state.participants);
@@ -21,21 +21,29 @@ export function TournamentInit() {
   const registerParticipant = useMatchStore((state) => state.registerParticipant);
   const seedNumberedStart = useMatchStore((state) => state.seedNumberedStart);
   const replaceParticipant = useMatchStore((state) => state.replaceParticipant);
-  const setParticipantGhost = useMatchStore((state) => state.setParticipantGhost);
   const removeParticipant = useMatchStore((state) => state.removeParticipant);
   const clearParticipants = useMatchStore((state) => state.clearParticipants);
   const startTournament = useMatchStore((state) => state.startTournament);
   const resetTournament = useMatchStore((state) => state.resetTournament);
+  const tournamentName = useMatchStore((state) => state.tournamentName);
+  const tournamentDate = useMatchStore((state) => state.tournamentDate);
+  const grid = useMatchStore((state) => state.grid);
+  const periodsCount = useMatchStore((state) => state.periodsCount);
+  const previewGrid = useMemo(
+    () => scheduleGrid(participants, periodsCount),
+    [participants, periodsCount],
+  );
+  const drawGrid = tournamentOpened ? grid : previewGrid;
   const [draft, setDraft] = useState("");
   const [arrivalCount, setArrivalCount] = useState("");
+  const [name, setName] = useState("");
+  const [date, setDate] = useState(todayIso);
   const [opening, setOpening] = useState(false);
   const [seeding, setSeeding] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const seedLock = useRef(false);
 
-  const matrix = planPeriodOne(participants, sectorCount);
-  const waiting = waitingParticipants(participants, sectorCount);
   const locked = tournamentOpened || setupSaving;
   const parsedArrival = Number.parseInt(arrivalCount, 10);
   const arrivalReady = Number.isInteger(parsedArrival) && parsedArrival >= 2 && participants.length === 0;
@@ -45,7 +53,12 @@ export function TournamentInit() {
     const name = draft.trim();
     if (!name || locked) return;
     const saved = await registerParticipant(name);
-    if (saved) setDraft("");
+    if (saved) {
+      setDraft("");
+      toast("ok", `${name} добавлен`);
+    } else {
+      toast("err", useMatchStore.getState().setupError ?? "Не удалось добавить участника");
+    }
   }
 
   async function seedNumbers(event: FormEvent<HTMLFormElement>) {
@@ -58,13 +71,17 @@ export function TournamentInit() {
     try {
       if (!Number.isInteger(count) || count < 2) {
         await seedNumberedStart(Number.isFinite(count) ? count : 0);
+        toast("err", useMatchStore.getState().setupError ?? "Укажите число рыбаков от 2");
         return;
       }
       setSeeding(true);
       const saved = await seedNumberedStart(count);
       if (saved) {
         setArrivalCount("");
+        toast("ok", `Создано номеров: ${count}`);
         document.getElementById("starter-list")?.scrollIntoView({ block: "nearest" });
+      } else {
+        toast("err", useMatchStore.getState().setupError ?? "Не удалось создать номера");
       }
     } finally {
       seedLock.current = false;
@@ -79,17 +96,23 @@ export function TournamentInit() {
       return;
     }
     setConfirmClear(false);
-    await clearParticipants();
+    const cleared = await clearParticipants();
+    if (cleared) toast("ok", "Стартовый лист очищен");
+    else toast("err", useMatchStore.getState().setupError ?? "Не удалось очистить лист");
   }
 
   async function open() {
+    const trimmedName = name.trim();
     setOpening(true);
-    const started = await startTournament();
+    const started = await startTournament({ name: trimmedName, date });
     setOpening(false);
     if (started) {
+      toast("ok", `Турнир «${trimmedName}» открыт`);
       requestAnimationFrame(() => {
         document.getElementById("start-qr")?.scrollIntoView({ behavior: "smooth", block: "start" });
       });
+    } else {
+      toast("err", useMatchStore.getState().setupError ?? "Не удалось открыть турнир");
     }
   }
 
@@ -104,6 +127,11 @@ export function TournamentInit() {
     if (cleared) {
       setDraft("");
       setArrivalCount("");
+      setName("");
+      setDate(todayIso());
+      toast("ok", "Турнир сброшен");
+    } else {
+      toast("err", useMatchStore.getState().setupError ?? "Не удалось сбросить турнир");
     }
   }
 
@@ -121,13 +149,38 @@ export function TournamentInit() {
       <header>
         <h2 className="text-lg font-black tracking-tight sm:text-2xl">Настройка турнира</h2>
         <p className="mt-1 text-xs text-slate-400 sm:text-sm">
-          Номер ставится при создании, по одному или пачкой, и больше не меняется. «Заменить» пишет только фамилию, сетка Бергера остаётся на этом номере.
+          До открытия турнира номер — это место в списке. Удаление убирает строку и сдвигает номера: 1, 2, 3 без пропусков. «Заменить» меняет только имя.
         </p>
       </header>
 
+      <div className="rounded-3xl bg-slate-900 px-4 py-4">
+        <label className="text-sm font-bold tracking-wide text-cyan-100/80 uppercase" htmlFor="tournament-name">
+          Название турнира
+        </label>
+        <input
+          id="tournament-name"
+          className="mt-2 h-12 w-full rounded-xl border border-white/10 bg-slate-950 px-3 text-base text-white outline-none placeholder:text-slate-500 focus:border-cyan-300 disabled:opacity-50"
+          value={tournamentOpened ? tournamentName : name}
+          placeholder="Trout Cup"
+          disabled={locked}
+          onChange={(event) => setName(event.target.value)}
+        />
+        <label className="mt-4 block text-sm font-bold tracking-wide text-cyan-100/80 uppercase" htmlFor="tournament-date">
+          Дата проведения
+        </label>
+        <input
+          id="tournament-date"
+          className="scheme-dark mt-2 h-12 w-full rounded-xl border border-white/10 bg-slate-950 px-3 text-base text-white outline-none focus:border-cyan-300 disabled:opacity-50"
+          type="date"
+          value={tournamentOpened ? tournamentDate : date}
+          disabled={locked}
+          onChange={(event) => setDate(event.target.value)}
+        />
+      </div>
+
       {tournamentOpened && (
         <p className="rounded-2xl border border-emerald-300/30 bg-emerald-300/10 px-4 py-3 text-sm font-semibold text-emerald-200">
-          Турнир открыт. Сетка на 8 периодов записана. На вводе результатов выберите свой номер.
+          Турнир открыт. Сетка на {periodsCount} периодов записана. На вводе результатов выберите свой номер.
         </p>
       )}
 
@@ -216,7 +269,6 @@ export function TournamentInit() {
         tournamentOpened={tournamentOpened}
         setupSaving={setupSaving}
         onReplace={replaceParticipant}
-        onSetGhost={setParticipantGhost}
         onRemove={removeParticipant}
       />
 
@@ -224,12 +276,12 @@ export function TournamentInit() {
         Секторов на водоёме потребуется: <span className="tabular-nums text-cyan-200">{sectorCount}</span>
       </p>
 
-      <PeriodPlan participants={participants} sectorCount={sectorCount} matrix={matrix} waiting={waiting} />
+      <PeriodPlan participants={participants} grid={drawGrid} periodsCount={periodsCount} />
 
       <button
         type="button"
         className="h-16 rounded-2xl bg-amber-400 text-lg font-black tracking-wide text-slate-950 disabled:bg-slate-700 disabled:text-slate-400"
-        disabled={tournamentOpened || setupSaving || participants.length < 2}
+        disabled={tournamentOpened || setupSaving || participants.length < 2 || name.trim().length === 0 || date.length === 0}
         onClick={() => void open()}
       >
         {opening ? "Сохраняем..." : tournamentOpened ? "Турнир открыт" : "Открыть турнир"}
@@ -237,7 +289,11 @@ export function TournamentInit() {
       {tournamentOpened && <StartQrCard />}
       <button
         type="button"
-        className="h-12 rounded-2xl border border-rose-300/40 bg-rose-400/10 text-sm font-black text-rose-100 disabled:opacity-40"
+        className={`h-12 rounded-2xl text-sm font-black disabled:opacity-40 ${
+          confirmReset
+            ? "border border-rose-300/40 bg-rose-500 text-white"
+            : "bg-amber-400 text-slate-950 disabled:bg-slate-700 disabled:text-slate-400"
+        }`}
         disabled={setupSaving}
         onClick={() => void resetAll()}
       >
@@ -248,18 +304,30 @@ export function TournamentInit() {
   );
 }
 
+function todayIso(): string {
+  const now = new Date();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${now.getFullYear()}-${month}-${day}`;
+}
+
 function StartQrCard() {
   const participants = useMatchStore((state) => state.participants);
   const grid = useMatchStore((state) => state.grid);
+  const periodsCount = useMatchStore((state) => state.periodsCount);
   const sectorCount = useMatchStore((state) => state.sectorCount);
   const period = useMatchStore((state) => state.period);
   const phase = useMatchStore((state) => state.periodPhase);
+  const tournamentName = useMatchStore((state) => state.tournamentName);
+  const tournamentDate = useMatchStore((state) => state.tournamentDate);
   const snapshot = useMemo<StartSnapshot>(
     () => ({
-      periodsPerRound: 8,
+      periodsPerRound: periodsCount,
       sectorCount,
       period,
       phase,
+      tournamentName,
+      tournamentDate,
       participants: participants.map((participant) => ({
         bibNumber: participant.bibNumber,
         displayName: participant.displayName,
@@ -271,7 +339,7 @@ function StartQrCard() {
         new Map(participants.map((participant) => [participant.slotId, participant.bibNumber])),
       ),
     }),
-    [participants, grid, sectorCount, period, phase],
+    [participants, grid, periodsCount, sectorCount, period, phase, tournamentName, tournamentDate],
   );
   const plain = useMemo(() => JSON.stringify(snapshot), [snapshot]);
   const [packet, setPacket] = useState<{ key: string; payload: string } | null>(null);
@@ -288,7 +356,10 @@ function StartQrCard() {
         }
       })
       .catch(() => {
-        if (!cancelled) setError("Не удалось сжать сетку в QR");
+        if (!cancelled) {
+          setError("Не удалось сжать сетку в QR");
+          toast("err", "Не удалось сжать сетку в QR");
+        }
       });
     return () => {
       cancelled = true;
@@ -343,14 +414,12 @@ function ParticipantList({
   tournamentOpened,
   setupSaving,
   onReplace,
-  onSetGhost,
   onRemove,
 }: {
   participants: readonly RegisteredParticipant[];
   tournamentOpened: boolean;
   setupSaving: boolean;
   onReplace: (slotId: string, displayName: string) => Promise<boolean>;
-  onSetGhost: (slotId: string) => Promise<boolean>;
   onRemove: (slotId: string) => Promise<boolean>;
 }) {
   return (
@@ -358,7 +427,9 @@ function ParticipantList({
       <div className="flex items-baseline justify-between gap-3">
         <div>
           <h3 className="text-sm font-bold tracking-wide text-cyan-100/80 uppercase">Стартовый лист</h3>
-          <p className="mt-1 text-xs text-slate-400">Порядковый номер закреплён за строкой. Замена меняет только имя.</p>
+          <p className="mt-1 text-xs text-slate-400">
+            До старта удаление убирает строку и смыкает номера. Замена меняет только имя.
+          </p>
         </div>
         <p className="text-sm font-semibold text-slate-300">{participants.length}</p>
       </div>
@@ -373,7 +444,6 @@ function ParticipantList({
               tournamentOpened={tournamentOpened}
               setupSaving={setupSaving}
               onReplace={onReplace}
-              onSetGhost={onSetGhost}
               onRemove={onRemove}
             />
           ))}
@@ -388,14 +458,12 @@ function ParticipantRow({
   tournamentOpened,
   setupSaving,
   onReplace,
-  onSetGhost,
   onRemove,
 }: {
   participant: RegisteredParticipant;
   tournamentOpened: boolean;
   setupSaving: boolean;
   onReplace: (slotId: string, displayName: string) => Promise<boolean>;
-  onSetGhost: (slotId: string) => Promise<boolean>;
   onRemove: (slotId: string) => Promise<boolean>;
 }) {
   const [editing, setEditing] = useState(false);
@@ -409,21 +477,21 @@ function ParticipantRow({
     setSaving(true);
     const saved = await onReplace(participant.slotId, name);
     setSaving(false);
-    if (saved) setEditing(false);
-  }
-
-  async function markGhost() {
-    if (tournamentOpened || setupSaving || saving || participant.ghost) return;
-    setSaving(true);
-    await onSetGhost(participant.slotId);
-    setSaving(false);
+    if (saved) {
+      setEditing(false);
+      toast("ok", `№${participant.bibNumber}: имя сохранено`);
+    } else {
+      toast("err", useMatchStore.getState().setupError ?? "Не удалось сохранить имя");
+    }
   }
 
   async function remove() {
     if (tournamentOpened || setupSaving || saving) return;
     setSaving(true);
-    await onRemove(participant.slotId);
+    const saved = await onRemove(participant.slotId);
     setSaving(false);
+    if (saved) toast("ok", `№${participant.bibNumber} удалён`);
+    else toast("err", useMatchStore.getState().setupError ?? "Не удалось удалить участника");
   }
 
   return (
@@ -491,8 +559,8 @@ function ParticipantRow({
           <button
             type="button"
             className="h-10 rounded-xl border border-amber-300/40 bg-amber-300/10 text-xs font-bold text-amber-100 disabled:opacity-40"
-            disabled={tournamentOpened || setupSaving || saving || participant.ghost}
-            onClick={() => void markGhost()}
+            disabled
+            title="До открытия турнира пустой слот не ставится. Лишний номер удалите."
           >
             Не пришел
           </button>
@@ -512,43 +580,66 @@ function ParticipantRow({
 
 function PeriodPlan({
   participants,
-  sectorCount,
-  matrix,
-  waiting,
+  grid,
+  periodsCount,
 }: {
   participants: readonly RegisteredParticipant[];
-  sectorCount: number;
-  matrix: readonly MatrixDuel[];
-  waiting: readonly RegisteredParticipant[];
+  grid: readonly GridSlot[];
+  periodsCount: number;
 }) {
-  const byId = new Map(participants.map((participant) => [participant.slotId, participant]));
+  const periods = useMemo(() => periodTabs(periodsCount), [periodsCount]);
+  const [period, setPeriod] = useState<PeriodIndex>(1);
+  const active = periods.includes(period) ? period : (periods[0] ?? 1);
+  const sectors = useMemo(
+    () => sectorsForPeriod(grid, participants, active),
+    [grid, participants, active],
+  );
+  const byId = useMemo(
+    () => new Map(participants.map((participant) => [participant.slotId, participant])),
+    [participants],
+  );
+  const waiting = useMemo(() => unseated(participants, sectors), [participants, sectors]);
 
   return (
     <div className="rounded-3xl border border-white/10 bg-white/5 px-4 py-4">
-      <h3 className="text-sm font-bold tracking-wide text-cyan-100/80 uppercase">Период 1</h3>
-      {matrix.length === 0 ? (
+      <h3 className="text-sm font-bold tracking-wide text-cyan-100/80 uppercase">Жеребьёвка</h3>
+      <div className="mt-3 flex flex-wrap gap-1.5" role="tablist" aria-label="Периоды жеребьёвки">
+        {periods.map((item) => {
+          const selected = item === active;
+          return (
+            <button
+              key={item}
+              type="button"
+              role="tab"
+              aria-selected={selected}
+              className={`shrink-0 rounded-full px-3 py-1.5 text-xs font-black ${
+                selected ? "bg-cyan-300 text-slate-950" : "bg-slate-900 text-slate-300"
+              }`}
+              onClick={() => setPeriod(item)}
+            >
+              Период {item}
+            </button>
+          );
+        })}
+      </div>
+      {participants.length === 0 ? (
         <p className="mt-3 text-sm text-slate-400">Пары появятся, когда в листе будет хотя бы один участник.</p>
+      ) : sectors.length === 0 ? (
+        <p className="mt-3 text-sm text-slate-400">В периоде {active} нет рассадки.</p>
       ) : (
         <ul className="mt-3 grid gap-2">
-          {matrix.map((duel) => (
-            <li key={duel.sectorId} className="rounded-2xl bg-slate-900 px-3 py-3 text-sm">
-              <p className="font-black text-cyan-200">Сектор {duel.sectorId}</p>
-              {duel.kind === "pair" ? (
-                <p className="mt-1 text-slate-100">
-                  {labelOf(byId, duel.leftSlotId)} слева
-                  <span className="text-slate-500"> · </span>
-                  {labelOf(byId, duel.rightSlotId)} справа
-                </p>
-              ) : (
-                <LoneLine participants={participants} sectorCount={sectorCount} byId={byId} slotId={duel.loneSlotId} />
-              )}
+          {sectors.map((sector) => (
+            <li key={sector.sectorId} className="rounded-2xl bg-slate-900 px-3 py-3 text-sm">
+              <p className="font-black text-cyan-200">Сектор {sector.sectorId}</p>
+              <SectorLine sector={sector} byId={byId} />
             </li>
           ))}
         </ul>
       )}
       {waiting.length > 0 && (
         <p className="mt-3 text-sm text-amber-200">
-          Не попали в период 1: {waiting.map((participant) => `${participant.bibNumber}. ${participant.displayName}`).join(", ")}.
+          Не попали в период {active}:{" "}
+          {waiting.map((participant) => `${participant.bibNumber}. ${participant.displayName}`).join(", ")}.
           Секторов меньше, чем нужно на всех.
         </p>
       )}
@@ -556,31 +647,57 @@ function PeriodPlan({
   );
 }
 
-function LoneLine({
-  participants,
-  sectorCount,
+function SectorLine({
+  sector,
   byId,
-  slotId,
 }: {
-  participants: readonly RegisteredParticipant[];
-  sectorCount: number;
+  sector: PeriodSector;
   byId: ReadonlyMap<string, RegisteredParticipant>;
-  slotId: string;
 }) {
-  const neighborId = loneNeighborSlotId(participants, sectorCount, slotId);
-  const vacant = ghostSeatPartner(participants, sectorCount, slotId) !== null;
+  if (sector.kind === "pair") {
+    return (
+      <p className="mt-1 text-slate-100">
+        {labelOf(byId, sector.leftSlotId)} слева
+        <span className="text-slate-500"> · </span>
+        {labelOf(byId, sector.rightSlotId)} справа
+      </p>
+    );
+  }
+
+  const side = sector.side === "left" ? "слева" : "справа";
   return (
     <p className="mt-1 text-slate-100">
-      {labelOf(byId, slotId)}
-      {vacant ? " · пустой слот" : " без пары"}
-      {neighborId && (
+      {labelOf(byId, sector.slotId)} {side}
+      {sector.vacant ? " · пустой слот" : " без пары"}
+      {sector.neighborSlotId && (
         <>
           <span className="text-slate-500"> · </span>
-          сравнение с соседом {labelOf(byId, neighborId)}
+          сравнение с соседом {labelOf(byId, sector.neighborSlotId)}
         </>
       )}
     </p>
   );
+}
+
+function periodTabs(count: number): PeriodIndex[] {
+  const total = Number.isInteger(count) && count > 0 ? Math.min(count, 10) : 8;
+  return Array.from({ length: total }, (_, index) => (index + 1) as PeriodIndex);
+}
+
+function unseated(
+  participants: readonly RegisteredParticipant[],
+  sectors: readonly PeriodSector[],
+): RegisteredParticipant[] {
+  const seated = new Set<string>();
+  for (const sector of sectors) {
+    if (sector.kind === "pair") {
+      seated.add(sector.leftSlotId);
+      seated.add(sector.rightSlotId);
+    } else {
+      seated.add(sector.slotId);
+    }
+  }
+  return participants.filter((participant) => !participant.ghost && !seated.has(participant.slotId));
 }
 
 function labelOf(byId: ReadonlyMap<string, RegisteredParticipant>, slotId: string): string {

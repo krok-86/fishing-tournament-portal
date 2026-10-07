@@ -2,6 +2,7 @@ import { useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import type { QrCatchCell, QrPlayoffCell } from "../qrSync.ts";
 import { useMatchStore } from "../store.ts";
+import { toast } from "../toast.ts";
 
 export function AthleteQrButton() {
   const tournamentOpened = useMatchStore((state) => state.tournamentOpened);
@@ -42,9 +43,11 @@ export function AthleteQrButton() {
     if (!result.ok) {
       setPacket(null);
       setError(result.error);
+      toast("err", result.error);
       return;
     }
     setPacket(result.packet);
+    toast("ok", cupMode ? "QR-код матча готов" : "QR-код результатов готов");
   }
 
   async function copyPayload() {
@@ -52,8 +55,10 @@ export function AthleteQrButton() {
     try {
       await navigator.clipboard.writeText(packet.payload);
       setCopied(true);
+      toast("ok", "Строка скопирована");
     } catch {
       setCopied(false);
+      toast("err", "Не удалось скопировать строку");
     }
   }
 

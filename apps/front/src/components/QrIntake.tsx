@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Html5Qrcode } from "html5-qrcode";
 import { useMatchStore } from "../store.ts";
+import { toast } from "../toast.ts";
 
 export function QrIntake() {
   const importAthleteResults = useMatchStore((state) => state.importAthleteResults);
@@ -28,15 +29,15 @@ export function QrIntake() {
     setBusy(false);
     if (result.ok) {
       setDraft("");
-      setStatus({
-        tone: "ok",
-        text: result.packet.cup
-          ? `Игрок №${result.packet.bibNumber} принят. ${result.packet.cup}${result.packet.mark ? ` На телефоне: ${result.packet.mark}.` : ""}`
-          : `Игрок №${result.packet.bibNumber}, ${result.packet.displayName}, принят. Рыб: ${result.packet.fish}. Периодов: ${result.packet.periods}.${result.packet.mark ? ` На телефоне: ${result.packet.mark}.` : ""} Таблица пересчитана.`,
-      });
+      const text = result.packet.cup
+        ? `Игрок №${result.packet.bibNumber} принят. ${result.packet.cup}${result.packet.mark ? ` На телефоне: ${result.packet.mark}.` : ""}`
+        : `Игрок №${result.packet.bibNumber}, ${result.packet.displayName}, принят. Рыб: ${result.packet.fish}. Периодов: ${result.packet.periods}.${result.packet.mark ? ` На телефоне: ${result.packet.mark}.` : ""} Таблица пересчитана.`;
+      setStatus({ tone: "ok", text });
+      toast("ok", text);
       return;
     }
     setStatus({ tone: "err", text: result.error });
+    toast("err", result.error);
   }
 
   useEffect(() => {
@@ -78,7 +79,10 @@ export function QrIntake() {
       try {
         await scanner.start({ facingMode: "user" }, config, onCode, () => undefined);
       } catch {
-        if (sessionRef.current === session) setCameraNote("Камера недоступна. Вставьте строку QR ниже.");
+        if (sessionRef.current === session) {
+          setCameraNote("Камера недоступна. Вставьте строку QR ниже.");
+          toast("err", "Камера недоступна. Вставьте строку QR ниже.");
+        }
         return;
       }
     }

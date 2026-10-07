@@ -157,14 +157,15 @@ export function generateLeaderboard(events: readonly TournamentEvent[]): Leaderb
 const SCHEDULE_PERIODS: readonly PeriodIndex[] = QUALIFYING_PERIODS;
 
 /**
- * Матрица переходов кругом Бергера.
- * Порядок `participantIds` — порядок регистрации: номер 1, 2, 3…
- * Период 1: пары 1–2, 3–4, 5–6…
- * Дальше список крутится, один участник закреплён, остальные сдвигаются.
- * В первых турах пары не повторяются. Если периодов больше, чем уникальных туров,
- * круг начинается сначала — повторы только в хвосте.
- * Сектор пары: 1, 2, 3… и сдвигается каждый период. Меньший номер стоит слева.
- * Нечётный список получает пропуск: в этом периоде у спортсмена нет соперника.
+ * Сетка переходов.
+ * Порядок `participantIds` — порядок жеребьёвки: номер 1, 2, 3…
+ * Нечётный номер в нечётном периоде стоит слева, в чётном — справа.
+ * Чётный номер — наоборот. Борт меняется каждый тур, за 8 периодов выходит 4 и 4.
+ * Тур без соперника тоже занимает борт и входит в этот баланс.
+ * Сектор меняется каждый период: один мосток два тура подряд не ставится.
+ * Пары идут между этими двумя группами. При 9 участниках и 8 периодах
+ * одна и та же пара может встретиться второй раз, но не третий
+ * и не ближе чем через два периода.
  */
 export function generateTournamentGrid(participantIds: string[], periodsCount: number): GridSlot[] {
   const ids = uniqueIds(participantIds);
@@ -172,25 +173,29 @@ export function generateTournamentGrid(participantIds: string[], periodsCount: n
 
   const periods = Math.min(SCHEDULE_PERIODS.length, periodsCount);
   const bibOf = new Map(ids.map((id, index) => [id, index + 1]));
-  const rounds = bergerRounds(ids);
+  const sectorCount = Math.ceil(ids.length / 2);
+  const circle = circleRounds(ids.length, periods);
+  const moved = assignMovingSectors(circle, ids.length, sectorCount);
+  const rounds = moved ? circle : blockRounds(ids.length, periods);
+  const sectors = moved ?? rotatingBlockSectors(rounds, sectorCount);
   const slots: GridSlot[] = [];
 
-  for (let periodNumber = 1; periodNumber <= periods; periodNumber += 1) {
-    const period = SCHEDULE_PERIODS[periodNumber - 1] ?? 1;
-    const pairs = rounds[(periodNumber - 1) % rounds.length] ?? [];
-    const sectorCount = pairs.length;
-    pairs.forEach((pair, pairIndex) => {
-      const sectorId = String(((pairIndex + periodNumber - 1) % sectorCount) + 1);
-      const [first, second] = orderPair(pair, bibOf);
-      if (!first) return;
-      if (!second) {
-        slots.push(gridPlace(first, null, "left", period, sectorId, bibOf));
+  rounds.forEach((seats, index) => {
+    const period = SCHEDULE_PERIODS[index] ?? 1;
+    seats.forEach((seat, unit) => {
+      const sectorId = String((sectors[index]?.[unit] ?? unit) + 1);
+      const left = seat.left === null ? null : (ids[seat.left] ?? null);
+      const right = seat.right === null ? null : (ids[seat.right] ?? null);
+      if (left && right) {
+        slots.push(gridPlace(left, right, "left", period, sectorId, bibOf));
+        slots.push(gridPlace(right, left, "right", period, sectorId, bibOf));
         return;
       }
-      slots.push(gridPlace(first, second, "left", period, sectorId, bibOf));
-      slots.push(gridPlace(second, first, "right", period, sectorId, bibOf));
+      const lone = left ?? right;
+      if (!lone) return;
+      slots.push(gridPlace(lone, null, left ? "left" : "right", period, sectorId, bibOf));
     });
-  }
+  });
 
   return slots.sort(compareGridSlots);
 }
@@ -1294,44 +1299,184 @@ function uniqueIds(participantIds: readonly string[]): string[] {
   return ids;
 }
 
-/** Один уникальный круг. `null` — пропуск при нечётном числе участников. */
-function bergerRounds(ids: readonly string[]): Array<Array<[string, string | null]>> {
-  const players: Array<string | null> = [...ids];
-  if (players.length % 2 === 1) players.push(null);
-
-  const count = players.length;
-  const half = count / 2;
-  const rotation: Array<string | null> = new Array(count);
-  for (let pair = 0; pair < half; pair += 1) {
-    rotation[pair] = players[pair * 2] ?? null;
-    rotation[count - 1 - pair] = players[pair * 2 + 1] ?? null;
-  }
-
-  const rounds: Array<Array<[string, string | null]>> = [];
-  for (let round = 0; round < count - 1; round += 1) {
-    const pairs: Array<[string, string | null]> = [];
-    for (let index = 0; index < half; index += 1) {
-      const left = rotation[index] ?? null;
-      const right = rotation[count - 1 - index] ?? null;
-      if (left && right) pairs.push([left, right]);
-      else if (left) pairs.push([left, null]);
-      else if (right) pairs.push([right, null]);
-    }
-    rounds.push(pairs);
-
-    const fixed = rotation[0] ?? null;
-    const tail = rotation.slice(1);
-    const moved = tail.length === 0 ? [] : [tail[tail.length - 1] ?? null, ...tail.slice(0, -1)];
-    rotation.splice(0, rotation.length, fixed, ...moved);
-  }
-
-  return rounds.length > 0 ? rounds : [[]];
+interface TransitionSeat {
+  left: number | null;
+  right: number | null;
 }
 
-function orderPair(pair: readonly [string, string | null], bibOf: ReadonlyMap<string, number>): [string, string | null] {
-  const [first, second] = pair;
-  if (!second) return [first, null];
-  return bibOf.get(first)! <= bibOf.get(second)! ? [first, second] : [second, first];
+/** Нечётный номер: нечётный период слева. Чётный номер — зеркально. */
+function checkerboardSide(index: number, periodNumber: number): Side {
+  const oddPeriod = periodNumber % 2 === 1;
+  const oddBib = index % 2 === 0;
+  return oddBib === oddPeriod ? "left" : "right";
+}
+
+function orientSeat(home: number, away: number | null, periodNumber: number): TransitionSeat {
+  if (away === null) {
+    return checkerboardSide(home, periodNumber) === "left" ? { left: home, right: null } : { left: null, right: home };
+  }
+  return checkerboardSide(home, periodNumber) === "left" ? { left: home, right: away } : { left: away, right: home };
+}
+
+/**
+ * Круг между двумя бортами.
+ * Нечётные номера — одна группа, чётные — другая: только они стоят друг напротив друга.
+ * При нечётном составе лишний номер группы пропуска сидит один.
+ * На 9 участниках и 8 периодах повтор пары отстоит на 5 туров и больше двух раз не случается.
+ */
+function circleRounds(count: number, periods: number): TransitionSeat[][] {
+  const home: number[] = [];
+  const away: number[] = [];
+  for (let index = 0; index < count; index += 1) {
+    if (index % 2 === 0) home.push(index);
+    else away.push(index);
+  }
+
+  const rounds: TransitionSeat[][] = [];
+  for (let offset = 0; offset < periods; offset += 1) {
+    const periodNumber = offset + 1;
+    const seats: TransitionSeat[] = [];
+    if (home.length !== away.length) {
+      const bye = home[offset % Math.max(1, home.length)];
+      if (bye !== undefined) seats.push(orientSeat(bye, null, periodNumber));
+      for (let index = 0; index < away.length; index += 1) {
+        const partner = home[(offset + 1 + index) % home.length];
+        const rival = away[index];
+        if (partner === undefined || rival === undefined) continue;
+        seats.push(orientSeat(partner, rival, periodNumber));
+      }
+    } else {
+      for (let index = 0; index < away.length; index += 1) {
+        const partner = home[(offset + index) % home.length];
+        const rival = away[index];
+        if (partner === undefined || rival === undefined) continue;
+        seats.push(orientSeat(partner, rival, periodNumber));
+      }
+    }
+    rounds.push(seats);
+  }
+  return rounds;
+}
+
+/**
+ * Запасной круг, когда секторов слишком мало, чтобы и менять мосток, и менять соперника.
+ * Соседние номера остаются парой и каждый тур переходят на следующий сектор.
+ */
+function blockRounds(count: number, periods: number): TransitionSeat[][] {
+  const rounds: TransitionSeat[][] = [];
+  for (let offset = 0; offset < periods; offset += 1) {
+    const periodNumber = offset + 1;
+    const seats: TransitionSeat[] = [];
+    for (let index = 0; index + 1 < count; index += 2) {
+      seats.push(orientSeat(index, index + 1, periodNumber));
+    }
+    if (count % 2 === 1) seats.push(orientSeat(count - 1, null, periodNumber));
+    rounds.push(seats);
+  }
+  return rounds;
+}
+
+function rotatingBlockSectors(rounds: readonly (readonly TransitionSeat[])[], sectorCount: number): number[][] {
+  const count = Math.max(1, sectorCount);
+  return rounds.map((seats, offset) => seats.map((_, index) => (index + offset) % count));
+}
+
+function seatPlayers(seat: TransitionSeat): number[] {
+  const players: number[] = [];
+  if (seat.left !== null) players.push(seat.left);
+  if (seat.right !== null) players.push(seat.right);
+  return players;
+}
+
+function sectorCost(
+  players: readonly number[],
+  sector: number,
+  periodNumber: number,
+  visits: readonly (readonly number[])[],
+  seenAt: readonly (readonly number[])[],
+): number {
+  let cost = 0;
+  for (const player of players) {
+    cost += (visits[player]?.[sector] ?? 0) * 10;
+    cost -= periodNumber - (seenAt[player]?.[sector] ?? 0);
+  }
+  return cost;
+}
+
+/**
+ * Сектор пары — не прошлый мосток ни одного из двоих.
+ * Среди свободных берётся тот, где эта пара бывала реже.
+ */
+function assignMovingSectors(
+  rounds: readonly (readonly TransitionSeat[])[],
+  playerCount: number,
+  sectorCount: number,
+): number[][] | null {
+  if (sectorCount < 1) return null;
+  const lastSector = new Array<number>(playerCount).fill(-1);
+  const visits = Array.from({ length: playerCount }, () => new Array<number>(sectorCount).fill(0));
+  const seenAt = Array.from({ length: playerCount }, () => new Array<number>(sectorCount).fill(0));
+  const assigned: number[][] = [];
+
+  for (let roundIndex = 0; roundIndex < rounds.length; roundIndex += 1) {
+    const periodNumber = roundIndex + 1;
+    const units = (rounds[roundIndex] ?? []).map(seatPlayers);
+    const adjacent = units.map((players) => {
+      const options: number[] = [];
+      for (let sector = 0; sector < sectorCount; sector += 1) {
+        if (players.some((player) => lastSector[player] === sector)) continue;
+        options.push(sector);
+      }
+      options.sort(
+        (left, right) =>
+          sectorCost(players, left, periodNumber, visits, seenAt) - sectorCost(players, right, periodNumber, visits, seenAt) ||
+          left - right,
+      );
+      return options;
+    });
+    if (adjacent.some((options) => options.length === 0)) return null;
+
+    const owner = new Array<number>(sectorCount).fill(-1);
+    const visit = (unit: number, seen: boolean[]): boolean => {
+      for (const sector of adjacent[unit] ?? []) {
+        if (seen[sector]) continue;
+        seen[sector] = true;
+        const sitting = owner[sector] ?? -1;
+        if (sitting === -1 || visit(sitting, seen)) {
+          owner[sector] = unit;
+          return true;
+        }
+      }
+      return false;
+    };
+
+    for (let unit = 0; unit < units.length; unit += 1) {
+      if (!visit(unit, new Array<boolean>(sectorCount).fill(false))) return null;
+    }
+
+    const sectors = new Array<number>(units.length).fill(-1);
+    for (let sector = 0; sector < sectorCount; sector += 1) {
+      const unit = owner[sector] ?? -1;
+      if (unit >= 0) sectors[unit] = sector;
+    }
+    if (sectors.some((sector) => sector < 0)) return null;
+
+    assigned.push(sectors);
+    units.forEach((players, unit) => {
+      const sector = sectors[unit] ?? -1;
+      if (sector < 0) return;
+      for (const player of players) {
+        lastSector[player] = sector;
+        const row = visits[player];
+        const when = seenAt[player];
+        if (!row || !when) continue;
+        row[sector] = (row[sector] ?? 0) + 1;
+        when[sector] = periodNumber;
+      }
+    });
+  }
+
+  return assigned;
 }
 
 function gridPlace(

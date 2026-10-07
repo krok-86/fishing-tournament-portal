@@ -1,7 +1,43 @@
 import { useEffect, useState } from "react";
-import { QUALIFYING_PERIODS, type LeaderboardEntry, type PeriodIndex, type PeriodResult } from "../../../../packages/shared/src/types.ts";
+import {
+  QUALIFYING_PERIOD_COUNT,
+  QUALIFYING_PERIODS,
+  type LeaderboardEntry,
+  type PeriodIndex,
+  type PeriodPhase,
+  type PeriodResult,
+} from "../../../../packages/shared/src/types.ts";
 import { useMatchStore } from "../store.ts";
+import { toast } from "../toast.ts";
 import { PlayoffBracket } from "./PlayoffBracket.tsx";
+
+function periodStatusText(period: PeriodIndex, phase: PeriodPhase): string {
+  if (phase === "fishing") return `Идёт ловля периода ${period}`;
+  if (phase === "closed") return `Период ${period} завершён`;
+  return `Ожидание старта периода ${period}`;
+}
+
+function nextPeriodAction(
+  period: PeriodIndex,
+  phase: PeriodPhase,
+): { period: PeriodIndex; phase: PeriodPhase; label: string } | null {
+  if (phase === "waiting") {
+    return { period, phase: "fishing", label: `Запустить период ${period}` };
+  }
+  if (phase === "fishing") {
+    return {
+      period,
+      phase: "closed",
+      label:
+        period < QUALIFYING_PERIOD_COUNT
+          ? `Завершить период ${period} и открыть период ${period + 1}`
+          : `Завершить период ${period}`,
+    };
+  }
+  if (period >= QUALIFYING_PERIOD_COUNT) return null;
+  const next = (period + 1) as PeriodIndex;
+  return { period: next, phase: "fishing", label: `Запустить период ${next}` };
+}
 
 const PLAYOFF_PLACES = 8;
 const PERIODS: readonly PeriodIndex[] = QUALIFYING_PERIODS;
@@ -20,17 +56,46 @@ export function Leaderboard() {
   const playoffSaving = useMatchStore((state) => state.playoffSaving);
   const playoffError = useMatchStore((state) => state.playoffError);
   const formPlayoff = useMatchStore((state) => state.formPlayoff);
+  const phase = useMatchStore((state) => state.periodPhase);
+  const signalPeriod = useMatchStore((state) => state.signalPeriod);
+  const signalSaving = useMatchStore((state) => state.signalSaving);
   const participants = useMatchStore((state) => state.participants);
   const [edit, setEdit] = useState<{ slotId: string; period: PeriodIndex } | null>(null);
   const ghostIds = new Set(participants.filter((participant) => participant.ghost).map((participant) => participant.slotId));
   const editing = edit ? rows.find((entry) => entry.slotId === edit.slotId) ?? null : null;
 
   useEffect(() => {
-    void loadLeaderboard();
+    void loadLeaderboard().then(() => {
+      const message = useMatchStore.getState().error;
+      if (message) toast("err", message);
+    });
   }, [loadLeaderboard]);
+
+  const periodAction = playoffFormed ? null : nextPeriodAction(activePeriod, phase);
 
   return (
     <section className="mt-4 min-w-0 flex-1">
+      {tournamentOpened && !playoffFormed && (
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-2xl bg-slate-900 px-4 py-3">
+          <p className="min-w-0 text-lg leading-tight font-black sm:text-xl">Статус: {periodStatusText(activePeriod, phase)}</p>
+          {periodAction && (
+            <button
+              type="button"
+              className="h-12 shrink-0 rounded-xl bg-amber-400 px-4 text-sm font-black text-slate-950 disabled:bg-slate-700 disabled:text-slate-400"
+              disabled={signalSaving}
+              onClick={() => {
+                const action = periodAction;
+                void signalPeriod(action.period, action.phase).then((ok) => {
+                  if (ok) toast("ok", periodStatusText(action.period, action.phase));
+                  else toast("err", useMatchStore.getState().error ?? "Не удалось записать сигнал периода");
+                });
+              }}
+            >
+              {signalSaving ? "Записываем…" : periodAction.label}
+            </button>
+          )}
+        </div>
+      )}
       <div className="mb-3 flex flex-wrap items-end justify-between gap-2">
         <div>
           <h2 className="text-lg font-black tracking-tight sm:text-2xl">Таблица лидеров</h2>
@@ -102,7 +167,12 @@ export function Leaderboard() {
               type="button"
               className="h-14 w-full rounded-2xl bg-amber-400 text-base font-black tracking-wide text-slate-950 disabled:bg-slate-700 disabled:text-slate-400"
               disabled={playoffSaving}
-              onClick={() => void formPlayoff()}
+              onClick={() => {
+                void formPlayoff().then((ok) => {
+                  if (ok) toast("ok", "Плей-офф сформирован");
+                  else toast("err", useMatchStore.getState().playoffError ?? "Не удалось сформировать плей-офф");
+                });
+              }}
             >
               {playoffSaving ? "Собираем сетку..." : "Сформировать Плей-офф"}
             </button>
@@ -215,8 +285,10 @@ function PeriodScoreDialog({
     setSaving(false);
     if (message) {
       setError(message);
+      toast("err", message);
       return;
     }
+    toast("ok", `Период ${period}: поимки сохранены`);
     onClose();
   }
 

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Html5Qrcode } from "html5-qrcode";
+import { toast } from "../toast.ts";
 
 function cameraFailureNote(error: unknown): string {
   const name = error instanceof Error ? error.name : "";
@@ -75,6 +76,11 @@ export function DrawScanner({
     }
   }
 
+  function failCamera(error: unknown) {
+    setCameraNote(cameraFailureNote(error));
+    toast("err", "Камера не включилась");
+  }
+
   function enableCamera() {
     const session = sessionRef.current + 1;
     sessionRef.current = session;
@@ -89,14 +95,14 @@ export function DrawScanner({
 
   async function startScanner(session: number, permission?: Promise<MediaStream>) {
     if (!permission) {
-      if (sessionRef.current === session) setCameraNote(cameraFailureNote(new Error("mediaDevices")));
+      if (sessionRef.current === session) failCamera(new Error("mediaDevices"));
       return;
     }
     try {
       const stream = await permission;
       stream.getTracks().forEach((track) => track.stop());
     } catch (error) {
-      if (sessionRef.current === session) setCameraNote(cameraFailureNote(error));
+      if (sessionRef.current === session) failCamera(error);
       return;
     }
     await stopScanner();
@@ -119,7 +125,7 @@ export function DrawScanner({
       try {
         await scanner.start({ facingMode: "user" }, config, onScan, () => undefined);
       } catch (error) {
-        if (sessionRef.current === session) setCameraNote(cameraFailureNote(error));
+        if (sessionRef.current === session) failCamera(error);
         return;
       }
     }

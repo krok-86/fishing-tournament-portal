@@ -33,6 +33,7 @@ import {
   decodePeriodSignal,
   decodeStartSnapshot,
   encodeCatchSnapshot,
+  isTournamentDate,
   encodePlayoffSnapshot,
   expandCatchEvents,
   periodStatusLabel,
@@ -48,7 +49,6 @@ import {
 } from "./qrSync.ts";
 
 const PERIODS_PER_ROUND = QUALIFYING_PERIOD_COUNT;
-const TOURNAMENT_NAME = "Локальный турнир";
 
 export interface RegisteredParticipant {
   slotId: string;
@@ -96,7 +96,13 @@ interface MatchStore extends SectorView {
   /** Сетка всех периодов. Пустая, пока турнир не открыт. */
   grid: GridSlot[];
   sectorCount: number;
+  /** Сколько периодов отбора в сетке. Пока 8, число приходит из открытия турнира. */
+  periodsCount: number;
   tournamentOpened: boolean;
+  /** Название, которое игрок видит после сканирования жеребьёвки. */
+  tournamentName: string;
+  /** День проведения, ISO `YYYY-MM-DD`. */
+  tournamentDate: string;
   setupSaving: boolean;
   setupError: string | null;
   hydrated: boolean;
@@ -134,6 +140,10 @@ interface MatchStore extends SectorView {
    */
   importRegistrationBatch: (value: unknown) => Promise<boolean>;
   replaceParticipant: (slotId: string, displayName: string) => Promise<boolean>;
+  /**
+   * До открытия турнира фантома не создаёт: строка снимается целиком, номера смыкаются.
+   * После открытия пустой слот с этого экрана не ставится.
+   */
   setParticipantGhost: (slotId: string) => Promise<boolean>;
   removeParticipant: (slotId: string) => Promise<boolean>;
   clearParticipants: () => Promise<boolean>;
@@ -143,7 +153,7 @@ interface MatchStore extends SectorView {
    * Строит матрицу переходов на все периоды, пишет матчи в IndexedDB
    * и переводит экран ввода в боевой режим.
    */
-  startTournament: () => Promise<boolean>;
+  startTournament: (meta?: { name: string; date: string }) => Promise<boolean>;
   openTournament: () => Promise<boolean>;
   /** Номер на этом телефоне. Кубковый QR кодирует его поимки. */
   selfSlotId: string;
@@ -199,7 +209,10 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
   participants: [],
   grid: [],
   sectorCount: 0,
+  periodsCount: PERIODS_PER_ROUND,
   tournamentOpened: false,
+  tournamentName: "",
+  tournamentDate: "",
   setupSaving: false,
   setupError: null,
   hydrated: false,
@@ -402,23 +415,31 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
       const rows = await db.events.where("tournamentId").equals(tournamentId).sortBy("timestamp");
       const stored = rows.map((row) => row.event);
       const snapshot = readSetup(stored);
-      const grid = snapshot.tournamentOpened ? gridOf(snapshot.participants, snapshot.periodsPerRound) : [];
+      const participants = snapshot.tournamentOpened
+        ? snapshot.participants
+        : await healedStartList(tournamentId, snapshot.participants);
+      const grid = snapshot.tournamentOpened ? gridOf(participants, snapshot.periodsPerRound) : [];
       const playoff = projectPlayoff(stored);
       const signal = readPeriodSignal(stored);
       set({
-        participants: snapshot.participants,
+        participants,
         grid,
         tournamentOpened: snapshot.tournamentOpened,
+        tournamentName: snapshot.tournamentName,
+        tournamentDate: snapshot.tournamentDate,
         sectorCount: snapshot.tournamentOpened
           ? snapshot.sectorCount
-          : requiredSectorCount(snapshot.participants.length),
+          : requiredSectorCount(participants.length),
+        periodsCount: snapshot.periodsPerRound,
         hydrated: true,
         setupError: null,
         period: snapshot.tournamentOpened ? signal.period : 1,
         periodPhase: snapshot.tournamentOpened ? signal.phase : "waiting",
-        playerNamedSlotIds: playerNamedFromEvents(stored),
+        playerNamedSlotIds: playerNamedFromEvents(stored).filter((slotId) =>
+          participants.some((participant) => participant.slotId === slotId),
+        ),
         ...emptySector,
-        ...cupPatch(stored, snapshot.participants, grid),
+        ...cupPatch(stored, participants, grid),
         selectedPlayoffMatchId: "",
         playoffEntryOpen: false,
       });
@@ -440,7 +461,8 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
     const state = get();
     if (!name || state.tournamentOpened || state.setupSaving) return false;
 
-    const bibNumber = state.participants.reduce((max, participant) => Math.max(max, participant.bibNumber), 0) + 1;
+    const roster = denseStartList(state.participants);
+    const bibNumber = roster.length + 1;
     const participant: RegisteredParticipant = {
       slotId: crypto.randomUUID(),
       bibNumber,
@@ -462,7 +484,7 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
     };
 
     const previous = state.participants;
-    const nextParticipants = [...previous, participant];
+    const nextParticipants = [...roster, participant];
     set({
       participants: nextParticipants,
       sectorCount: requiredSectorCount(nextParticipants.length),
@@ -470,15 +492,21 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
       setupError: null,
     });
 
+    let rosterSaved = sameRoster(previous, roster);
     try {
+      if (!rosterSaved) {
+        await persistDenseRoster(state.tournamentId, roster);
+        rosterSaved = true;
+      }
       await db.events.add(toRecord(event));
       set({ setupSaving: false });
       return true;
     } catch (error) {
+      const restored = rosterSaved ? roster : previous;
       set({
         setupSaving: false,
-        participants: previous,
-        sectorCount: requiredSectorCount(previous.length),
+        participants: restored,
+        sectorCount: requiredSectorCount(restored.length),
         setupError: error instanceof Error ? error.message : "Не удалось записать участника",
       });
       return false;
@@ -553,31 +581,10 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
 
   async setParticipantGhost(slotId) {
     const state = get();
-    if (state.tournamentOpened || state.setupSaving) return false;
-
-    const current = state.participants.find((participant) => participant.slotId === slotId);
-    if (!current || current.ghost) return false;
-
-    const displayName = phantomName(current.bibNumber);
-    const event: TournamentEvent = {
-      id: crypto.randomUUID(),
-      tournamentId: state.tournamentId,
-      type: "PARTICIPANT_SET_GHOST",
-      timestamp: Date.now(),
-      payload: {
-        slotId,
-        ghost: true,
-        displayName,
-      },
-    };
-
-    return commitParticipantUpdate(
-      set,
-      state.participants,
-      slotId,
-      { ...current, displayName, ghost: true },
-      event,
-    );
+    if (state.setupSaving) return false;
+    // До сетки переходов пустой слот держит номер и оставляет дыру. Строка снимается целиком.
+    if (!state.tournamentOpened) return get().removeParticipant(slotId);
+    return false;
   },
 
   async removeParticipant(slotId) {
@@ -610,7 +617,10 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
         participants: [],
         grid: [],
         sectorCount: 0,
+        periodsCount: PERIODS_PER_ROUND,
         tournamentOpened: false,
+        tournamentName: "",
+        tournamentDate: "",
         setupSaving: false,
         setupError: null,
         hydrated: true,
@@ -647,11 +657,21 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
     );
   },
 
-  async startTournament() {
+  async startTournament(meta) {
     const state = get();
     if (state.tournamentOpened || state.setupSaving) return state.tournamentOpened;
     if (state.participants.length < 2) {
       set({ setupError: "Добавьте хотя бы двух участников" });
+      return false;
+    }
+    const tournamentName = (meta?.name ?? state.tournamentName).trim().replace(/\s+/g, " ");
+    const tournamentDate = (meta?.date ?? state.tournamentDate).trim();
+    if (!tournamentName) {
+      set({ setupError: "Укажите название турнира" });
+      return false;
+    }
+    if (!isTournamentDate(tournamentDate)) {
+      set({ setupError: "Укажите дату проведения" });
       return false;
     }
 
@@ -668,7 +688,8 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
       timestamp,
       payload: {
         rulesetId: "pal-trout-2026",
-        name: TOURNAMENT_NAME,
+        name: tournamentName,
+        date: tournamentDate,
         periodsPerRound: PERIODS_PER_ROUND,
         rounds: 2,
         sectorCount,
@@ -704,6 +725,9 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
           tournamentOpened: true,
           participants: snapshot.participants,
           sectorCount: snapshot.sectorCount,
+          periodsCount: snapshot.periodsPerRound,
+          tournamentName: snapshot.tournamentName,
+          tournamentDate: snapshot.tournamentDate,
           grid: openedGrid,
           period: signal.period,
           periodPhase: signal.phase,
@@ -718,7 +742,10 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
       set({
         setupSaving: false,
         tournamentOpened: true,
+        tournamentName,
+        tournamentDate,
         sectorCount,
+        periodsCount: PERIODS_PER_ROUND,
         grid,
         round: 1,
         period: 1,
@@ -1123,6 +1150,8 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
 interface SetupSnapshot {
   participants: RegisteredParticipant[];
   tournamentOpened: boolean;
+  tournamentName: string;
+  tournamentDate: string;
   sectorCount: number;
   periodsPerRound: number;
   matrix: readonly MatrixDuel[];
@@ -1131,6 +1160,8 @@ interface SetupSnapshot {
 function readSetup(events: readonly TournamentEvent[]): SetupSnapshot {
   const participants: RegisteredParticipant[] = [];
   let tournamentOpened = false;
+  let tournamentName = "";
+  let tournamentDate = "";
   let sectorCount = 0;
   let periodsPerRound = PERIODS_PER_ROUND;
   let matrix: readonly MatrixDuel[] = [];
@@ -1161,6 +1192,8 @@ function readSetup(events: readonly TournamentEvent[]): SetupSnapshot {
       if (index >= 0) participants.splice(index, 1);
     } else if (event.type === "TOURNAMENT_OPENED") {
       tournamentOpened = true;
+      tournamentName = event.payload.name;
+      tournamentDate = event.payload.date ?? "";
       sectorCount = event.payload.sectorCount;
       periodsPerRound = event.payload.periodsPerRound;
     } else if (event.type === "DRAW_SEEDED" && tournamentOpened) {
@@ -1169,7 +1202,7 @@ function readSetup(events: readonly TournamentEvent[]): SetupSnapshot {
   }
 
   participants.sort((left, right) => left.bibNumber - right.bibNumber || left.slotId.localeCompare(right.slotId));
-  return { participants, tournamentOpened, sectorCount, periodsPerRound, matrix };
+  return { participants, tournamentOpened, tournamentName, tournamentDate, sectorCount, periodsPerRound, matrix };
 }
 
 const MAX_REGISTRATION_BATCH = 200;
@@ -1250,13 +1283,82 @@ interface SectorSeat {
 }
 
 /**
- * Период 1 полной сетки: пары по порядку номеров, меньший слева.
+ * Период 1 полной сетки. Борт чередуется по номеру, а не по тому, чей номер меньше.
  * Фантом место не освобождает: живой соперник остаётся один.
  */
 export function planPeriodOne(participants: readonly RegisteredParticipant[], sectorCount: number): MatrixDuel[] {
   if (!Number.isInteger(sectorCount) || sectorCount < 1) return [];
   const ordered = [...participants].sort(byBib).slice(0, sectorCount * 2);
   return matrixFromGrid(gridOf(ordered, 1), ordered);
+}
+
+/** Сетка переходов на все периоды. Тот же расчёт, что пишется в журнал при открытии. */
+export function scheduleGrid(
+  participants: readonly RegisteredParticipant[],
+  periodsCount: number,
+): GridSlot[] {
+  return gridOf(participants, periodsCount);
+}
+
+export type PeriodSector =
+  | {
+      sectorId: string;
+      kind: "pair";
+      leftSlotId: string;
+      rightSlotId: string;
+    }
+  | {
+      sectorId: string;
+      kind: "lone";
+      slotId: string;
+      side: Side;
+      /** Напротив живого места стоит фантом, а не пустой пропуск Бергера. */
+      vacant: boolean;
+      neighborSlotId: string | null;
+    };
+
+/** Секторы одного периода из уже посчитанной сетки. Сосед одиночки берётся из этого же периода. */
+export function sectorsForPeriod(
+  grid: readonly GridSlot[],
+  participants: readonly RegisteredParticipant[],
+  period: PeriodIndex,
+): PeriodSector[] {
+  const slots = grid.filter((slot) => slot.round === 1 && slot.period === period);
+  const byId = new Map(participants.map((participant) => [participant.slotId, participant]));
+  const ghosts = new Set(
+    participants.filter((participant) => participant.ghost).map((participant) => participant.slotId),
+  );
+  const sectors: PeriodSector[] = [];
+
+  for (const seat of gridSeats(slots)) {
+    const left = seat.left ? byId.get(seat.left.slotId) : undefined;
+    const right = seat.right ? byId.get(seat.right.slotId) : undefined;
+    const leftFishing = isFishing(left ?? null);
+    const rightFishing = isFishing(right ?? null);
+    if (leftFishing && rightFishing && seat.left && seat.right) {
+      sectors.push({
+        sectorId: seat.sectorId,
+        kind: "pair",
+        leftSlotId: seat.left.slotId,
+        rightSlotId: seat.right.slotId,
+      });
+      continue;
+    }
+
+    const loneSlot = leftFishing ? seat.left : rightFishing ? seat.right : null;
+    if (!loneSlot) continue;
+    const opponent = loneSlot.opponentSlotId ? byId.get(loneSlot.opponentSlotId) : undefined;
+    sectors.push({
+      sectorId: seat.sectorId,
+      kind: "lone",
+      slotId: loneSlot.slotId,
+      side: loneSlot.side,
+      vacant: opponent?.ghost === true,
+      neighborSlotId: gridNeighbor(slots, loneSlot, ghosts),
+    });
+  }
+
+  return sectors;
 }
 
 /** Другое место того же сектора, если там фантом. */
@@ -1529,6 +1631,121 @@ async function commitParticipantUpdate(
   }
 }
 
+/** До старта лист плотный: без фантомов и без пропусков в номерах. */
+function denseStartList(participants: readonly RegisteredParticipant[]): RegisteredParticipant[] {
+  return [...participants]
+    .filter((participant) => !participant.ghost)
+    .sort(byBib)
+    .map((participant, index) => {
+      const bibNumber = index + 1;
+      const displayName = isAutoName(participant.displayName, participant.bibNumber)
+        ? numberedAthleteName(bibNumber)
+        : participant.displayName;
+      return { ...participant, bibNumber, displayName, ghost: false };
+    });
+}
+
+function isAutoName(displayName: string, bibNumber: number): boolean {
+  return displayName === numberedAthleteName(bibNumber) || displayName === phantomName(bibNumber);
+}
+
+function sameRoster(left: readonly RegisteredParticipant[], right: readonly RegisteredParticipant[]): boolean {
+  if (left.length !== right.length) return false;
+  const orderedLeft = [...left].sort(byBib);
+  const orderedRight = [...right].sort(byBib);
+  return orderedLeft.every((participant, index) => {
+    const other = orderedRight[index];
+    return (
+      other !== undefined &&
+      participant.slotId === other.slotId &&
+      participant.bibNumber === other.bibNumber &&
+      participant.displayName === other.displayName &&
+      participant.groupId === other.groupId &&
+      participant.ghost === other.ghost
+    );
+  });
+}
+
+async function healedStartList(
+  tournamentId: string,
+  participants: readonly RegisteredParticipant[],
+): Promise<RegisteredParticipant[]> {
+  const dense = denseStartList(participants);
+  if (sameRoster(participants, dense)) return [...participants];
+  await persistDenseRoster(tournamentId, dense);
+  return dense;
+}
+
+function rosterSlotId(event: TournamentEvent): string | null {
+  switch (event.type) {
+    case "PARTICIPANT_REGISTERED":
+    case "PARTICIPANT_REPLACED":
+    case "PARTICIPANT_SET_GHOST":
+    case "PARTICIPANT_REMOVED":
+      return event.payload.slotId;
+    default:
+      return null;
+  }
+}
+
+/** Стирает снятых игроков из журнала и записывает сомкнутые номера оставшимся. */
+async function persistDenseRoster(
+  tournamentId: string,
+  next: readonly RegisteredParticipant[],
+): Promise<void> {
+  const keep = new Map(next.map((participant) => [participant.slotId, participant]));
+  await db.transaction("rw", db.events, async () => {
+    const rows = await db.events.where("tournamentId").equals(tournamentId).toArray();
+    const registeredBib = new Map<string, number>();
+    for (const row of rows) {
+      if (row.event.type === "PARTICIPANT_REGISTERED") {
+        registeredBib.set(row.event.payload.slotId, row.event.payload.bibNumber);
+      }
+    }
+
+    const deleteIds: string[] = [];
+    for (const row of rows) {
+      const slotId = rosterSlotId(row.event);
+      if (slotId === null) continue;
+      const kept = keep.get(slotId);
+      if (!kept || row.event.type === "PARTICIPANT_REMOVED" || row.event.type === "PARTICIPANT_SET_GHOST") {
+        deleteIds.push(row.id);
+        continue;
+      }
+      if (row.event.type === "PARTICIPANT_REGISTERED") {
+        const previousBib = row.event.payload.bibNumber;
+        const displayName = isAutoName(row.event.payload.displayName, previousBib)
+          ? numberedAthleteName(kept.bibNumber)
+          : row.event.payload.displayName;
+        if (previousBib === kept.bibNumber && displayName === row.event.payload.displayName) continue;
+        await db.events.update(row.id, {
+          event: {
+            ...row.event,
+            payload: {
+              ...row.event.payload,
+              bibNumber: kept.bibNumber,
+              displayName,
+            },
+          },
+        });
+        continue;
+      }
+      if (row.event.type !== "PARTICIPANT_REPLACED") continue;
+      const previousBib = registeredBib.get(slotId);
+      if (previousBib === undefined || !isAutoName(row.event.payload.displayName, previousBib)) continue;
+      const displayName = numberedAthleteName(kept.bibNumber);
+      if (displayName === row.event.payload.displayName) continue;
+      await db.events.update(row.id, {
+        event: {
+          ...row.event,
+          payload: { ...row.event.payload, displayName },
+        },
+      });
+    }
+    if (deleteIds.length > 0) await db.events.bulkDelete(deleteIds);
+  });
+}
+
 async function dropParticipants(
   set: (partial: Partial<MatchStore>) => void,
   state: MatchStore,
@@ -1536,33 +1753,30 @@ async function dropParticipants(
 ): Promise<boolean> {
   const removing = new Set(slotIds);
   const previous = state.participants;
-  const nextParticipants = previous.filter((participant) => !removing.has(participant.slotId));
-  if (nextParticipants.length === previous.length) return false;
+  const kept = previous.filter((participant) => !removing.has(participant.slotId));
+  if (kept.length === previous.length) return false;
 
-  const timestamp = Date.now();
-  const events: TournamentEvent[] = [...removing].map((slotId, index) => ({
-    id: crypto.randomUUID(),
-    tournamentId: state.tournamentId,
-    type: "PARTICIPANT_REMOVED",
-    timestamp: timestamp + index,
-    payload: { slotId },
-  }));
-
+  const nextParticipants = denseStartList(kept);
+  const named = state.playerNamedSlotIds.filter((slotId) =>
+    nextParticipants.some((participant) => participant.slotId === slotId),
+  );
   set({
     participants: nextParticipants,
+    playerNamedSlotIds: named,
     sectorCount: requiredSectorCount(nextParticipants.length),
     setupSaving: true,
     setupError: null,
   });
 
   try {
-    await db.events.bulkAdd(events.map(toRecord));
+    await persistDenseRoster(state.tournamentId, nextParticipants);
     set({ setupSaving: false });
     return true;
   } catch (error) {
     set({
       setupSaving: false,
       participants: [...previous],
+      playerNamedSlotIds: state.playerNamedSlotIds,
       sectorCount: requiredSectorCount(previous.length),
       setupError: error instanceof Error ? error.message : "Не удалось удалить участника",
     });
@@ -1575,7 +1789,8 @@ async function appendRegisteredParticipants(
   state: MatchStore,
   entries: readonly RegistrationBatchEntry[],
 ): Promise<boolean> {
-  const normalized = normalizeRegistrationEntries(entries, state.participants);
+  const roster = denseStartList(state.participants);
+  const normalized = normalizeRegistrationEntries(entries, roster);
   if (!normalized.ok) {
     set({ setupError: normalized.error });
     return false;
@@ -1594,7 +1809,7 @@ async function appendRegisteredParticipants(
       groupId: participant.groupId,
     },
   }));
-  const nextParticipants = [...state.participants, ...normalized.participants].sort(byBib);
+  const nextParticipants = [...roster, ...normalized.participants].sort(byBib);
 
   set({
     participants: nextParticipants,
@@ -1603,15 +1818,21 @@ async function appendRegisteredParticipants(
     setupError: null,
   });
 
+  let rosterSaved = sameRoster(state.participants, roster);
   try {
+    if (!rosterSaved) {
+      await persistDenseRoster(state.tournamentId, roster);
+      rosterSaved = true;
+    }
     await db.events.bulkAdd(events.map(toRecord));
     set({ setupSaving: false });
     return true;
   } catch (error) {
+    const restored = rosterSaved ? roster : state.participants;
     set({
       setupSaving: false,
-      participants: [...state.participants],
-      sectorCount: requiredSectorCount(state.participants.length),
+      participants: [...restored],
+      sectorCount: requiredSectorCount(restored.length),
       setupError: error instanceof Error ? error.message : "Не удалось записать участников",
     });
     return false;
@@ -2120,16 +2341,6 @@ async function importStartDraw(
   if (state.saving || state.setupSaving || state.signalSaving) {
     return { ok: false, error: "Журнал сейчас занят" };
   }
-  if (state.tournamentOpened) {
-    const saved = await get().signalPeriod(decoded.snapshot.period, decoded.snapshot.phase);
-    if (!saved) return { ok: false, error: get().error ?? "Не удалось обновить период" };
-    return {
-      ok: true,
-      fresh: false,
-      label: periodStatusLabel(decoded.snapshot.period, decoded.snapshot.phase),
-    };
-  }
-
   const participants = participantsFromStart(decoded.snapshot.participants);
   const grid = gridFromSeats(participants, decoded.snapshot.seats);
   if (grid.length === 0) return { ok: false, error: "В стартовом коде нет сетки" };
@@ -2170,7 +2381,8 @@ async function importStartDraw(
     timestamp: cursor,
     payload: {
       rulesetId: "pal-trout-2026",
-      name: TOURNAMENT_NAME,
+      name: decoded.snapshot.tournamentName,
+      date: decoded.snapshot.tournamentDate,
       periodsPerRound: PERIODS_PER_ROUND,
       rounds: 2,
       sectorCount: decoded.snapshot.sectorCount,
@@ -2210,14 +2422,17 @@ async function importStartDraw(
   set({ setupSaving: true, setupError: null, error: null });
   try {
     await db.transaction("rw", db.events, async () => {
-      await db.events.where("tournamentId").equals(state.tournamentId).delete();
+      await db.events.clear();
       await db.events.bulkAdd(events.map(toRecord));
     });
     set({
       setupSaving: false,
       tournamentOpened: true,
+      tournamentName: decoded.snapshot.tournamentName,
+      tournamentDate: decoded.snapshot.tournamentDate,
       participants,
       sectorCount: decoded.snapshot.sectorCount,
+      periodsCount: decoded.snapshot.periodsPerRound,
       grid,
       round: 1,
       period: decoded.snapshot.period,
@@ -2230,10 +2445,13 @@ async function importStartDraw(
       error: null,
       setupError: null,
       hydrated: true,
+      leaderboard: [],
+      leaderboardReady: true,
       playoff: emptyPlayoffProjection,
       eighthPeriodClosed: false,
       selectedPlayoffMatchId: "",
       playoffEntryOpen: false,
+      playoffSaving: false,
       playoffError: null,
       selfSlotId: "",
       qualifyingHandoffReady: false,
@@ -2241,6 +2459,7 @@ async function importStartDraw(
       cupHandoffReady: false,
       playerNamedSlotIds: [],
       signalSaving: false,
+      saving: false,
       ...emptySector,
     });
     await get().loadLeaderboard();
@@ -2269,7 +2488,7 @@ function participantsFromStart(
     .map((entry) => ({
       slotId: crypto.randomUUID(),
       bibNumber: entry.bibNumber,
-      displayName: entry.displayName.trim(),
+      displayName: entry.ghost ? entry.displayName.trim() : numberedAthleteName(entry.bibNumber),
       groupId: entry.groupId,
       ghost: entry.ghost,
     }))
@@ -2280,14 +2499,17 @@ function gridFromSeats(participants: readonly RegisteredParticipant[], seats: re
   const byBib = new Map(participants.map((participant) => [participant.bibNumber, participant]));
   const slots: GridSlot[] = [];
   for (const seat of seats) {
-    const left = byBib.get(seat.leftBib);
-    const right = seat.rightBib === null ? null : byBib.get(seat.rightBib) ?? null;
-    if (!left || (seat.rightBib !== null && !right)) continue;
-    if (right) {
+    const left = seat.leftBib > 0 ? (byBib.get(seat.leftBib) ?? null) : null;
+    const right = seat.rightBib !== null && seat.rightBib > 0 ? (byBib.get(seat.rightBib) ?? null) : null;
+    if (seat.leftBib > 0 && !left) continue;
+    if (seat.rightBib !== null && seat.rightBib > 0 && !right) continue;
+    if (left && right) {
       slots.push(seatSlot(seat, left, right.slotId, "left"));
       slots.push(seatSlot(seat, right, left.slotId, "right"));
-    } else {
+    } else if (left) {
       slots.push(seatSlot(seat, left, null, "left"));
+    } else if (right) {
+      slots.push(seatSlot(seat, right, null, "right"));
     }
   }
   return slots;

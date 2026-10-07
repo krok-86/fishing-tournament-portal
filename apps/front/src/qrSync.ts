@@ -407,7 +407,9 @@ export interface StartSeat {
   round: RoundIndex;
   period: PeriodIndex;
   sectorId: string;
+  /** 0 — левый борт пустой, одиночка сидит справа. */
   leftBib: number;
+  /** null — правый борт пустой. */
   rightBib: number | null;
 }
 
@@ -416,8 +418,19 @@ export interface StartSnapshot {
   sectorCount: number;
   period: PeriodIndex;
   phase: PeriodPhase;
+  tournamentName: string;
+  /** ISO `YYYY-MM-DD`. */
+  tournamentDate: string;
   participants: readonly StartParticipant[];
   seats: readonly StartSeat[];
+}
+
+export function isTournamentDate(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const [year, month, day] = value.split("-").map(Number);
+  if (!year || !month || !day) return false;
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
 }
 
 export type StartDecodeResult = { ok: true; snapshot: StartSnapshot } | { ok: false; error: string };
@@ -442,7 +455,7 @@ export function seatsFromGrid(grid: readonly GridSlot[], bibBySlot: ReadonlyMap<
     grouped.set(key, seat);
   }
   return [...grouped.values()]
-    .filter((seat) => seat.leftBib > 0)
+    .filter((seat) => seat.leftBib > 0 || (seat.rightBib !== null && seat.rightBib > 0))
     .sort(
       (left, right) =>
         left.round - right.round ||
@@ -454,6 +467,7 @@ export function seatsFromGrid(grid: readonly GridSlot[], bibBySlot: ReadonlyMap<
 
 export function serializeStartSnapshot(snapshot: StartSnapshot): string {
   const header = `1|${snapshot.periodsPerRound}|${snapshot.sectorCount}|${snapshot.period}|${phaseLetter(snapshot.phase)}`;
+  const meta = `M\t${escapeField(snapshot.tournamentName.trim())}\t${snapshot.tournamentDate}`;
   const people = [...snapshot.participants]
     .sort((left, right) => left.bibNumber - right.bibNumber)
     .map(
@@ -470,12 +484,13 @@ export function serializeStartSnapshot(snapshot: StartSnapshot): string {
   for (const seat of seats) {
     const key = `${seat.round}.${seat.period}`;
     const list = lines.get(key) ?? [];
+    const left = seat.leftBib > 0 ? String(seat.leftBib) : "";
     const right = seat.rightBib === null ? "" : String(seat.rightBib);
-    list.push(`${seat.sectorId}=${seat.leftBib}/${right}`);
+    list.push(`${seat.sectorId}=${left}/${right}`);
     lines.set(key, list);
   }
   const grid = [...lines.entries()].map(([key, list]) => `${key}:${list.join(",")}`);
-  return [header, ...people, "#", ...grid].join("\n");
+  return [header, meta, ...people, "#", ...grid].join("\n");
 }
 
 export async function encodeStartSnapshot(snapshot: StartSnapshot): Promise<string> {
@@ -517,9 +532,25 @@ export function parseStartSnapshot(plain: string): StartDecodeResult {
   }
   if (!isQualifyingPeriod(period) || !phase) return { ok: false, error: "В стартовом коде неверный период" };
 
+  let tournamentName = "Локальный турнир";
+  let tournamentDate = "";
+  let sawMeta = false;
   const participants: StartParticipant[] = [];
   const seenBibs = new Set<number>();
   for (const line of lines.slice(1, splitAt)) {
+    if (line.startsWith("M\t")) {
+      if (sawMeta) return { ok: false, error: "В стартовом коде повторяется название" };
+      sawMeta = true;
+      const [, nameText, dateText] = line.split("\t");
+      const name = unescapeField(nameText ?? "").trim().replace(/\s+/g, " ");
+      const date = (dateText ?? "").trim();
+      if (!name || !isTournamentDate(date)) {
+        return { ok: false, error: "В стартовом коде нет названия или даты" };
+      }
+      tournamentName = name;
+      tournamentDate = date;
+      continue;
+    }
     const [bibText, nameText, groupText, ghostText] = line.split("\t");
     const bibNumber = Number(bibText);
     const displayName = unescapeField(nameText ?? "").trim();
@@ -553,20 +584,26 @@ export function parseStartSnapshot(plain: string): StartDecodeResult {
     const seenHere = new Set<number>();
     const seenSectors = new Set<string>();
     for (const chunk of (match[3] ?? "").split(",")) {
-      const seatMatch = /^(\d+)=(\d+)\/(\d*)$/.exec(chunk);
+      const seatMatch = /^(\d+)=(\d*)\/(\d*)$/.exec(chunk);
       if (!seatMatch) return { ok: false, error: "В стартовом коде повреждена пара" };
       const sectorId = seatMatch[1] ?? "";
-      const leftBib = Number(seatMatch[2]);
+      const leftText = seatMatch[2] ?? "";
       const rightText = seatMatch[3] ?? "";
+      const leftBib = leftText.length === 0 ? 0 : Number(leftText);
       const rightBib = rightText.length === 0 ? null : Number(rightText);
-      if (!seenBibs.has(leftBib) || (rightBib !== null && !seenBibs.has(rightBib))) {
+      if (leftBib === 0 && rightBib === null) return { ok: false, error: "В стартовом коде пустой сектор" };
+      if ((leftBib !== 0 && !seenBibs.has(leftBib)) || (rightBib !== null && !seenBibs.has(rightBib))) {
         return { ok: false, error: "В сетке есть номер, которого нет в стартовом листе" };
       }
-      if (rightBib === leftBib || seenHere.has(leftBib) || (rightBib !== null && seenHere.has(rightBib))) {
+      if (
+        (leftBib !== 0 && rightBib === leftBib) ||
+        (leftBib !== 0 && seenHere.has(leftBib)) ||
+        (rightBib !== null && seenHere.has(rightBib))
+      ) {
         return { ok: false, error: "В одном периоде номер стоит дважды" };
       }
       if (seenSectors.has(sectorId)) return { ok: false, error: "В одном периоде повторяется сектор" };
-      seenHere.add(leftBib);
+      if (leftBib !== 0) seenHere.add(leftBib);
       if (rightBib !== null) seenHere.add(rightBib);
       seenSectors.add(sectorId);
       seats.push({ round, period: seatPeriod, sectorId, leftBib, rightBib });
@@ -581,6 +618,8 @@ export function parseStartSnapshot(plain: string): StartDecodeResult {
       sectorCount,
       period,
       phase,
+      tournamentName,
+      tournamentDate,
       participants,
       seats,
     },

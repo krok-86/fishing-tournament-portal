@@ -2,12 +2,12 @@ import { useEffect, useState } from "react";
 import { AthleteQrButton } from "./components/AthleteQrButton.tsx";
 import { DrawScanner } from "./components/DrawScanner.tsx";
 import { Leaderboard } from "./components/Leaderboard.tsx";
-import { PeriodControl } from "./components/PeriodControl.tsx";
 import { PlayoffEntryDialog, playoffStageTitle } from "./components/PlayoffBracket.tsx";
 import { QrIntake } from "./components/QrIntake.tsx";
+import { Toaster } from "./components/Toaster.tsx";
 import { TournamentInit } from "./components/TournamentInit.tsx";
-import { periodStatusLabel } from "./qrSync.ts";
 import { useMatchStore } from "./store.ts";
+import { confirmAndToast, toast } from "./toast.ts";
 import { playoffMatches } from "../../../packages/shared/src/calculator.ts";
 import { QUALIFYING_PERIODS } from "../../../packages/shared/src/types.ts";
 
@@ -43,16 +43,32 @@ function App() {
   const hydrate = useMatchStore((state) => state.hydrate);
 
   useEffect(() => {
-    void hydrate();
+    void hydrate().then(() => {
+      const message = useMatchStore.getState().setupError;
+      if (message) toast("err", message);
+    });
   }, [hydrate]);
 
-  if (surface === "organizer") return <OrganizerScreen />;
-  return <PlayerScreen />;
+  return (
+    <>
+      {surface === "organizer" ? <OrganizerScreen /> : <PlayerScreen />}
+      <Toaster />
+    </>
+  );
+}
+
+async function takeOrganizerCode(raw: string): Promise<string | null> {
+  const result = await useMatchStore.getState().acceptOrganizerCode(raw);
+  if (!result.ok) {
+    toast("err", result.error);
+    return result.error;
+  }
+  toast("ok", result.fresh ? "Жеребьёвка записана" : result.label);
+  return null;
 }
 
 function OrganizerScreen() {
   const [tab, setTab] = useState<OrganizerTab>("setup");
-  const tournamentOpened = useMatchStore((state) => state.tournamentOpened);
   const wide = tab === "table";
 
   return (
@@ -70,7 +86,6 @@ function OrganizerScreen() {
           Таблица лидеров
         </TabButton>
       </div>
-      {tournamentOpened && <PeriodControl />}
       {tab === "setup" ? (
         <TournamentInit />
       ) : tab === "scan" ? (
@@ -111,6 +126,7 @@ function PlayerScreen() {
 
   return (
     <main className="mx-auto flex min-h-dvh w-full max-w-lg flex-col bg-slate-950 px-3 pt-[max(0.75rem,env(safe-area-inset-top))] pb-[max(0.75rem,env(safe-area-inset-bottom))] text-white sm:px-6">
+      {hydrated && tournamentOpened && <ConnectedTournament />}
       <p className="px-1 text-xs font-bold tracking-[0.2em] text-cyan-200/80 uppercase">Игрок</p>
       {!hydrated ? (
         <p className="mt-4 text-sm text-slate-400">Читаем журнал…</p>
@@ -140,8 +156,24 @@ function PlayerScreen() {
   );
 }
 
+function ConnectedTournament() {
+  const tournamentName = useMatchStore((state) => state.tournamentName);
+  const tournamentDate = useMatchStore((state) => state.tournamentDate);
+  return (
+    <section className="mb-4 rounded-3xl bg-gradient-to-br from-emerald-300 to-teal-500 px-5 py-4 text-slate-950 shadow-lg">
+      <p className="text-lg leading-snug font-black">Успешно подключен к турниру: {tournamentName}</p>
+      <p className="mt-1 text-base font-bold">Дата: {formatTournamentDate(tournamentDate)}</p>
+    </section>
+  );
+}
+
+function formatTournamentDate(iso: string): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
+  if (!match) return iso || "—";
+  return `${match[3]}.${match[2]}.${match[1]}`;
+}
+
 function AwaitingDraw() {
-  const acceptOrganizerCode = useMatchStore((state) => state.acceptOrganizerCode);
   const [scanning, setScanning] = useState(false);
 
   if (scanning) {
@@ -149,10 +181,7 @@ function AwaitingDraw() {
       <DrawScanner
         title="Жеребьёвка организатора"
         hint="Наведите камеру на стартовый QR с ноутбука орга."
-        onCode={async (raw) => {
-          const result = await acceptOrganizerCode(raw);
-          return result.ok ? null : result.error;
-        }}
+        onCode={takeOrganizerCode}
         onClose={() => setScanning(false)}
       />
     );
@@ -227,7 +256,6 @@ function JudgeScreen({
   const selfSlotId = useMatchStore((state) => state.selfSlotId);
   const briefing = useMatchStore((state) => state.briefing);
   const selectAthlete = useMatchStore((state) => state.selectAthlete);
-  const setPeriod = useMatchStore((state) => state.setPeriod);
   const playoff = useMatchStore((state) => state.playoff);
   const selectedPlayoffMatchId = useMatchStore((state) => state.selectedPlayoffMatchId);
   const playoffEntryOpen = useMatchStore((state) => state.playoffEntryOpen);
@@ -256,7 +284,13 @@ function JudgeScreen({
               key={item}
               type="button"
               className={`h-10 rounded-xl text-sm font-black ${item === period ? "bg-cyan-300 text-slate-950" : "bg-slate-900 text-slate-300"}`}
-              onClick={() => setPeriod(item)}
+              onClick={() => {
+                if (item === period) return;
+                void useMatchStore.getState().signalPeriod(item, useMatchStore.getState().periodPhase).then((ok) => {
+                  if (ok) toast("ok", `Период ${item}`);
+                  else toast("err", useMatchStore.getState().error ?? "Не удалось сменить период");
+                });
+              }}
             >
               {item}
             </button>
@@ -319,19 +353,28 @@ function JudgeScreen({
             className="mt-2 h-12 w-full rounded-xl border border-white/10 bg-slate-950 px-3 text-base font-semibold text-white outline-none focus:border-cyan-300 disabled:opacity-50"
             value={playoffFormed ? selfSlotId : athleteSlotId}
             disabled={saving}
-            onChange={(event) => selectAthlete(event.target.value)}
+            onChange={(event) => {
+              selectAthlete(event.target.value);
+              const message = useMatchStore.getState().error;
+              if (message) toast("err", message);
+            }}
           >
             <option value="">Выберите номер</option>
             {fishing.map((participant) => (
               <option key={participant.slotId} value={participant.slotId}>
-                {playerNamedSlotIds.includes(participant.slotId)
-                  ? `№${participant.bibNumber} · ${participant.displayName}`
-                  : `Игрок №${participant.bibNumber}`}
+                №{participant.bibNumber} · {participant.displayName}
               </option>
             ))}
           </select>
           </label>
-          {identitySlotId && <AthleteNameField key={identitySlotId} slotId={identitySlotId} saved={nameReady} />}
+          {identitySlotId && (
+            <AthleteNameField
+              key={identitySlotId}
+              slotId={identitySlotId}
+              saved={nameReady}
+              editable={!playoffFormed}
+            />
+          )}
         </div>
       )}
 
@@ -376,7 +419,7 @@ function JudgeScreen({
           type="button"
           className="h-16 w-full rounded-2xl bg-amber-400 text-lg font-black tracking-wide text-slate-950 disabled:bg-slate-700 disabled:text-slate-400"
           disabled={locked || confirmed}
-          onClick={() => void confirmPeriod()}
+          onClick={() => void confirmAndToast(confirmPeriod)}
         >
           {saving
             ? "Сохраняем..."
@@ -398,19 +441,44 @@ function JudgeScreen({
   );
 }
 
-function AthleteNameField({ slotId, saved }: { slotId: string; saved: boolean }) {
+function AthleteNameField({
+  slotId,
+  saved,
+  editable,
+}: {
+  slotId: string;
+  saved: boolean;
+  editable: boolean;
+}) {
   const participant = useMatchStore((state) => state.participants.find((item) => item.slotId === slotId));
   const replaceParticipant = useMatchStore((state) => state.replaceParticipant);
   const [draft, setDraft] = useState("");
+  const [editing, setEditing] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   if (!participant) return null;
-  if (saved) {
+  if (saved && !editing) {
     return (
-      <p className="mt-3 text-lg font-black text-white">
-        №{participant.bibNumber} · {participant.displayName}
-      </p>
+      <div className="mt-3 flex items-center gap-2">
+        <p className="min-w-0 flex-1 text-lg font-black text-white">
+          №{participant.bibNumber} · {participant.displayName}
+        </p>
+        {editable && (
+          <button
+            type="button"
+            className="grid h-11 w-11 shrink-0 place-items-center rounded-xl border border-white/10 bg-slate-950 text-cyan-200"
+            aria-label="Редактировать ФИО"
+            onClick={() => {
+              setDraft(participant.displayName);
+              setError(null);
+              setEditing(true);
+            }}
+          >
+            <PencilIcon />
+          </button>
+        )}
+      </div>
     );
   }
 
@@ -422,13 +490,20 @@ function AthleteNameField({ slotId, saved }: { slotId: string; saved: boolean })
         const name = draft.trim().replace(/\s+/g, " ");
         if (name.length < 2) {
           setError("Введите ФИО");
+          toast("err", "Введите ФИО");
           return;
         }
         setBusy(true);
         setError(null);
         void replaceParticipant(slotId, name).then((ok) => {
           setBusy(false);
-          if (!ok) setError("Не удалось записать ФИО");
+          if (!ok) {
+            setError("Не удалось записать ФИО");
+            toast("err", "Не удалось записать ФИО");
+            return;
+          }
+          setEditing(false);
+          toast("ok", "ФИО сохранено");
         });
       }}
     >
@@ -447,21 +522,43 @@ function AthleteNameField({ slotId, saved }: { slotId: string; saved: boolean })
       <p className="mt-2 text-xs leading-relaxed text-slate-400">
         Номер и ФИО остаются на телефоне и уходят организатору после 8-го периода.
       </p>
-      <button
-        type="submit"
-        className="mt-3 h-12 w-full rounded-xl bg-cyan-300 text-sm font-black text-slate-950 disabled:opacity-40"
-        disabled={busy || draft.trim().length < 2}
-      >
-        {busy ? "Записываем…" : "Сохранить ФИО"}
-      </button>
+      <div className="mt-3 flex gap-2">
+        <button
+          type="submit"
+          className="h-12 flex-1 rounded-xl bg-cyan-300 text-sm font-black text-slate-950 disabled:opacity-40"
+          disabled={busy || draft.trim().length < 2}
+        >
+          {busy ? "Записываем…" : "Сохранить ФИО"}
+        </button>
+        {editing && (
+          <button
+            type="button"
+            className="h-12 rounded-xl border border-white/10 px-4 text-sm font-black text-slate-200 disabled:opacity-40"
+            disabled={busy}
+            onClick={() => {
+              setEditing(false);
+              setError(null);
+            }}
+          >
+            Отмена
+          </button>
+        )}
+      </div>
       {error && <p className="mt-2 text-sm font-semibold text-rose-300">{error}</p>}
     </form>
   );
 }
 
+function PencilIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="h-5 w-5" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2">
+      <path strokeLinecap="round" strokeLinejoin="round" d="M12 20h9" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4 11.5-11.5z" />
+    </svg>
+  );
+}
+
 function PeriodStatus({ playoffFormed, period }: { playoffFormed: boolean; period: number }) {
-  const phase = useMatchStore((state) => state.periodPhase);
-  const acceptOrganizerCode = useMatchStore((state) => state.acceptOrganizerCode);
   const [scanning, setScanning] = useState(false);
 
   if (playoffFormed) {
@@ -474,18 +571,15 @@ function PeriodStatus({ playoffFormed, period }: { playoffFormed: boolean; perio
 
   return (
     <>
-      <section className="mt-4 rounded-3xl border border-white/10 bg-white/5 px-5 py-6 text-center" aria-live="polite">
-        <p className="text-3xl leading-tight font-black text-balance sm:text-4xl">{periodStatusLabel(period, phase)}</p>
-        <p className="mt-3 text-sm leading-relaxed text-slate-300">Ориентируйтесь по сирене организатора на водоёме.</p>
+      <section className="mt-4 rounded-3xl border border-white/10 bg-white/5 px-5 py-4 text-center" aria-live="polite">
+        <p className="text-xs font-bold tracking-[0.2em] text-cyan-100/80 uppercase">Период</p>
+        <p className="text-5xl leading-none font-black tabular-nums">{period}</p>
       </section>
       {scanning ? (
         <DrawScanner
           title="Сигнал периода"
           hint="Наведите камеру на QR сигнала с экрана организатора."
-          onCode={async (raw) => {
-            const result = await acceptOrganizerCode(raw);
-            return result.ok ? null : result.error;
-          }}
+          onCode={takeOrganizerCode}
           onClose={() => setScanning(false)}
         />
       ) : (
