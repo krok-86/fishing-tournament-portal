@@ -1,4 +1,4 @@
-import { type DuelPoints, type DuelResult, type FishCount, type GridSlot, type LeaderboardEntry, type LoneNeighborInput, type PlayoffBracketMatch, type PlayoffDecision, type PlayoffPairing, type PlayoffProjection, type PlayoffSeed, type TournamentCalculator, type TournamentEvent, type VirtualDuelResult } from "./types.js";
+import { type DuelPoints, type DuelResult, type FishCount, type GridSlot, type LeaderboardEntry, type LoneNeighborInput, type PeriodIndex, type PlayoffBracketMatch, type PlayoffDecision, type PlayoffPairing, type PlayoffProjection, type PlayoffSeed, type RoundIndex, type Side, type TournamentCalculator, type TournamentEvent, type VirtualDuelResult } from "./types.js";
 /**
  * Очки одного спортсмена:
  * 0 рыб → 0; больше соперника → 4; поровну и оба поймали → 2; меньше, но рыба есть → 1.
@@ -12,14 +12,32 @@ export declare function scoreDuel(fishA: FishCount, fishB: FishCount): DuelPoint
 export declare function scorePlayoffDuel(fishA: FishCount, fishB: FishCount, placeA: number, seedA: number, placeB: number, seedB: number): PlayoffDecision;
 export declare function calculateDuels(events: readonly TournamentEvent[]): DuelResult[];
 export declare function generateLeaderboard(events: readonly TournamentEvent[]): LeaderboardEntry[];
+/** Виртуальный соперник нечётного состава. В сетку слотом не сажается. */
+export declare const GHOST_ID: "GHOST";
+export declare function isGhostOpponent(slotId: string | null | undefined): boolean;
 /**
- * Сетка переходов.
- * Нечётный номер меняет борт каждый период, начиная слева. Чётный — начиная справа.
- * Сектор тоже меняется каждый период. Повтор пары при 9 участниках на 8 периодах
- * бывает не больше одного раза и не в соседних турах.
- * Нечётный список: один спортсмен периода сидит без соперника, его борт входит в баланс.
+ * Стартовый борт, если история номера ещё неизвестна.
+ * Период 1: нечётный слева, чётный справа. Дальше формула чередует борт.
  */
-export declare function generateTournamentGrid(participantIds: string[], periodsCount: number): GridSlot[];
+export declare function bankSide(bibNumber: number, periodNumber: number): Side;
+export interface SectorMapSeat {
+    sectorId: string;
+    order: number;
+    leftSlotId: string | null;
+    rightSlotId: string | null;
+}
+/** Сосед одиночки: ближайший сектор в сторону пустого борта. */
+export declare function comparisonNeighborId(seats: readonly SectorMapSeat[], loneSlotId: string): string | null;
+/** Сосед одиночки по карте секторов. Борт берётся из слота жеребьёвки. */
+export declare function comparisonNeighborFromGrid(grid: readonly GridSlot[], loneSlotId: string, period: PeriodIndex, round?: RoundIndex, skipSlotIds?: ReadonlySet<string>): string | null;
+/**
+ * Сетка отбора. Нечётный состав дополняется GHOST.
+ * Период 1 — чётный с нечётным, пары перемешаны.
+ * Дальше разрешены пары одной чётности. Повтор меняет борта и сектор.
+ * Сектор не повторяется два периода подряд. Поздний возврат меняет борт относительно прошлого визита.
+ * Одинаковые номера с разными id участников дают разные листы. Один список остаётся стабильным.
+ */
+export declare function generateTournamentGrid(participantIds: readonly string[], periodsCount: number, bibNumbers?: readonly number[]): GridSlot[];
 export declare function readTransitionGrid(events: readonly TournamentEvent[]): GridSlot[];
 export declare const emptyPlayoffProjection: PlayoffProjection;
 /** Первые восемь строк таблицы. seed — порядок, place — место отбора. */

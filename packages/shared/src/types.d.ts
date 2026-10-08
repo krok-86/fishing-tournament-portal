@@ -55,6 +55,8 @@ export interface TournamentOpenedEvent extends TournamentEventBase {
     payload: {
         rulesetId: RulesetId;
         name: string;
+        /** День проведения, ISO `YYYY-MM-DD`. Пусто у турниров, открытых до этого поля. */
+        date?: string;
         periodsPerRound: typeof QUALIFYING_PERIOD_COUNT;
         rounds: 2;
         /** Сколько секторов на водоёме зафиксировано при открытии. */
@@ -129,8 +131,9 @@ export interface DuelAssignedEvent extends TournamentEventBase {
     payload: ManualDuel;
 }
 /**
- * Зафиксированный выбор соседа для одиночки из матрицы.
- * Пока это событие не записано, виртуальные очки за период не начисляются.
+ * Зафиксированный сосед одиночки.
+ * Если события нет, очки всё равно считаются: сосед — ближайший по сектору в этом периоде.
+ * Очки виртуальной дуэли получает только одиночка.
  */
 export interface LoneComparedEvent extends TournamentEventBase {
     type: "LONE_COMPARED";
@@ -212,6 +215,15 @@ export interface PeriodCompletedEvent extends TournamentEventBase {
         round: RoundIndex;
         period: PeriodIndex;
         protocols: readonly ProtocolSignature[];
+    };
+}
+/** Сирена на водоёме. На очки не влияет: телефоны сверяют по ней период, а не по своим часам. */
+export type PeriodPhase = "waiting" | "fishing" | "closed";
+export interface PeriodSignalEvent extends TournamentEventBase {
+    type: "PERIOD_SIGNAL";
+    payload: {
+        period: PeriodIndex;
+        phase: PeriodPhase;
     };
 }
 export type PlayoffStage = "quarterfinal" | "semifinal" | "final";
@@ -299,7 +311,7 @@ export interface ProtocolSignature {
     slotIdB: string | null;
     signed: boolean;
 }
-export type TournamentEvent = TournamentOpenedEvent | ParticipantRegisteredEvent | DrawSeededEvent | DuelAssignedEvent | LoneComparedEvent | ParticipantReplacedEvent | ParticipantSetGhostEvent | ParticipantRemovedEvent | CatchRecordedEvent | TransitionDecidedEvent | CardIssuedEvent | PeriodCompletedEvent | PlayoffFormedEvent | PlayoffDuelScoredEvent | PlayoffSideReportedEvent;
+export type TournamentEvent = TournamentOpenedEvent | ParticipantRegisteredEvent | DrawSeededEvent | DuelAssignedEvent | LoneComparedEvent | ParticipantReplacedEvent | ParticipantSetGhostEvent | ParticipantRemovedEvent | CatchRecordedEvent | TransitionDecidedEvent | CardIssuedEvent | PeriodCompletedEvent | PeriodSignalEvent | PlayoffFormedEvent | PlayoffDuelScoredEvent | PlayoffSideReportedEvent;
 /** isSynced живёт только на устройстве и в доменную свёртку не входит. */
 export interface LocalEventRecord {
     event: TournamentEvent;
@@ -438,7 +450,7 @@ export interface LeaderboardEntry {
 export interface TournamentCalculator {
     /** Очки одной пары. Карта переходов не нужна. */
     scoreDuel(fishA: FishCount, fishB: FishCount): DuelPoints;
-    /** Дуэли из DRAW_SEEDED и DUEL_ASSIGNED. Одиночки из матрицы — только если есть LONE_COMPARED. */
+    /** Дуэли из матрицы и ручных пар. Одиночка сравнивается с ближайшим соседом по сектору. */
     calculateDuels(events: readonly TournamentEvent[]): DuelResult[];
     /** Сквозная таблица. Сортировка по TieBreakCriterion. */
     generateLeaderboard(events: readonly TournamentEvent[]): LeaderboardEntry[];

@@ -18,5 +18,12 @@ const https = devHttps();
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
-  ...(https ? { server: { https } } : {}),
+  server: {
+    // Документация и закладки организатора завязаны на этот порт.
+    port: 5174,
+    strictPort: true,
+    // Телефон в той же Wi‑Fi открывает ноутбук по адресу 192.168.x.x, не по localhost.
+    host: true,
+    ...(https ? { https } : {}),
+  },
 });

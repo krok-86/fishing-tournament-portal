@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import type { GridSlot, PeriodIndex } from "../../../../packages/shared/src/types.ts";
-import { encodeStartSnapshot, periodStatusLabel, seatsFromGrid, type StartSnapshot } from "../qrSync.ts";
+import { encodeStartSnapshot, isTournamentDate, periodStatusLabel, seatsFromGrid, type StartSnapshot } from "../qrSync.ts";
 import {
   scheduleGrid,
   sectorsForPeriod,
@@ -42,11 +42,13 @@ export function TournamentInit() {
   const [seeding, setSeeding] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
+  const [openAttempted, setOpenAttempted] = useState(false);
   const seedLock = useRef(false);
 
   const locked = tournamentOpened || setupSaving;
   const parsedArrival = Number.parseInt(arrivalCount, 10);
   const arrivalReady = Number.isInteger(parsedArrival) && parsedArrival >= 2 && participants.length === 0;
+  const openIssues = openAttempted ? collectOpenIssues(name, date, participants.length) : [];
 
   async function addParticipant(event: FormEvent) {
     event.preventDefault();
@@ -102,6 +104,16 @@ export function TournamentInit() {
   }
 
   async function open() {
+    if (tournamentOpened || setupSaving) return;
+    const issues = collectOpenIssues(name, date, participants.length);
+    setOpenAttempted(true);
+    if (issues.length > 0) {
+      toast("err", OPEN_ISSUE_TEXT[issues[0]]);
+      const fieldId = issues[0] === "roster" ? "starter-list" : issues[0] === "date" ? "tournament-date" : "tournament-name";
+      document.getElementById(fieldId)?.scrollIntoView({ behavior: "smooth", block: "center" });
+      if (issues[0] !== "roster") document.getElementById(fieldId)?.focus();
+      return;
+    }
     const trimmedName = name.trim();
     setOpening(true);
     const started = await startTournament({ name: trimmedName, date });
@@ -129,6 +141,7 @@ export function TournamentInit() {
       setArrivalCount("");
       setName("");
       setDate(todayIso());
+      setOpenAttempted(false);
       toast("ok", "Турнир сброшен");
     } else {
       toast("err", useMatchStore.getState().setupError ?? "Не удалось сбросить турнир");
@@ -159,10 +172,13 @@ export function TournamentInit() {
         </label>
         <input
           id="tournament-name"
-          className="mt-2 h-12 w-full rounded-xl border border-white/10 bg-slate-950 px-3 text-base text-white outline-none placeholder:text-slate-500 focus:border-cyan-300 disabled:opacity-50"
+          className={`mt-2 h-12 w-full rounded-xl border bg-slate-950 px-3 text-base text-white outline-none placeholder:text-slate-500 focus:border-cyan-300 disabled:opacity-50 ${
+            openIssues.includes("name") ? "border-rose-400" : "border-white/10"
+          }`}
           value={tournamentOpened ? tournamentName : name}
           placeholder="Trout Cup"
           disabled={locked}
+          aria-invalid={openIssues.includes("name")}
           onChange={(event) => setName(event.target.value)}
         />
         <label className="mt-4 block text-sm font-bold tracking-wide text-cyan-100/80 uppercase" htmlFor="tournament-date">
@@ -170,10 +186,13 @@ export function TournamentInit() {
         </label>
         <input
           id="tournament-date"
-          className="scheme-dark mt-2 h-12 w-full rounded-xl border border-white/10 bg-slate-950 px-3 text-base text-white outline-none focus:border-cyan-300 disabled:opacity-50"
+          className={`scheme-dark mt-2 h-12 w-full rounded-xl border bg-slate-950 px-3 text-base text-white outline-none focus:border-cyan-300 disabled:opacity-50 ${
+            openIssues.includes("date") ? "border-rose-400" : "border-white/10"
+          }`}
           type="date"
           value={tournamentOpened ? tournamentDate : date}
           disabled={locked}
+          aria-invalid={openIssues.includes("date")}
           onChange={(event) => setDate(event.target.value)}
         />
       </div>
@@ -231,7 +250,9 @@ export function TournamentInit() {
             </p>
             <button
               type="button"
-              className="h-10 rounded-xl border border-rose-300/40 bg-rose-400/10 text-xs font-bold text-rose-100 disabled:opacity-40"
+              className={`h-10 rounded-xl text-xs font-black disabled:opacity-40 ${
+                confirmClear ? "bg-rose-500 text-white" : "bg-amber-400 text-slate-950"
+              }`}
               disabled={setupSaving}
               onClick={() => void clearList()}
             >
@@ -278,14 +299,23 @@ export function TournamentInit() {
 
       <PeriodPlan participants={participants} grid={drawGrid} periodsCount={periodsCount} />
 
-      <button
-        type="button"
-        className="h-16 rounded-2xl bg-amber-400 text-lg font-black tracking-wide text-slate-950 disabled:bg-slate-700 disabled:text-slate-400"
-        disabled={tournamentOpened || setupSaving || participants.length < 2 || name.trim().length === 0 || date.length === 0}
-        onClick={() => void open()}
-      >
-        {opening ? "Сохраняем..." : tournamentOpened ? "Турнир открыт" : "Открыть турнир"}
-      </button>
+      <div className="grid gap-2">
+        <button
+          type="button"
+          className="h-16 rounded-2xl bg-emerald-400 text-lg font-black tracking-wide text-slate-950 disabled:bg-slate-700 disabled:text-slate-400"
+          disabled={tournamentOpened || setupSaving}
+          onClick={() => void open()}
+        >
+          {opening ? "Сохраняем..." : tournamentOpened ? "Турнир открыт" : "Открыть турнир"}
+        </button>
+        {openIssues.length > 0 && (
+          <ul className="grid gap-1 px-1 text-sm font-semibold text-rose-300" aria-live="polite">
+            {openIssues.map((issue) => (
+              <li key={issue}>{OPEN_ISSUE_TEXT[issue]}</li>
+            ))}
+          </ul>
+        )}
+      </div>
       {tournamentOpened && <StartQrCard />}
       <button
         type="button"
@@ -304,6 +334,22 @@ export function TournamentInit() {
   );
 }
 
+type OpenIssue = "name" | "date" | "roster";
+
+const OPEN_ISSUE_TEXT: Record<OpenIssue, string> = {
+  name: "Укажите название турнира",
+  date: "Укажите дату проведения",
+  roster: "Добавьте хотя бы двух участников",
+};
+
+function collectOpenIssues(name: string, date: string, participantCount: number): OpenIssue[] {
+  const issues: OpenIssue[] = [];
+  if (name.trim().length === 0) issues.push("name");
+  if (!isTournamentDate(date)) issues.push("date");
+  if (participantCount < 2) issues.push("roster");
+  return issues;
+}
+
 function todayIso(): string {
   const now = new Date();
   const month = String(now.getMonth() + 1).padStart(2, "0");
@@ -318,14 +364,17 @@ function StartQrCard() {
   const sectorCount = useMatchStore((state) => state.sectorCount);
   const period = useMatchStore((state) => state.period);
   const phase = useMatchStore((state) => state.periodPhase);
+  const officiallyStarted = useMatchStore((state) => state.officiallyStarted);
+  const qrPeriod = officiallyStarted ? period : 1;
+  const qrPhase = officiallyStarted ? phase : "waiting";
   const tournamentName = useMatchStore((state) => state.tournamentName);
   const tournamentDate = useMatchStore((state) => state.tournamentDate);
   const snapshot = useMemo<StartSnapshot>(
     () => ({
       periodsPerRound: periodsCount,
       sectorCount,
-      period,
-      phase,
+      period: qrPeriod,
+      phase: qrPhase,
       tournamentName,
       tournamentDate,
       participants: participants.map((participant) => ({
@@ -339,7 +388,7 @@ function StartQrCard() {
         new Map(participants.map((participant) => [participant.slotId, participant.bibNumber])),
       ),
     }),
-    [participants, grid, periodsCount, sectorCount, period, phase, tournamentName, tournamentDate],
+    [participants, grid, periodsCount, sectorCount, qrPeriod, qrPhase, tournamentName, tournamentDate],
   );
   const plain = useMemo(() => JSON.stringify(snapshot), [snapshot]);
   const [packet, setPacket] = useState<{ key: string; payload: string } | null>(null);
@@ -374,7 +423,9 @@ function StartQrCard() {
       <p className="mt-2 text-sm text-slate-300">
         В коде сжатая сетка Бергера и стартовый лист. Игрок сканирует его один раз — телефон записывает жеребьёвку и открывает ввод поимок.
       </p>
-      <p className="mt-2 text-sm font-bold text-cyan-100">{periodStatusLabel(period, phase)}</p>
+      <p className="mt-2 text-sm font-bold text-cyan-100">
+        {officiallyStarted ? periodStatusLabel(period, phase) : "ОЖИДАНИЕ СТАРТА ТУРНИРА (ПЕРИОД 1)"}
+      </p>
       {error && <p className="mt-3 text-sm text-rose-300">{error}</p>}
       {!payload && !error && <p className="mt-3 text-sm text-slate-400">Собираем код…</p>}
       {payload && tooWide && (

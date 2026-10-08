@@ -1,5 +1,8 @@
 # Проект: Fishing Tournament Portal (Движок офлайн-расчетов)
-
+nvm use 20
+npm run front:dev -- --host
+Организатор: http://localhost:5174/admin-secret-setup
+Участник: http://localhost:5174/
 ## 1. Архитектура проекта
 - Это монорепозиторий (npm workspaces).
 - `packages/shared` — содержит общие типы и чистые функции расчетов (Pure Functions) на TypeScript. Этот код импортируется как во фронтенд, так и в бэкенд.

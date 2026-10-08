@@ -6,7 +6,8 @@ import { PlayoffEntryDialog, playoffStageTitle } from "./components/PlayoffBrack
 import { QrIntake } from "./components/QrIntake.tsx";
 import { Toaster } from "./components/Toaster.tsx";
 import { TournamentInit } from "./components/TournamentInit.tsx";
-import { useMatchStore } from "./store.ts";
+import { primeScanBeep } from "./scanBeep.ts";
+import { isRealAthleteName, useMatchStore } from "./store.ts";
 import { confirmAndToast, toast } from "./toast.ts";
 import { playoffMatches } from "../../../packages/shared/src/calculator.ts";
 import { QUALIFYING_PERIODS } from "../../../packages/shared/src/types.ts";
@@ -79,7 +80,13 @@ function OrganizerScreen() {
         <TabButton active={tab === "setup"} onClick={() => setTab("setup")}>
           Настройка турнира
         </TabButton>
-        <TabButton active={tab === "scan"} onClick={() => setTab("scan")}>
+        <TabButton
+          active={tab === "scan"}
+          onClick={() => {
+            primeScanBeep();
+            setTab("scan");
+          }}
+        >
           Сканировать QR
         </TabButton>
         <TabButton active={tab === "table"} onClick={() => setTab("table")}>
@@ -255,6 +262,7 @@ function JudgeScreen({
   const athleteSlotId = useMatchStore((state) => state.athleteSlotId);
   const selfSlotId = useMatchStore((state) => state.selfSlotId);
   const briefing = useMatchStore((state) => state.briefing);
+  const neighborLabel = useMatchStore((state) => state.neighborLabel);
   const selectAthlete = useMatchStore((state) => state.selectAthlete);
   const playoff = useMatchStore((state) => state.playoff);
   const selectedPlayoffMatchId = useMatchStore((state) => state.selectedPlayoffMatchId);
@@ -264,10 +272,15 @@ function JudgeScreen({
   const playoffFormed = playoff.formed;
   const playerNamedSlotIds = useMatchStore((state) => state.playerNamedSlotIds);
   const identitySlotId = playoffFormed ? selfSlotId : athleteSlotId;
-  const nameReady = identitySlotId.length > 0 && playerNamedSlotIds.includes(identitySlotId);
+  const identity = participants.find((participant) => participant.slotId === identitySlotId);
+  const nameReady =
+    identity !== undefined &&
+    playerNamedSlotIds.includes(identity.slotId) &&
+    isRealAthleteName(identity.displayName, identity.bibNumber);
   const locked =
     !tournamentOpened || saving || athleteSlotId.length === 0 || (!playoffFormed && (confirmed || !nameReady));
   const fishing = participants.filter((participant) => !participant.ghost);
+  const alone = tournamentOpened && !playoffFormed && athleteSlotId.length > 0 && !hasOpponent;
   const cupMatches = playoffMatches(playoff);
   const nameOf = (slotId: string | null) => {
     if (!slotId) return "Победитель пары";
@@ -405,20 +418,24 @@ function JudgeScreen({
           onPlus={() => adjustFish("athlete", 1)}
           onMinus={() => adjustFish("athlete", -1)}
         />
-        <ScoreCard
-          title={opponentName}
-          count={opponentFish}
-          disabled={locked || !hasOpponent}
-          onPlus={() => adjustFish("opponent", 1)}
-          onMinus={() => adjustFish("opponent", -1)}
-        />
+        {alone ? (
+          <LoneNeighborNotice label={neighborLabel} />
+        ) : (
+          <ScoreCard
+            title={opponentName}
+            count={opponentFish}
+            disabled={locked || !hasOpponent}
+            onPlus={() => adjustFish("opponent", 1)}
+            onMinus={() => adjustFish("opponent", -1)}
+          />
+        )}
       </section>
 
       <div className="sticky bottom-0 mt-4 bg-gradient-to-t from-slate-950 via-slate-950 to-slate-950/0 pt-3">
         <button
           type="button"
           className="h-16 w-full rounded-2xl bg-amber-400 text-lg font-black tracking-wide text-slate-950 disabled:bg-slate-700 disabled:text-slate-400"
-          disabled={locked || confirmed}
+          disabled={locked || confirmed || !nameReady || identitySlotId.length === 0}
           onClick={() => void confirmAndToast(confirmPeriod)}
         >
           {saving
@@ -488,7 +505,7 @@ function AthleteNameField({
       onSubmit={(event) => {
         event.preventDefault();
         const name = draft.trim().replace(/\s+/g, " ");
-        if (name.length < 2) {
+        if (!isRealAthleteName(name, participant.bibNumber)) {
           setError("Введите ФИО");
           toast("err", "Введите ФИО");
           return;
@@ -516,6 +533,9 @@ function AthleteNameField({
         value={draft}
         placeholder="Иванов Иван Иванович"
         autoComplete="name"
+        required
+        minLength={3}
+        aria-required="true"
         disabled={busy}
         onChange={(event) => setDraft(event.target.value)}
       />
@@ -526,7 +546,7 @@ function AthleteNameField({
         <button
           type="submit"
           className="h-12 flex-1 rounded-xl bg-cyan-300 text-sm font-black text-slate-950 disabled:opacity-40"
-          disabled={busy || draft.trim().length < 2}
+          disabled={busy || !isRealAthleteName(draft, participant.bibNumber)}
         >
           {busy ? "Записываем…" : "Сохранить ФИО"}
         </button>
@@ -559,8 +579,6 @@ function PencilIcon() {
 }
 
 function PeriodStatus({ playoffFormed, period }: { playoffFormed: boolean; period: number }) {
-  const [scanning, setScanning] = useState(false);
-
   if (playoffFormed) {
     return (
       <section className="mt-4 rounded-3xl border border-white/10 bg-white/5 px-5 py-6 text-center" aria-live="polite">
@@ -570,30 +588,21 @@ function PeriodStatus({ playoffFormed, period }: { playoffFormed: boolean; perio
   }
 
   return (
-    <>
-      <section className="mt-4 rounded-3xl border border-white/10 bg-white/5 px-5 py-4 text-center" aria-live="polite">
-        <p className="text-xs font-bold tracking-[0.2em] text-cyan-100/80 uppercase">Период</p>
-        <p className="text-5xl leading-none font-black tabular-nums">{period}</p>
-      </section>
-      {scanning ? (
-        <DrawScanner
-          title="Сигнал периода"
-          hint="Наведите камеру на QR сигнала с экрана организатора."
-          onCode={takeOrganizerCode}
-          onClose={() => setScanning(false)}
-        />
-      ) : (
-        <div className="mt-3">
-          <button
-            type="button"
-            className="h-14 w-full rounded-2xl bg-cyan-300 text-base font-black text-slate-950"
-            onClick={() => setScanning(true)}
-          >
-            Сканировать сигнал периода
-          </button>
-        </div>
-      )}
-    </>
+    <section className="mt-4 rounded-3xl border border-white/10 bg-white/5 px-5 py-4 text-center" aria-live="polite">
+      <p className="text-xs font-bold tracking-[0.2em] text-cyan-100/80 uppercase">Период</p>
+      <p className="text-5xl leading-none font-black tabular-nums">{period}</p>
+    </section>
+  );
+}
+
+function LoneNeighborNotice({ label }: { label: string }) {
+  return (
+    <aside className="rounded-3xl border-2 border-amber-200 bg-amber-300 px-4 py-5 text-slate-950 shadow-lg" role="status">
+      <p className="text-sm font-black tracking-[0.16em] uppercase">Внимание</p>
+      <p className="mt-2 text-lg leading-snug font-black">
+        Вы ловите в секторе один. Ваш результат в этом периоде напрямую сравнивается с уловом соседа из соседнего сектора: {label}.
+      </p>
+    </aside>
   );
 }
 

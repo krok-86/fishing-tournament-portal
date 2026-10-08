@@ -1,8 +1,10 @@
 import { create } from "zustand";
 import {
   buildQuarterfinals,
+  comparisonNeighborFromGrid,
   emptyPlayoffProjection,
   generateTournamentGrid,
+  isGhostOpponent,
   playoffMatches,
   projectPlayoff,
   seedsFromRanking,
@@ -73,6 +75,8 @@ interface SectorView {
   opponentName: string;
   /** «Вы в секторе 1 СЛЕВА, ваш соперник Спортсмен №2» */
   briefing: string;
+  /** «Спортсмен №5 Иванов», когда в секторе нет живого соперника. */
+  neighborLabel: string;
 }
 
 interface MatchStore extends SectorView {
@@ -81,6 +85,8 @@ interface MatchStore extends SectorView {
   period: PeriodIndex;
   /** Сирена орга: ожидание, ловля или период закрыт. Часы телефона сюда не входят. */
   periodPhase: PeriodPhase;
+  /** Организатор нажал «Запустить период». До этого текущий период — всегда 1. */
+  officiallyStarted: boolean;
   athleteFish: number;
   opponentFish: number;
   pending: PendingCatch[];
@@ -188,6 +194,7 @@ const emptySector: SectorView = {
   athleteName: "Вы",
   opponentName: "Соперник",
   briefing: "",
+  neighborLabel: "",
 };
 
 export const useMatchStore = create<MatchStore>((set, get) => ({
@@ -197,6 +204,7 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
   round: 1,
   period: 1,
   periodPhase: "waiting",
+  officiallyStarted: false,
   athleteFish: 0,
   opponentFish: 0,
   pending: [],
@@ -290,6 +298,7 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
         signalSaving: false,
         period,
         periodPhase: phase,
+        officiallyStarted: state.officiallyStarted || phase !== "waiting",
         ...(periodChanged
           ? {
               ...emptySector,
@@ -335,6 +344,11 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
 
   async confirmPeriod() {
     const state = get();
+    const identityId = state.playoff.formed ? state.selfSlotId : state.athleteSlotId;
+    if (!hasSavedRealName(state, identityId)) {
+      set({ error: "Выберите номер и введите ФИО" });
+      return;
+    }
     if (state.playoff.formed) {
       await savePlayoffDuel(get, set);
       return;
@@ -420,7 +434,9 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
         : await healedStartList(tournamentId, snapshot.participants);
       const grid = snapshot.tournamentOpened ? gridOf(participants, snapshot.periodsPerRound) : [];
       const playoff = projectPlayoff(stored);
-      const signal = readPeriodSignal(stored);
+      const signal = snapshot.tournamentOpened
+        ? publishedPeriod(stored)
+        : { period: 1 as PeriodIndex, phase: "waiting" as const, officiallyStarted: false };
       set({
         participants,
         grid,
@@ -433,8 +449,9 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
         periodsCount: snapshot.periodsPerRound,
         hydrated: true,
         setupError: null,
-        period: snapshot.tournamentOpened ? signal.period : 1,
-        periodPhase: snapshot.tournamentOpened ? signal.phase : "waiting",
+        period: signal.period,
+        periodPhase: signal.phase,
+        officiallyStarted: signal.officiallyStarted,
         playerNamedSlotIds: playerNamedFromEvents(stored).filter((slotId) =>
           participants.some((participant) => participant.slotId === slotId),
         ),
@@ -566,7 +583,12 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
     };
     const saved = await commitParticipantUpdate(set, state.participants, slotId, nextParticipant, event, {
       optimistic: renamedLabels(state, current.bibNumber, slotId, name),
-      rollback: { athleteName: state.athleteName, opponentName: state.opponentName, briefing: state.briefing },
+      rollback: {
+        athleteName: state.athleteName,
+        opponentName: state.opponentName,
+        briefing: state.briefing,
+        neighborLabel: state.neighborLabel,
+      },
     });
     if (!saved) return false;
     const named = get().playerNamedSlotIds;
@@ -604,6 +626,7 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
         round: 1,
         period: 1,
         periodPhase: "waiting",
+        officiallyStarted: false,
         athleteFish: 0,
         opponentFish: 0,
         pending: [],
@@ -719,7 +742,7 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
         const stored = existing.map((row) => row.event);
         const snapshot = readSetup(stored);
         const openedGrid = gridOf(snapshot.participants, snapshot.periodsPerRound);
-        const signal = readPeriodSignal(stored);
+        const signal = publishedPeriod(stored);
         set({
           setupSaving: false,
           tournamentOpened: true,
@@ -731,6 +754,7 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
           grid: openedGrid,
           period: signal.period,
           periodPhase: signal.phase,
+          officiallyStarted: signal.officiallyStarted,
           playerNamedSlotIds: playerNamedFromEvents(stored),
           ...emptySector,
           ...cupPatch(stored, snapshot.participants, openedGrid),
@@ -750,6 +774,7 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
         round: 1,
         period: 1,
         periodPhase: "waiting",
+        officiallyStarted: false,
         confirmed: false,
         athleteFish: 0,
         opponentFish: 0,
@@ -1276,14 +1301,8 @@ export function phantomName(bibNumber: number): string {
   return `ФАНТОМ ${bibNumber}`;
 }
 
-interface SectorSeat {
-  sectorId: string;
-  left: RegisteredParticipant;
-  right: RegisteredParticipant | null;
-}
-
 /**
- * Период 1 полной сетки. Борт чередуется по номеру, а не по тому, чей номер меньше.
+ * Период 1 полной сетки. Нечётный номер слева, чётный справа.
  * Фантом место не освобождает: живой соперник остаётся один.
  */
 export function planPeriodOne(participants: readonly RegisteredParticipant[], sectorCount: number): MatrixDuel[] {
@@ -1352,8 +1371,8 @@ export function sectorsForPeriod(
       sectorId: seat.sectorId,
       kind: "lone",
       slotId: loneSlot.slotId,
-      side: loneSlot.side,
-      vacant: opponent?.ghost === true,
+      side: drawnSide(loneSlot),
+      vacant: isGhostOpponent(loneSlot.opponentSlotId) || opponent?.ghost === true,
       neighborSlotId: gridNeighbor(slots, loneSlot, ghosts),
     });
   }
@@ -1361,42 +1380,34 @@ export function sectorsForPeriod(
   return sectors;
 }
 
-/** Другое место того же сектора, если там фантом. */
+/** Другое место того же сектора в первом периоде, если там фантом или GHOST. */
 export function ghostSeatPartner(
   participants: readonly RegisteredParticipant[],
-  sectorCount: number,
+  _sectorCount: number,
   slotId: string,
 ): RegisteredParticipant | null {
-  for (const seat of sectorSeats(participants, sectorCount)) {
-    if (seat.left.slotId === slotId) return seat.right?.ghost ? seat.right : null;
-    if (seat.right?.slotId === slotId) return seat.left.ghost ? seat.left : null;
-  }
-  return null;
+  const slot = gridOf(participants, 1).find((item) => item.period === 1 && item.slotId === slotId);
+  if (!slot?.opponentSlotId || isGhostOpponent(slot.opponentSlotId)) return null;
+  const partner = participants.find((participant) => participant.slotId === slot.opponentSlotId);
+  return partner?.ghost ? partner : null;
 }
 
-/** Ближайший живой сосед по секторам. Очки одиночки считаются против него, ему эти очки не идут. */
+/** Ближайший живой сосед по карте секторов первого периода. Очки одиночки считаются против него. */
 export function loneNeighborSlotId(
   participants: readonly RegisteredParticipant[],
-  sectorCount: number,
+  _sectorCount: number,
   loneSlotId: string,
 ): string | null {
-  const seats = sectorSeats(participants, sectorCount);
-  const sectorIndex = seats.findIndex(
-    (seat) => seat.left.slotId === loneSlotId || seat.right?.slotId === loneSlotId,
-  );
-  if (sectorIndex < 0) return null;
-
-  const loneOnLeft = seats[sectorIndex]?.left.slotId === loneSlotId;
-  const nearestFirst = loneOnLeft ? [sectorIndex + 1, sectorIndex - 1] : [sectorIndex - 1, sectorIndex + 1];
-  for (const index of nearestFirst) {
-    const adjacent = seats[index];
-    if (!adjacent) continue;
-    const towardLone = index > sectorIndex ? [adjacent.left, adjacent.right] : [adjacent.right, adjacent.left];
-    for (const candidate of towardLone) {
-      if (isFishing(candidate) && candidate.slotId !== loneSlotId) return candidate.slotId;
-    }
+  const grid = gridOf(participants, 1);
+  const slot = grid.find((item) => item.period === 1 && item.slotId === loneSlotId);
+  if (!slot || !isGhostOpponent(slot.opponentSlotId)) {
+    const opponent = slot?.opponentSlotId
+      ? participants.find((participant) => participant.slotId === slot.opponentSlotId)
+      : undefined;
+    if (opponent && !opponent.ghost) return null;
   }
-  return null;
+  const ghosts = new Set(participants.filter((participant) => participant.ghost).map((participant) => participant.slotId));
+  return comparisonNeighborFromGrid(grid, loneSlotId, 1, 1, ghosts);
 }
 
 export function waitingParticipants(
@@ -1416,9 +1427,11 @@ export function waitingParticipants(
 }
 
 function gridOf(participants: readonly RegisteredParticipant[], periodsCount: number): GridSlot[] {
+  const fishing = [...participants].filter((participant) => !participant.ghost).sort(byBib);
   return generateTournamentGrid(
-    [...participants].sort(byBib).map((participant) => participant.slotId),
+    fishing.map((participant) => participant.slotId),
     periodsCount,
+    fishing.map((participant) => participant.bibNumber),
   );
 }
 
@@ -1436,8 +1449,8 @@ function matrixFromGrid(grid: readonly GridSlot[], participants: readonly Regist
   const keys = [...grouped.keys()].sort((left, right) => compareMatrixKey(left) - compareMatrixKey(right) || left.localeCompare(right));
   for (const key of keys) {
     const slots = grouped.get(key) ?? [];
-    const left = slots.find((slot) => slot.side === "left");
-    const right = slots.find((slot) => slot.side === "right");
+    const left = slots.find((slot) => drawnSide(slot) === "left");
+    const right = slots.find((slot) => drawnSide(slot) === "right");
     const sample = left ?? right;
     if (!sample) continue;
 
@@ -1489,6 +1502,10 @@ function zoneOf(groupId: GroupId, round: RoundIndex): ZoneId {
   return round === 1 ? "red" : "blue";
 }
 
+function drawnSide(slot: GridSlot): Side {
+  return slot.side;
+}
+
 interface GridSeat {
   sectorId: string;
   order: number;
@@ -1505,7 +1522,7 @@ function gridSeats(slots: readonly GridSlot[]): GridSeat[] {
       left: null,
       right: null,
     };
-    if (slot.side === "right") seat.right = slot;
+    if (drawnSide(slot) === "right") seat.right = slot;
     else seat.left = slot;
     bySector.set(slot.sectorId, seat);
   }
@@ -1515,24 +1532,7 @@ function gridSeats(slots: readonly GridSlot[]): GridSeat[] {
 }
 
 function gridNeighbor(slots: readonly GridSlot[], lone: GridSlot, ghosts: ReadonlySet<string>): string | null {
-  const seats = gridSeats(slots);
-  const sectorIndex = seats.findIndex(
-    (seat) => seat.left?.slotId === lone.slotId || seat.right?.slotId === lone.slotId,
-  );
-  if (sectorIndex < 0) return null;
-
-  const loneOnLeft = seats[sectorIndex]?.left?.slotId === lone.slotId;
-  const nearestFirst = loneOnLeft ? [sectorIndex + 1, sectorIndex - 1] : [sectorIndex - 1, sectorIndex + 1];
-  for (const index of nearestFirst) {
-    const adjacent = seats[index];
-    if (!adjacent) continue;
-    const towardLone = index > sectorIndex ? [adjacent.left, adjacent.right] : [adjacent.right, adjacent.left];
-    for (const candidate of towardLone) {
-      if (!candidate || candidate.slotId === lone.slotId || ghosts.has(candidate.slotId)) continue;
-      return candidate.slotId;
-    }
-  }
-  return null;
+  return comparisonNeighborFromGrid(slots, lone.slotId, lone.period, lone.round, ghosts);
 }
 
 function viewFromGrid(
@@ -1542,8 +1542,8 @@ function viewFromGrid(
 ): SectorView {
   const byId = new Map(participants.map((participant) => [participant.slotId, participant]));
   const athlete = byId.get(slot.slotId);
-  const opponent = slot.opponentSlotId ? byId.get(slot.opponentSlotId) : undefined;
-  const sideLabel = slot.side === "left" ? "СЛЕВА" : "СПРАВА";
+  const opponent = slot.opponentSlotId && !isGhostOpponent(slot.opponentSlotId) ? byId.get(slot.opponentSlotId) : undefined;
+  const sideLabel = drawnSide(slot) === "left" ? "СЛЕВА" : "СПРАВА";
   const periodSlots = grid.filter((item) => item.round === slot.round && item.period === slot.period);
   const ghosts = new Set(participants.filter((participant) => participant.ghost).map((participant) => participant.slotId));
 
@@ -1556,23 +1556,29 @@ function viewFromGrid(
       athleteName: athleteLabel(athlete),
       opponentName: athleteLabel(opponent),
       briefing: `Вы в секторе ${slot.sectorId} ${sideLabel}, ваш соперник ${opponent.displayName}`,
+      neighborLabel: "",
     };
   }
 
   const neighborId = gridNeighbor(periodSlots, slot, ghosts);
   const neighbor = neighborId ? byId.get(neighborId) : undefined;
-  const vacant = opponent?.ghost === true;
   return {
     sectorLabel: slot.sectorId,
     sideLabel,
     athleteSlotId: slot.slotId,
     opponentSlotId: "",
     athleteName: athleteLabel(athlete),
-    opponentName: vacant ? "Пустой слот" : "Нет соперника",
-    briefing: neighbor
-      ? `Вы в секторе ${slot.sectorId} ${sideLabel}, соперника в паре нет, сравнение с ${neighbor.displayName}`
-      : `Вы в секторе ${slot.sectorId} ${sideLabel}, соперника в паре нет`,
+    opponentName: "Вы один",
+    briefing: `Вы в секторе ${slot.sectorId} ${sideLabel}`,
+    neighborLabel: neighborCardLabel(neighbor),
   };
+}
+
+function neighborCardLabel(participant: RegisteredParticipant | undefined): string {
+  if (!participant) return "сосед не определён";
+  const auto = numberedAthleteName(participant.bibNumber);
+  if (participant.displayName.trim() === auto) return auto;
+  return `Спортсмен №${participant.bibNumber} ${participant.displayName.trim()}`;
 }
 
 function athleteLabel(participant: RegisteredParticipant | undefined): string {
@@ -1605,8 +1611,8 @@ async function commitParticipantUpdate(
   next: RegisteredParticipant,
   event: TournamentEvent,
   labels?: {
-    optimistic: Pick<SectorView, "athleteName" | "opponentName" | "briefing">;
-    rollback: Pick<SectorView, "athleteName" | "opponentName" | "briefing">;
+    optimistic: Pick<SectorView, "athleteName" | "opponentName" | "briefing" | "neighborLabel">;
+    rollback: Pick<SectorView, "athleteName" | "opponentName" | "briefing" | "neighborLabel">;
   },
 ): Promise<boolean> {
   set({
@@ -1647,6 +1653,19 @@ function denseStartList(participants: readonly RegisteredParticipant[]): Registe
 
 function isAutoName(displayName: string, bibNumber: number): boolean {
   return displayName === numberedAthleteName(bibNumber) || displayName === phantomName(bibNumber);
+}
+
+/** Настоящее ФИО: не короче трёх символов и не служебное «Спортсмен №N» / «ФАНТОМ N». */
+export function isRealAthleteName(displayName: string, bibNumber: number): boolean {
+  const name = displayName.trim().replace(/\s+/g, " ");
+  return name.length >= 3 && !isAutoName(name, bibNumber);
+}
+
+function hasSavedRealName(state: MatchStore, slotId: string): boolean {
+  if (!slotId || !state.playerNamedSlotIds.includes(slotId)) return false;
+  const participant = state.participants.find((item) => item.slotId === slotId);
+  if (!participant || participant.ghost) return false;
+  return isRealAthleteName(participant.displayName, participant.bibNumber);
 }
 
 function sameRoster(left: readonly RegisteredParticipant[], right: readonly RegisteredParticipant[]): boolean {
@@ -1880,20 +1899,6 @@ function normalizeRegistrationEntries(
   return { ok: true, participants };
 }
 
-function sectorSeats(participants: readonly RegisteredParticipant[], sectorCount: number): SectorSeat[] {
-  if (!Number.isInteger(sectorCount) || sectorCount < 1) return [];
-  const active = [...participants].sort(byBib).slice(0, sectorCount * 2);
-  const seats: SectorSeat[] = [];
-  for (let index = 0; index < active.length; index += 2) {
-    const first = active[index];
-    const second = active[index + 1] ?? null;
-    if (!first) break;
-    const [left, right] = !second || first.bibNumber <= second.bibNumber ? [first, second] : [second, first];
-    seats.push({ sectorId: String(seats.length + 1), left, right });
-  }
-  return seats;
-}
-
 function isFishing(participant: RegisteredParticipant | null): participant is RegisteredParticipant {
   return participant !== null && !participant.ghost;
 }
@@ -1942,7 +1947,7 @@ function renamedLabels(
   bibNumber: number,
   slotId: string,
   displayName: string,
-): Pick<SectorView, "athleteName" | "opponentName" | "briefing"> {
+): Pick<SectorView, "athleteName" | "opponentName" | "briefing" | "neighborLabel"> {
   const label = `${bibNumber}. ${displayName}`;
   const participants = state.participants.map((participant) =>
     participant.slotId === slotId ? { ...participant, displayName, ghost: false } : participant,
@@ -1950,11 +1955,12 @@ function renamedLabels(
   const slot = state.grid.find(
     (item) => item.slotId === state.athleteSlotId && item.round === state.round && item.period === state.period,
   );
-  const briefing = slot ? viewFromGrid(participants, state.grid, slot).briefing : state.briefing;
+  const view = slot ? viewFromGrid(participants, state.grid, slot) : null;
   return {
     athleteName: state.athleteSlotId === slotId ? label : state.athleteName,
     opponentName: state.opponentSlotId === slotId ? label : state.opponentName,
-    briefing,
+    briefing: view?.briefing ?? state.briefing,
+    neighborLabel: view?.neighborLabel ?? state.neighborLabel,
   };
 }
 
@@ -2100,6 +2106,7 @@ function viewFromPlayoff(participants: readonly RegisteredParticipant[], match: 
     athleteName: athleteLabel(athlete),
     opponentName: athleteLabel(opponent),
     briefing: `${stage}: ${athlete?.displayName ?? "—"} (место ${match.placeA ?? "—"}) против ${opponent?.displayName ?? "—"} (место ${match.placeB ?? "—"}). При равных поимках побеждает более высокое место отбора.`,
+    neighborLabel: "",
   };
 }
 
@@ -2330,6 +2337,19 @@ function readPeriodSignal(events: readonly TournamentEvent[]): { period: PeriodI
   return { period, phase };
 }
 
+/** До кнопки «Запустить период» журнал не двигает текущий период с 1. */
+function publishedPeriod(events: readonly TournamentEvent[]): {
+  period: PeriodIndex;
+  phase: PeriodPhase;
+  officiallyStarted: boolean;
+} {
+  const officiallyStarted = events.some(
+    (event) => event.type === "PERIOD_SIGNAL" && event.payload.phase !== "waiting",
+  );
+  if (!officiallyStarted) return { period: 1, phase: "waiting", officiallyStarted: false };
+  return { ...readPeriodSignal(events), officiallyStarted: true };
+}
+
 async function importStartDraw(
   get: () => MatchStore,
   set: (partial: Partial<MatchStore>) => void,
@@ -2435,8 +2455,9 @@ async function importStartDraw(
       periodsCount: decoded.snapshot.periodsPerRound,
       grid,
       round: 1,
-      period: decoded.snapshot.period,
+      period: decoded.snapshot.phase === "waiting" && decoded.snapshot.period === 1 ? 1 : decoded.snapshot.period,
       periodPhase: decoded.snapshot.phase,
+      officiallyStarted: decoded.snapshot.phase !== "waiting" || decoded.snapshot.period > 1,
       confirmed: false,
       athleteFish: 0,
       opponentFish: 0,
@@ -2504,12 +2525,12 @@ function gridFromSeats(participants: readonly RegisteredParticipant[], seats: re
     if (seat.leftBib > 0 && !left) continue;
     if (seat.rightBib !== null && seat.rightBib > 0 && !right) continue;
     if (left && right) {
-      slots.push(seatSlot(seat, left, right.slotId, "left"));
-      slots.push(seatSlot(seat, right, left.slotId, "right"));
+      slots.push(seatSlot(seat, left, right.slotId));
+      slots.push(seatSlot(seat, right, left.slotId));
     } else if (left) {
-      slots.push(seatSlot(seat, left, null, "left"));
+      slots.push(seatSlot(seat, left, null));
     } else if (right) {
-      slots.push(seatSlot(seat, right, null, "right"));
+      slots.push(seatSlot(seat, right, null));
     }
   }
   return slots;
@@ -2519,7 +2540,6 @@ function seatSlot(
   seat: StartSeat,
   person: RegisteredParticipant,
   opponentSlotId: string | null,
-  side: Side,
 ): GridSlot {
   return {
     round: seat.round,
@@ -2529,7 +2549,7 @@ function seatSlot(
     sectorId: seat.sectorId,
     slotId: person.slotId,
     bibNumber: person.bibNumber,
-    side,
+    side: person.bibNumber === seat.leftBib ? "left" : "right",
     opponentSlotId,
   };
 }

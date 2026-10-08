@@ -1,4 +1,4 @@
-import { type FishDelta, type GridSlot, type GroupId, type LeaderboardEntry, type MatrixDuel, type PeriodIndex, type PlayoffProjection, type RoundIndex } from "../../../packages/shared/src/types.ts";
+import { type FishDelta, type GridSlot, type GroupId, type LeaderboardEntry, type MatrixDuel, type PeriodIndex, type PeriodPhase, type PlayoffProjection, type RoundIndex, type Side } from "../../../packages/shared/src/types.ts";
 import { type PlayerQrExportResult, type PlayerQrImportResult } from "./qrSync.ts";
 export interface RegisteredParticipant {
     slotId: string;
@@ -21,14 +21,19 @@ interface SectorView {
     opponentName: string;
     /** «Вы в секторе 1 СЛЕВА, ваш соперник Спортсмен №2» */
     briefing: string;
+    /** «Спортсмен №5 Иванов», когда в секторе нет живого соперника. */
+    neighborLabel: string;
 }
 interface MatchStore extends SectorView {
     tournamentId: string;
     round: RoundIndex;
     period: PeriodIndex;
+    /** Сирена орга: ожидание, ловля или период закрыт. Часы телефона сюда не входят. */
+    periodPhase: PeriodPhase;
+    /** Организатор нажал «Запустить период». До этого текущий период — всегда 1. */
+    officiallyStarted: boolean;
     athleteFish: number;
     opponentFish: number;
-    secondsLeft: number;
     pending: PendingCatch[];
     confirmed: boolean;
     saving: boolean;
@@ -37,10 +42,18 @@ interface MatchStore extends SectorView {
     leaderboard: LeaderboardEntry[];
     leaderboardReady: boolean;
     participants: RegisteredParticipant[];
+    /** Номера, для которых на этом телефоне уже записано ФИО игрока. */
+    playerNamedSlotIds: string[];
     /** Сетка всех периодов. Пустая, пока турнир не открыт. */
     grid: GridSlot[];
     sectorCount: number;
+    /** Сколько периодов отбора в сетке. Пока 8, число приходит из открытия турнира. */
+    periodsCount: number;
     tournamentOpened: boolean;
+    /** Название, которое игрок видит после сканирования жеребьёвки. */
+    tournamentName: string;
+    /** День проведения, ISO `YYYY-MM-DD`. */
+    tournamentDate: string;
     setupSaving: boolean;
     setupError: string | null;
     hydrated: boolean;
@@ -54,9 +67,23 @@ interface MatchStore extends SectorView {
     playoffSaving: boolean;
     playoffError: string | null;
     adjustFish: (who: "athlete" | "opponent", delta: FishDelta) => void;
-    /** Период отбора 1–8. */
+    /** Период отбора 1–8. Пишет тот же сигнал, что и сирена орга. */
     setPeriod: (period: PeriodIndex) => void;
-    tick: () => void;
+    /** Записать активный период и фазу сирены. Игрок без связи вызывает это вручную. */
+    signalPeriod: (period: PeriodIndex, phase: PeriodPhase) => Promise<boolean>;
+    signalSaving: boolean;
+    /**
+     * Телефон игрока принимает стартовый QR или короткий сигнал периода.
+     * Стартовый код пишет сетку в IndexedDB и открывает ввод поимок.
+     */
+    acceptOrganizerCode: (payload: string) => Promise<{
+        ok: true;
+        fresh: boolean;
+        label: string;
+    } | {
+        ok: false;
+        error: string;
+    }>;
     confirmPeriod: () => Promise<void>;
     loadLeaderboard: () => Promise<LeaderboardEntry[]>;
     hydrate: () => Promise<void>;
@@ -69,6 +96,10 @@ interface MatchStore extends SectorView {
      */
     importRegistrationBatch: (value: unknown) => Promise<boolean>;
     replaceParticipant: (slotId: string, displayName: string) => Promise<boolean>;
+    /**
+     * До открытия турнира фантома не создаёт: строка снимается целиком, номера смыкаются.
+     * После открытия пустой слот с этого экрана не ставится.
+     */
     setParticipantGhost: (slotId: string) => Promise<boolean>;
     removeParticipant: (slotId: string) => Promise<boolean>;
     clearParticipants: () => Promise<boolean>;
@@ -78,7 +109,10 @@ interface MatchStore extends SectorView {
      * Строит матрицу переходов на все периоды, пишет матчи в IndexedDB
      * и переводит экран ввода в боевой режим.
      */
-    startTournament: () => Promise<boolean>;
+    startTournament: (meta?: {
+        name: string;
+        date: string;
+    }) => Promise<boolean>;
     openTournament: () => Promise<boolean>;
     /** Номер на этом телефоне. Кубковый QR кодирует его поимки. */
     selfSlotId: string;
@@ -88,6 +122,15 @@ interface MatchStore extends SectorView {
     exportAthleteResults: () => Promise<PlayerQrExportResult>;
     /** Вписывает строку QR в журнал и помечает эти поимки синхронизированными. */
     importAthleteResults: (payload: string) => Promise<PlayerQrImportResult>;
+    /** Этот номер закрыл 8-й период: один QR может унести весь отбор. */
+    qualifyingHandoffReady: boolean;
+    /** Сколько периодов 1–8 этот номер уже сохранил на телефоне. */
+    qualifyingSavedCount: number;
+    /** Есть несинхронизированный кубковый матч выбранного номера. */
+    cupHandoffReady: boolean;
+    refreshHandoff: () => Promise<void>;
+    /** Ручная правка поимок за период. Номер жеребьёвки не меняется. */
+    correctPeriodFish: (slotId: string, period: PeriodIndex, fish: number) => Promise<string | null>;
     /** Топ-8 после 8-го периода: пары 1–8, 2–7, 3–6, 4–5. Пишет FORM_PLAYOFF. */
     formPlayoff: () => Promise<boolean>;
     selectPlayoffMatch: (matchId: string) => void;
@@ -113,6 +156,8 @@ export type RegistrationBatchResult = {
     ok: false;
     error: string;
 };
+/** Настоящее ФИО: не короче трёх символов и не служебное «Спортсмен №N» / «ФАНТОМ N». */
+export declare function isRealAthleteName(displayName: string, bibNumber: number): boolean;
 export declare function numberedAthleteName(bibNumber: number): string;
 export declare function numberedRegistrationBatch(count: number): RegistrationBatch;
 export declare function parseRegistrationBatch(value: unknown): RegistrationBatchResult;
@@ -121,14 +166,31 @@ export declare function requiredSectorCount(participantCount: number): number;
 /** Имя фантома. Номер жеребьёвки в имени — тот же слот, не новый участник. */
 export declare function phantomName(bibNumber: number): string;
 /**
- * Период 1 полной сетки. Борт чередуется по номеру, а не по тому, чей номер меньше.
+ * Период 1 полной сетки. Нечётный номер слева, чётный справа.
  * Фантом место не освобождает: живой соперник остаётся один.
  */
 export declare function planPeriodOne(participants: readonly RegisteredParticipant[], sectorCount: number): MatrixDuel[];
+/** Сетка переходов на все периоды. Тот же расчёт, что пишется в журнал при открытии. */
+export declare function scheduleGrid(participants: readonly RegisteredParticipant[], periodsCount: number): GridSlot[];
+export type PeriodSector = {
+    sectorId: string;
+    kind: "pair";
+    leftSlotId: string;
+    rightSlotId: string;
+} | {
+    sectorId: string;
+    kind: "lone";
+    slotId: string;
+    side: Side;
+    /** Напротив живого места стоит фантом, а не пустой пропуск Бергера. */
+    vacant: boolean;
+    neighborSlotId: string | null;
+};
+/** Секторы одного периода из уже посчитанной сетки. Сосед одиночки берётся из этого же периода. */
+export declare function sectorsForPeriod(grid: readonly GridSlot[], participants: readonly RegisteredParticipant[], period: PeriodIndex): PeriodSector[];
 /** Другое место того же сектора, если там фантом. */
 export declare function ghostSeatPartner(participants: readonly RegisteredParticipant[], sectorCount: number, slotId: string): RegisteredParticipant | null;
 /** Ближайший живой сосед по секторам. Очки одиночки считаются против него, ему эти очки не идут. */
 export declare function loneNeighborSlotId(participants: readonly RegisteredParticipant[], sectorCount: number, loneSlotId: string): string | null;
 export declare function waitingParticipants(participants: readonly RegisteredParticipant[], sectorCount: number): RegisteredParticipant[];
-export declare function formatClock(totalSeconds: number): string;
 export {};
