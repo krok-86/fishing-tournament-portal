@@ -129,8 +129,11 @@ interface MatchStore extends SectorView {
     /** Есть несинхронизированный кубковый матч выбранного номера. */
     cupHandoffReady: boolean;
     refreshHandoff: () => Promise<void>;
-    /** Ручная правка поимок за период. Номер жеребьёвки не меняется. */
-    correctPeriodFish: (slotId: string, period: PeriodIndex, fish: number) => Promise<string | null>;
+    /**
+     * Ручная правка поимок обеих сторон дуэли.
+     * Баллы в журнал не пишутся: после записи их заново считает калькулятор.
+     */
+    correctPeriodFish: (slotId: string, period: PeriodIndex, ownFish: number, opponentFish: number) => Promise<string | null>;
     /** Топ-8 после 8-го периода: пары 1–8, 2–7, 3–6, 4–5. Пишет FORM_PLAYOFF. */
     formPlayoff: () => Promise<boolean>;
     selectPlayoffMatch: (matchId: string) => void;
@@ -188,6 +191,15 @@ export type PeriodSector = {
 };
 /** Секторы одного периода из уже посчитанной сетки. Сосед одиночки берётся из этого же периода. */
 export declare function sectorsForPeriod(grid: readonly GridSlot[], participants: readonly RegisteredParticipant[], period: PeriodIndex): PeriodSector[];
+export interface PeriodSeat {
+    sectorId: string;
+    /** С кем сравниваются поимки: соперник пары или сосед одиночки. */
+    opponentSlotId: string | null;
+    /** Соперник в сетке Бергера. У одиночки это GHOST. */
+    bergerOpponentSlotId: string | null;
+}
+/** Сектор, соперник Бергера и соперник для счёта в одном периоде. */
+export declare function periodSeat(grid: readonly GridSlot[], participants: readonly RegisteredParticipant[], slotId: string, period: PeriodIndex): PeriodSeat | null;
 /** Другое место того же сектора, если там фантом. */
 export declare function ghostSeatPartner(participants: readonly RegisteredParticipant[], sectorCount: number, slotId: string): RegisteredParticipant | null;
 /** Ближайший живой сосед по секторам. Очки одиночки считаются против него, ему эти очки не идут. */

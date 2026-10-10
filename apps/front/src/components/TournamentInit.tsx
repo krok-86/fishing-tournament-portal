@@ -9,6 +9,7 @@ import {
   type PeriodSector,
   type RegisteredParticipant,
 } from "../store.ts";
+import { ProtocolExportButtons } from "../protocolExport.tsx";
 import { toast } from "../toast.ts";
 
 export function TournamentInit() {
@@ -298,6 +299,8 @@ export function TournamentInit() {
       </p>
 
       <PeriodPlan participants={participants} grid={drawGrid} periodsCount={periodsCount} />
+
+      <ProtocolExportButtons grid={drawGrid} />
 
       <div className="grid gap-2">
         <button

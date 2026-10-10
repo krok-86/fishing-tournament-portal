@@ -1,9 +1,11 @@
-import { type DuelPoints, type DuelResult, type FishCount, type GridSlot, type LeaderboardEntry, type LoneNeighborInput, type PeriodIndex, type PlayoffBracketMatch, type PlayoffDecision, type PlayoffPairing, type PlayoffProjection, type PlayoffSeed, type RoundIndex, type Side, type TournamentCalculator, type TournamentEvent, type VirtualDuelResult } from "./types.js";
+import { type DuelPoints, type DuelResult, type FishCount, type GridSlot, type LeaderboardEntry, type LoneNeighborInput, type PeriodIndex, type PeriodPoints, type PlayoffBracketMatch, type PlayoffDecision, type PlayoffPairing, type PlayoffProjection, type PlayoffSeed, type RoundIndex, type Side, type TournamentCalculator, type TournamentEvent, type VirtualDuelResult } from "./types.js";
 /**
  * Очки одного спортсмена:
  * 0 рыб → 0; больше соперника → 4; поровну и оба поймали → 2; меньше, но рыба есть → 1.
  */
 export declare function scoreDuel(fishA: FishCount, fishB: FishCount): DuelPoints;
+/** Очки спортсмена против соперника. 4 победа, 2 ничья, 1 поражение с рыбой, 0 ноль поимок. */
+export declare function pointsAgainst(ownFish: FishCount, opponentFish: FishCount): PeriodPoints;
 /**
  * Плей-офф не знает ничьей.
  * Больше поимок — победа. Поровну, включая 0:0 и 2:2, — побеждает более высокое место отбора.

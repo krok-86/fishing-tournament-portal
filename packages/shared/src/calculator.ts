@@ -62,6 +62,11 @@ export function scoreDuel(fishA: FishCount, fishB: FishCount): DuelPoints {
   };
 }
 
+/** Очки спортсмена против соперника. 4 победа, 2 ничья, 1 поражение с рыбой, 0 ноль поимок. */
+export function pointsAgainst(ownFish: FishCount, opponentFish: FishCount): PeriodPoints {
+  return sidePoints(scoreDuel(ownFish, opponentFish), "a");
+}
+
 /**
  * Плей-офф не знает ничьей.
  * Больше поимок — победа. Поровну, включая 0:0 и 2:2, — побеждает более высокое место отбора.
@@ -920,8 +925,22 @@ function periodResults(state: TournamentState, slotId: string, duels: readonly D
       played,
       points: played ? periodPoints(duels, slotId, period) : 0,
       fish: played ? fish : 0,
+      opponentFish: played ? opponentFishInPeriod(duels, slotId, period) : 0,
     };
   });
+}
+
+function opponentFishInPeriod(duels: readonly DuelResult[], slotId: string, period: PeriodIndex): FishCount {
+  for (const duel of duels) {
+    if (duel.round !== 1 || duel.period !== period) continue;
+    if (duel.kind === "pair") {
+      if (duel.a.slotId === slotId) return duel.b.fish;
+      if (duel.b.slotId === slotId) return duel.a.fish;
+    } else if (duel.lone.slotId === slotId) {
+      return duel.neighborFish;
+    }
+  }
+  return 0;
 }
 
 function periodPoints(duels: readonly DuelResult[], slotId: string, period: PeriodIndex): PeriodPoints {

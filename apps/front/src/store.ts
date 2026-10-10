@@ -176,8 +176,11 @@ interface MatchStore extends SectorView {
   /** Есть несинхронизированный кубковый матч выбранного номера. */
   cupHandoffReady: boolean;
   refreshHandoff: () => Promise<void>;
-  /** Ручная правка поимок за период. Номер жеребьёвки не меняется. */
-  correctPeriodFish: (slotId: string, period: PeriodIndex, fish: number) => Promise<string | null>;
+  /**
+   * Ручная правка поимок обеих сторон дуэли.
+   * Баллы в журнал не пишутся: после записи их заново считает калькулятор.
+   */
+  correctPeriodFish: (slotId: string, period: PeriodIndex, ownFish: number, opponentFish: number) => Promise<string | null>;
   /** Топ-8 после 8-го периода: пары 1–8, 2–7, 3–6, 4–5. Пишет FORM_PLAYOFF. */
   formPlayoff: () => Promise<boolean>;
   selectPlayoffMatch: (matchId: string) => void;
@@ -1120,32 +1123,30 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
     }
   },
 
-  async correctPeriodFish(slotId, period, fish) {
+  async correctPeriodFish(slotId, period, ownFish, opponentFish) {
     const state = get();
     if (!state.tournamentOpened || state.saving || state.setupSaving) return "Сейчас журнал занят";
     if (!isQualifyingPeriod(period)) return "Этот период нельзя править";
     const participant = state.participants.find((item) => item.slotId === slotId);
     if (!participant) return "Игрок не найден";
     if (participant.ghost) return "Пустой слот нельзя править";
-    if (!Number.isFinite(fish)) return "Укажите число поимок";
 
-    const count = Math.max(0, Math.min(9999, Math.trunc(fish)));
-    const timestamp = Date.now();
-    const catches: TournamentEvent[] = [];
-    for (let index = 0; index < count; index += 1) {
-      catches.push({
-        id: crypto.randomUUID(),
-        tournamentId: state.tournamentId,
-        type: "CATCH_RECORDED",
-        timestamp: timestamp + index,
-        payload: {
-          slotId,
-          round: 1,
-          period,
-          delta: 1,
-        },
-      });
+    const own = clampFish(ownFish);
+    const opp = clampFish(opponentFish);
+    if (own === null || opp === null) return "Укажите число поимок";
+
+    const seat = periodSeat(state.grid, state.participants, slotId, period);
+    const opponentSlotId = seat?.opponentSlotId ?? null;
+    if (opponentSlotId) {
+      const opponent = state.participants.find((item) => item.slotId === opponentSlotId);
+      if (!opponent || opponent.ghost) return "Соперник этого периода не найден";
     }
+
+    const counts = new Map<string, number>([[slotId, own]]);
+    if (opponentSlotId) counts.set(opponentSlotId, opp);
+    const paired = opponentSlotId !== null && seat?.bergerOpponentSlotId === opponentSlotId;
+    const timestamp = Date.now();
+    const catches = catchEventsForCounts(state.tournamentId, period, counts, timestamp);
     const closed: TournamentEvent = {
       id: crypto.randomUUID(),
       tournamentId: state.tournamentId,
@@ -1154,14 +1155,37 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
       payload: {
         round: 1,
         period,
-        protocols: [{ slotIdA: slotId, slotIdB: null, signed: true }],
+        protocols: [
+          {
+            slotIdA: slotId,
+            slotIdB: paired ? opponentSlotId : null,
+            signed: true,
+          },
+        ],
       },
     };
 
     try {
-      await replacePeriodCatches(state.tournamentId, 1, period, [slotId], [...catches, closed]);
-      if (!get().playoff.formed && get().athleteSlotId === slotId && get().period === period) {
-        set({ athleteFish: count, pending: [], confirmed: true, savedCount: catches.length + 1, error: null });
+      await replacePeriodCatches(state.tournamentId, 1, period, [...counts.keys()], [...catches, closed]);
+      const next = get();
+      if (
+        !next.playoff.formed &&
+        next.period === period &&
+        (next.athleteSlotId === slotId || (opponentSlotId !== null && next.athleteSlotId === opponentSlotId))
+      ) {
+        set({
+          athleteFish:
+            next.athleteSlotId === slotId ? own : opponentSlotId !== null && next.athleteSlotId === opponentSlotId ? opp : next.athleteFish,
+          opponentFish:
+            next.opponentSlotId === slotId
+              ? own
+              : opponentSlotId !== null && next.opponentSlotId === opponentSlotId
+                ? opp
+                : next.opponentFish,
+          pending: [],
+          confirmed: true,
+          error: null,
+        });
       }
       await get().loadLeaderboard();
       await get().refreshHandoff();
@@ -1378,6 +1402,45 @@ export function sectorsForPeriod(
   }
 
   return sectors;
+}
+
+export interface PeriodSeat {
+  sectorId: string;
+  /** С кем сравниваются поимки: соперник пары или сосед одиночки. */
+  opponentSlotId: string | null;
+  /** Соперник в сетке Бергера. У одиночки это GHOST. */
+  bergerOpponentSlotId: string | null;
+}
+
+/** Сектор, соперник Бергера и соперник для счёта в одном периоде. */
+export function periodSeat(
+  grid: readonly GridSlot[],
+  participants: readonly RegisteredParticipant[],
+  slotId: string,
+  period: PeriodIndex,
+): PeriodSeat | null {
+  const drawn = grid.find((slot) => slot.round === 1 && slot.period === period && slot.slotId === slotId);
+  if (!drawn) return null;
+
+  const sectors = sectorsForPeriod(grid, participants, period);
+  for (const sector of sectors) {
+    if (sector.kind === "pair") {
+      if (sector.leftSlotId === slotId) {
+        return { sectorId: sector.sectorId, opponentSlotId: sector.rightSlotId, bergerOpponentSlotId: drawn.opponentSlotId };
+      }
+      if (sector.rightSlotId === slotId) {
+        return { sectorId: sector.sectorId, opponentSlotId: sector.leftSlotId, bergerOpponentSlotId: drawn.opponentSlotId };
+      }
+    } else if (sector.slotId === slotId) {
+      return {
+        sectorId: sector.sectorId,
+        opponentSlotId: sector.neighborSlotId,
+        bergerOpponentSlotId: drawn.opponentSlotId,
+      };
+    }
+  }
+
+  return { sectorId: drawn.sectorId, opponentSlotId: null, bergerOpponentSlotId: drawn.opponentSlotId };
 }
 
 /** Другое место того же сектора в первом периоде, если там фантом или GHOST. */
@@ -1987,6 +2050,37 @@ function absoluteCatches(state: MatchStore, slotIds: readonly string[], timestam
           slotId,
           round: state.round,
           period: state.period,
+          delta: 1,
+        },
+      });
+    }
+  }
+  return events;
+}
+
+function clampFish(fish: number): number | null {
+  if (!Number.isFinite(fish)) return null;
+  return Math.max(0, Math.min(9999, Math.trunc(fish)));
+}
+
+function catchEventsForCounts(
+  tournamentId: string,
+  period: PeriodIndex,
+  counts: ReadonlyMap<string, number>,
+  timestamp: number,
+): TournamentEvent[] {
+  const events: TournamentEvent[] = [];
+  for (const [slotId, count] of counts) {
+    for (let index = 0; index < count; index += 1) {
+      events.push({
+        id: crypto.randomUUID(),
+        tournamentId,
+        type: "CATCH_RECORDED",
+        timestamp: timestamp + events.length,
+        payload: {
+          slotId,
+          round: 1,
+          period,
           delta: 1,
         },
       });

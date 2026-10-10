@@ -497,7 +497,10 @@ export interface PeriodResult {
   period: PeriodIndex;
   played: boolean;
   points: PeriodPoints;
+  /** Свои поимки. */
   fish: FishCount;
+  /** Поимки соперника в этой дуэли. У несыгранного периода 0. */
+  opponentFish: FishCount;
 }
 
 export interface LeaderboardEntry {
