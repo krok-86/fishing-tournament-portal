@@ -1,5 +1,7 @@
+import { useEffect, useState } from "react";
 import { previewPlayoffScore, scorePlayoffDuel } from "../../../../packages/shared/src/calculator.ts";
 import { useMatchStore } from "../store.ts";
+import { confirmAndToast, toast } from "../toast.ts";
 export function playoffStageTitle(stage) {
     if (stage === "quarterfinal")
         return "1/4 финала";
@@ -68,9 +70,11 @@ export function PlayoffBracket() {
         </p>)}
     </section>);
 }
-export function PlayoffEntryDialog() {
+const NAME_REQUIRED = "Выберите номер и введите ФИО";
+export function PlayoffEntryDialog({ organizer = false } = {}) {
     const open = useMatchStore((state) => state.playoffEntryOpen);
     const playoff = useMatchStore((state) => state.playoff);
+    const participants = useMatchStore((state) => state.participants);
     const selectedPlayoffMatchId = useMatchStore((state) => state.selectedPlayoffMatchId);
     const athleteName = useMatchStore((state) => state.athleteName);
     const opponentName = useMatchStore((state) => state.opponentName);
@@ -82,14 +86,25 @@ export function PlayoffEntryDialog() {
     const adjustFish = useMatchStore((state) => state.adjustFish);
     const confirmPeriod = useMatchStore((state) => state.confirmPeriod);
     const closePlayoffEntry = useMatchStore((state) => state.closePlayoffEntry);
+    useEffect(() => {
+        if (!organizer || !open)
+            return;
+        if (useMatchStore.getState().error === NAME_REQUIRED)
+            useMatchStore.setState({ error: null });
+    }, [organizer, open]);
     const match = [...playoff.quarterfinals, ...playoff.semifinals, ...(playoff.final ? [playoff.final] : [])].find((item) => item.matchId === selectedPlayoffMatchId);
     if (!open || !match?.slotIdA || !match.slotIdB || match.placeA === null || match.placeB === null || match.seedA === null || match.seedB === null) {
         return null;
     }
+    const athlete = participants.find((participant) => participant.slotId === match.slotIdA);
+    const opponent = participants.find((participant) => participant.slotId === match.slotIdB);
+    const athleteTitle = athlete ? `${athlete.bibNumber}. ${athlete.displayName}` : athleteName;
+    const opponentTitle = opponent ? `${opponent.bibNumber}. ${opponent.displayName}` : opponentName;
     const decision = scorePlayoffDuel(athleteFish, opponentFish, match.placeA, match.seedA, match.placeB, match.seedB);
-    const winnerName = decision.winner === "a" ? athleteName : opponentName;
+    const winnerName = decision.winner === "a" ? athleteTitle : opponentTitle;
     const tied = athleteFish === opponentFish;
     const started = athleteFish > 0 || opponentFish > 0 || confirmed;
+    const visibleError = organizer && error === NAME_REQUIRED ? null : error;
     return (<div className="pointer-events-none fixed inset-x-0 bottom-0 z-50 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
       <section role="dialog" aria-labelledby="playoff-entry-title" className="pointer-events-auto mx-auto w-full max-w-lg rounded-3xl border border-cyan-300/40 bg-slate-900 p-4 shadow-2xl shadow-black/60">
         <div className="flex items-start justify-between gap-3">
@@ -105,8 +120,8 @@ export function PlayoffEntryDialog() {
         </div>
 
         <div className="mt-3 grid gap-2">
-          <CatchRow title={athleteName} place={match.placeA} count={athleteFish} disabled={saving} onPlus={() => adjustFish("athlete", 1)} onMinus={() => adjustFish("athlete", -1)}/>
-          <CatchRow title={opponentName} place={match.placeB} count={opponentFish} disabled={saving} onPlus={() => adjustFish("opponent", 1)} onMinus={() => adjustFish("opponent", -1)}/>
+          <CatchRow slotId={match.slotIdA} bibNumber={athlete?.bibNumber ?? 0} displayName={athlete?.displayName ?? athleteTitle} place={match.placeA} count={athleteFish} disabled={saving} canRename={organizer && athlete !== undefined} onPlus={() => adjustFish("athlete", 1)} onMinus={() => adjustFish("athlete", -1)}/>
+          <CatchRow slotId={match.slotIdB} bibNumber={opponent?.bibNumber ?? 0} displayName={opponent?.displayName ?? opponentTitle} place={match.placeB} count={opponentFish} disabled={saving} canRename={organizer && opponent !== undefined} onPlus={() => adjustFish("opponent", 1)} onMinus={() => adjustFish("opponent", -1)}/>
         </div>
 
         <p className={`mt-3 rounded-2xl px-3 py-2 text-sm font-semibold ${started && tied ? "bg-amber-300/15 text-amber-100" : "bg-cyan-300/10 text-cyan-50"}`}>
@@ -117,10 +132,10 @@ export function PlayoffEntryDialog() {
             : "Введите поимки. При ничьей дальше идёт более высокое место отбора."}
         </p>
 
-        <button type="button" className="mt-3 h-14 w-full rounded-2xl bg-amber-400 text-base font-black tracking-wide text-slate-950 disabled:bg-slate-700 disabled:text-slate-400" disabled={saving || confirmed} onClick={() => void confirmPeriod()}>
+        <button type="button" className="mt-3 h-14 w-full rounded-2xl bg-amber-400 text-base font-black tracking-wide text-slate-950 disabled:bg-slate-700 disabled:text-slate-400" disabled={saving || confirmed} onClick={() => void confirmAndToast(() => confirmPeriod(organizer))}>
           {saving ? "Сохраняем..." : confirmed ? "Дуэль сохранена" : "Подтвердить поимки"}
         </button>
-        {error && <p className="mt-2 text-center text-sm text-rose-300">{error}</p>}
+        {visibleError && <p className="mt-2 text-center text-sm text-rose-300">{visibleError}</p>}
       </section>
     </div>);
 }
@@ -177,18 +192,73 @@ function MatchSide({ name, place, fish, winner, waiting, divider = false, }) {
       </span>
     </div>);
 }
-function CatchRow({ title, place, count, disabled, onPlus, onMinus, }) {
+function CatchRow({ slotId, bibNumber, displayName, place, count, disabled, canRename, onPlus, onMinus, }) {
+    const replaceParticipant = useMatchStore((state) => state.replaceParticipant);
+    const [editing, setEditing] = useState(false);
+    const [draft, setDraft] = useState(displayName);
+    const [busy, setBusy] = useState(false);
+    const title = `${bibNumber}. ${displayName}`;
+    function beginEdit() {
+        setDraft(displayName);
+        setEditing(true);
+    }
+    async function saveName(event) {
+        event.preventDefault();
+        const name = draft.trim().replace(/\s+/g, " ");
+        if (!name || busy)
+            return;
+        if (name === displayName) {
+            setEditing(false);
+            return;
+        }
+        setBusy(true);
+        const ok = await replaceParticipant(slotId, name);
+        setBusy(false);
+        if (!ok) {
+            toast("err", useMatchStore.getState().setupError ?? "Не удалось записать ФИО");
+            return;
+        }
+        setEditing(false);
+        toast("ok", "ФИО сохранено");
+    }
     return (<div className="flex items-center gap-2 rounded-2xl bg-slate-950 px-3 py-2">
       <div className="min-w-0 flex-1">
-        <p className="truncate text-sm font-bold">{title}</p>
+        {editing ? (<form className="flex items-center gap-1" onSubmit={(event) => void saveName(event)}>
+            <span className="shrink-0 text-sm font-black tabular-nums text-cyan-100">{bibNumber}.</span>
+            <input className="h-9 min-w-0 flex-1 rounded-lg border border-cyan-300/50 bg-slate-900 px-2 text-sm font-semibold text-white outline-none" value={draft} aria-label={`ФИО, номер ${bibNumber}`} autoFocus disabled={busy} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                    event.preventDefault();
+                    setEditing(false);
+                }
+            }}/>
+            <button type="submit" className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-cyan-300 text-slate-950 disabled:opacity-40" aria-label={`Сохранить ФИО, номер ${bibNumber}`} disabled={busy || draft.trim().length === 0}>
+              <CheckIcon />
+            </button>
+          </form>) : (<div className="flex min-w-0 items-center gap-1">
+            <p className="truncate text-sm font-bold">{title}</p>
+            {canRename && (<button type="button" className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-cyan-200 hover:bg-white/10 disabled:opacity-40" aria-label={`Исправить ФИО, ${title}`} disabled={disabled} onClick={beginEdit}>
+                <PencilIcon />
+              </button>)}
+          </div>)}
         <p className="text-[11px] font-semibold text-slate-400">Место отбора {place}</p>
       </div>
-      <button type="button" className="h-11 w-11 rounded-xl bg-rose-500 text-lg font-black text-white disabled:opacity-40" disabled={disabled || count === 0} onClick={onMinus} aria-label={`Минус, ${title}`}>
+      <button type="button" className="h-11 w-11 rounded-xl bg-rose-500 text-lg font-black text-white disabled:opacity-40" disabled={disabled || editing || count === 0} onClick={onMinus} aria-label={`Минус, ${title}`}>
         −
       </button>
       <p className="w-8 text-center text-2xl font-black tabular-nums">{count}</p>
-      <button type="button" className="h-11 w-11 rounded-xl bg-emerald-400 text-lg font-black text-slate-950 disabled:opacity-40" disabled={disabled} onClick={onPlus} aria-label={`Плюс, ${title}`}>
+      <button type="button" className="h-11 w-11 rounded-xl bg-emerald-400 text-lg font-black text-slate-950 disabled:opacity-40" disabled={disabled || editing} onClick={onPlus} aria-label={`Плюс, ${title}`}>
         +
       </button>
     </div>);
+}
+function PencilIcon() {
+    return (<svg viewBox="0 0 24 24" className="h-4 w-4" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2">
+      <path strokeLinecap="round" strokeLinejoin="round" d="M12 20h9"/>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4 11.5-11.5z"/>
+    </svg>);
+}
+function CheckIcon() {
+    return (<svg viewBox="0 0 24 24" className="h-4 w-4" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2.5">
+      <path strokeLinecap="round" strokeLinejoin="round" d="M5 12.5 10 17l9-10"/>
+    </svg>);
 }

@@ -1,4 +1,4 @@
-import { type DuelPoints, type DuelResult, type FishCount, type GridSlot, type LeaderboardEntry, type LoneNeighborInput, type PeriodIndex, type PeriodPoints, type PlayoffBracketMatch, type PlayoffDecision, type PlayoffPairing, type PlayoffProjection, type PlayoffSeed, type RoundIndex, type Side, type TournamentCalculator, type TournamentEvent, type VirtualDuelResult } from "./types.js";
+import { type DuelPoints, type DuelResult, type FishCount, type GridSlot, type LeaderboardEntry, type LoneNeighborInput, type PeriodIndex, type PeriodPoints, type PlayoffBracketMatch, type PlayoffDecision, type PlayoffDuelInput, type PlayoffPairing, type PlayoffProjection, type PlayoffSeed, type RoundIndex, type Side, type TournamentCalculator, type TournamentEvent, type VirtualDuelResult } from "./types.js";
 /**
  * Очки одного спортсмена:
  * 0 рыб → 0; больше соперника → 4; поровну и оба поймали → 2; меньше, но рыба есть → 1.
@@ -11,15 +11,16 @@ export declare function pointsAgainst(ownFish: FishCount, opponentFish: FishCoun
  * Больше поимок — победа. Поровну, включая 0:0 и 2:2, — побеждает более высокое место отбора.
  * Одинаковое место отбора разводит меньший seed: это порядок строк таблицы.
  */
-export declare function scorePlayoffDuel(fishA: FishCount, fishB: FishCount, placeA: number, seedA: number, placeB: number, seedB: number): PlayoffDecision;
+export declare function scorePlayoffDuel(input: PlayoffDuelInput): PlayoffDecision;
 export declare function calculateDuels(events: readonly TournamentEvent[]): DuelResult[];
 export declare function generateLeaderboard(events: readonly TournamentEvent[]): LeaderboardEntry[];
-/** Виртуальный соперник нечётного состава. В сетку слотом не сажается. */
-export declare const GHOST_ID: "GHOST";
+/** Виртуальный соперник нечётного состава. В сетку слотом не сажается: живой в этом туре один. */
+export declare const GHOST_ID = "GHOST";
 export declare function isGhostOpponent(slotId: string | null | undefined): boolean;
 /**
- * Стартовый борт, если история номера ещё неизвестна.
- * Период 1: нечётный слева, чётный справа. Дальше формула чередует борт.
+ * Стартовый борт и чередование, если других сведений нет.
+ * Период 1: нечётный номер слева, чётный справа. Дальше борт меняется каждый период.
+ * В сетке борт пары и одиночки берётся из их собственной истории, а не только из этой формулы.
  */
 export declare function bankSide(bibNumber: number, periodNumber: number): Side;
 export interface SectorMapSeat {
@@ -28,16 +29,23 @@ export interface SectorMapSeat {
     leftSlotId: string | null;
     rightSlotId: string | null;
 }
-/** Сосед одиночки: ближайший сектор в сторону пустого борта. */
+/**
+ * Сосед для сравнения одиночки по карте секторов этого периода.
+ * Сначала сектор в сторону пустого борта, из него — место, которое смотрит на одиночку.
+ */
 export declare function comparisonNeighborId(seats: readonly SectorMapSeat[], loneSlotId: string): string | null;
-/** Сосед одиночки по карте секторов. Борт берётся из слота жеребьёвки. */
+/** Сосед одиночки из уже построенной сетки. Борт берётся из слота жеребьёвки. */
 export declare function comparisonNeighborFromGrid(grid: readonly GridSlot[], loneSlotId: string, period: PeriodIndex, round?: RoundIndex, skipSlotIds?: ReadonlySet<string>): string | null;
 /**
- * Сетка отбора. Нечётный состав дополняется GHOST.
- * Период 1 — чётный с нечётным, пары перемешаны.
- * Дальше разрешены пары одной чётности. Повтор меняет борта и сектор.
- * Сектор не повторяется два периода подряд. Поздний возврат меняет борт относительно прошлого визита.
- * Одинаковые номера с разными id участников дают разные листы. Один список остаётся стабильным.
+ * Сетка отбора.
+ * `participantIds` идут в порядке жеребьёвки. Номер — позиция в этом списке, если `bibNumbers` не переданы.
+ * Нечётный состав дополняется одним GHOST: кому он выпал, тот в периоде один.
+ * Период 1 — только чётный с нечётным, пары и сектора перемешаны, а не 1 со 2 в секторе 1.
+ * Со 2-го периода чётный может встретить чётного, нечётный — нечётного.
+ * Сначала закрываются новые пары. Повтор меняет борта местами и садится в другой сектор.
+ * Один и тот же сектор два периода подряд не берётся. Возврат позже возможен, но реже, и тогда борт меняется относительно прошлого визита.
+ * Борт каждого номера по возможности меняется каждый период. Повтор борта допустим, длинная серия на одной стороне — нет.
+ * Одинаковые номера не дают один и тот же лист: расклад зависит и от id участников. Один и тот же список при этом не прыгает.
  */
 export declare function generateTournamentGrid(participantIds: readonly string[], periodsCount: number, bibNumbers?: readonly number[]): GridSlot[];
 export declare function readTransitionGrid(events: readonly TournamentEvent[]): GridSlot[];
@@ -54,7 +62,16 @@ export declare function projectPlayoff(events: readonly TournamentEvent[]): Play
  * Победитель и следующий раунд считаются тем же тай-брейком, что и при записи дуэли.
  * Счёт следующего раунда сохраняется, только если в паре остались те же спортсмены.
  */
-export declare function previewPlayoffScore(projection: PlayoffProjection, matchId: string, fishA: FishCount, fishB: FishCount): PlayoffProjection;
+export interface PlayoffDraftLines {
+    fishA: FishCount;
+    fishB: FishCount;
+    extraFishA?: FishCount;
+    extraFishB?: FishCount;
+    goldenFishA?: FishCount;
+    goldenFishB?: FishCount;
+    goldenFirst?: "a" | "b" | null;
+}
+export declare function previewPlayoffScore(projection: PlayoffProjection, matchId: string, lines: PlayoffDraftLines): PlayoffProjection;
 export declare function calculateLoneResult(events: readonly TournamentEvent[], loneId: string, neighbor: LoneNeighborInput): VirtualDuelResult;
 export declare const tournamentCalculator: TournamentCalculator;
 export interface PlayoffSideReport {

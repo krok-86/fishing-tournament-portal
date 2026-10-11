@@ -1,11 +1,15 @@
 import { useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { useMatchStore } from "../store.ts";
+import { toast } from "../toast.ts";
 export function AthleteQrButton() {
     const tournamentOpened = useMatchStore((state) => state.tournamentOpened);
     const athleteSlotId = useMatchStore((state) => state.athleteSlotId);
     const selfSlotId = useMatchStore((state) => state.selfSlotId);
     const playoffFormed = useMatchStore((state) => state.playoff.formed);
+    const qualifyingHandoffReady = useMatchStore((state) => state.qualifyingHandoffReady);
+    const qualifyingSavedCount = useMatchStore((state) => state.qualifyingSavedCount);
+    const cupHandoffReady = useMatchStore((state) => state.cupHandoffReady);
     const saving = useMatchStore((state) => state.saving);
     const exportAthleteResults = useMatchStore((state) => state.exportAthleteResults);
     const [packet, setPacket] = useState(null);
@@ -13,6 +17,11 @@ export function AthleteQrButton() {
     const [busy, setBusy] = useState(false);
     const [copied, setCopied] = useState(false);
     if (!tournamentOpened)
+        return null;
+    const cupMode = playoffFormed;
+    const selected = cupMode ? selfSlotId.length > 0 : athleteSlotId.length > 0;
+    const ready = cupMode ? cupHandoffReady : qualifyingHandoffReady;
+    if (!selected)
         return null;
     async function generate() {
         setBusy(true);
@@ -23,9 +32,11 @@ export function AthleteQrButton() {
         if (!result.ok) {
             setPacket(null);
             setError(result.error);
+            toast("err", result.error);
             return;
         }
         setPacket(result.packet);
+        toast("ok", cupMode ? "QR-код матча готов" : "QR-код результатов готов");
     }
     async function copyPayload() {
         if (!packet)
@@ -33,14 +44,23 @@ export function AthleteQrButton() {
         try {
             await navigator.clipboard.writeText(packet.payload);
             setCopied(true);
+            toast("ok", "Строка скопирована");
         }
         catch {
             setCopied(false);
+            toast("err", "Не удалось скопировать строку");
         }
     }
+    if (!ready) {
+        return (<p className="mt-3 text-center text-sm font-semibold text-slate-300">
+        {cupMode
+                ? "QR-код матча появится сразу после сохранения дуэли."
+                : `Периоды 1–7 остаются в памяти телефона. Кнопка QR появится после 8-го периода.${qualifyingSavedCount > 0 ? ` Уже сохранено: ${qualifyingSavedCount} из 8.` : ""}`}
+      </p>);
+    }
     return (<>
-      <button type="button" className="mt-3 min-h-16 w-full rounded-2xl bg-white px-3 py-3 text-base leading-tight font-black text-slate-950 disabled:bg-slate-700 disabled:text-slate-400" disabled={(playoffFormed ? selfSlotId.length === 0 : athleteSlotId.length === 0) || saving || busy} onClick={() => void generate()}>
-        {busy ? "Собираем результаты…" : "Сгенерировать QR-код моих результатов"}
+      <button type="button" className="mt-3 min-h-20 w-full rounded-2xl bg-white px-3 py-3 text-lg leading-tight font-black text-slate-950 disabled:bg-slate-700 disabled:text-slate-400" disabled={saving || busy} onClick={() => void generate()}>
+        {busy ? "Собираем результаты…" : cupMode ? "Сгенерировать QR-код матча" : "Сгенерировать QR-код результатов"}
       </button>
       {error && <p className="mt-2 text-center text-sm text-rose-300">{error}</p>}
       {packet && (<div className="fixed inset-0 z-30 flex items-end justify-center bg-slate-950/80 p-3 sm:items-center" role="presentation">
@@ -51,6 +71,7 @@ export function AthleteQrButton() {
             <p className="mt-1 text-sm text-slate-300">
               {packet.displayName}. Покажите код организатору. Рыб: {packet.fish}.{" "}
               {packet.playoffCells.length > 0 ? `Матчей: ${packet.playoffCells.length}.` : `Периодов: ${packet.periods}.`}
+              {packet.markLabel ? ` В коде период: ${packet.markLabel}.` : ""}
             </p>
             <div className="mx-auto mt-4 w-fit rounded-3xl bg-white p-3">
               <QRCodeSVG value={packet.payload} size={260} level="H" marginSize={4} bgColor="#ffffff" fgColor="#020617" title={`Результаты игрока №${packet.bibNumber}`}/>

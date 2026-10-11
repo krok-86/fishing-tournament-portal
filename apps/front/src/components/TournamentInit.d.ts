@@ -1,3 +1,1 @@
-export declare function TournamentInit({ onOpened }: {
-    onOpened: () => void;
-}): import("react").JSX.Element;
+export declare function TournamentInit(): import("react").JSX.Element;

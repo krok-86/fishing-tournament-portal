@@ -3,6 +3,7 @@ import type {
   GroupId,
   PeriodIndex,
   PeriodPhase,
+  PlayoffStage,
   RoundIndex,
   TournamentEvent,
 } from "../../../packages/shared/src/types.ts";
@@ -11,7 +12,7 @@ import { QUALIFYING_PERIOD_COUNT } from "../../../packages/shared/src/types.ts";
 /**
  * Короткая строка поимок одного номера: FTP1|<номер>|<тур>.<период>=<рыбы>;...|N<ФИО>
  * Плей-офф вместо периода: FTP1|<номер>|QF|<пара>=<рыбы>|N<ФИО>
- * QF — четвертьфинал, пары 1–4. SF — полуфинал, пары 1–2. F — финал, пара 1.
+ * QF — четвертьфинал, пары 1–4. SF — полуфинал, пары 1–2. F — финал, пара 1. TF — матч за 3-е место, пара 1.
  * Пример: FTP1|4|QF|1=3 — номер 4, первая четвертьфинальная пара, 3 рыбы.
  * Хвост S1F — период и сирена с телефона, который сдал код. На очки не влияет.
  * В коде номер жеребьёвки, не slotId: на телефоне организатора слоты другие.
@@ -21,9 +22,9 @@ import { QUALIFYING_PERIOD_COUNT } from "../../../packages/shared/src/types.ts";
  */
 const PREFIX = "FTP1";
 const MAX_FISH = 9999;
-const PLAYOFF_CELL = /^(QF|SF|F)\|([1-4])=(\d{1,4})$/;
-const PAIR_LIMIT = { QF: 4, SF: 2, F: 1 } as const;
-const STAGE_ORDER = { QF: 0, SF: 1, F: 2 } as const;
+const PLAYOFF_CELL = /^(QF|SF|F|TF)\|([1-4])=(\d{1,4})$/;
+const PAIR_LIMIT = { QF: 4, SF: 2, F: 1, TF: 1 } as const;
+const STAGE_ORDER = { QF: 0, SF: 1, F: 2, TF: 3 } as const;
 
 export interface QrCatchCell {
   round: RoundIndex;
@@ -37,11 +38,11 @@ export interface LiveCatch {
   fish: number;
 }
 
-export type PlayoffStageCode = "QF" | "SF" | "F";
+export type PlayoffStageCode = "QF" | "SF" | "F" | "TF";
 
 export interface QrPlayoffCell {
   stage: PlayoffStageCode;
-  /** Номер пары с 1: четвертьфинал 1–4, полуфинал 1–2, финал 1. */
+  /** Номер пары с 1: четвертьфинал 1–4, полуфинал 1–2, финал и матч за 3-е место — 1. */
   pair: number;
   fish: number;
 }
@@ -168,13 +169,15 @@ export function encodePlayoffSnapshot(
 
 export function playoffMatchId(stage: PlayoffStageCode, pair: number): string {
   if (stage === "F") return "final";
+  if (stage === "TF") return "third";
   if (stage === "SF") return `sf-${pair - 1}`;
   return `qf-${pair - 1}`;
 }
 
-export function playoffStageCode(stage: "quarterfinal" | "semifinal" | "final"): PlayoffStageCode {
+export function playoffStageCode(stage: PlayoffStage): PlayoffStageCode {
   if (stage === "quarterfinal") return "QF";
   if (stage === "semifinal") return "SF";
+  if (stage === "third") return "TF";
   return "F";
 }
 
@@ -285,11 +288,11 @@ function decodePlayoffBody(bibNumber: number, body: string): DecodedCatchSnapsho
 
 function isPlayoffBody(body: string): boolean {
   const head = body.split(";")[0] ?? "";
-  return /^(QF|SF|F)\|/.test(head);
+  return /^(QF|SF|F|TF)\|/.test(head);
 }
 
 function isPlayoffStage(value: string): value is PlayoffStageCode {
-  return value === "QF" || value === "SF" || value === "F";
+  return value === "QF" || value === "SF" || value === "F" || value === "TF";
 }
 
 function comparePlayoffCells(left: QrPlayoffCell, right: QrPlayoffCell): number {

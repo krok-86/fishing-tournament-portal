@@ -25,5 +25,12 @@ export default defineConfig({
     // Телефон в той же Wi‑Fi открывает ноутбук по адресу 192.168.x.x, не по localhost.
     host: true,
     ...(https ? { https } : {}),
+    // Заявка игрока и импорт орга идут на тот же адрес, что и страница. Бэкенд — apps/back.
+    proxy: {
+      "/api": {
+        target: "http://127.0.0.1:3001",
+        changeOrigin: true,
+      },
+    },
   },
 });

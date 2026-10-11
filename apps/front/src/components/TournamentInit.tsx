@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import type { GridSlot, PeriodIndex } from "../../../../packages/shared/src/types.ts";
+import { loadOnlineNames } from "../onlineRoster.ts";
 import { encodeStartSnapshot, isTournamentDate, periodStatusLabel, seatsFromGrid, type StartSnapshot } from "../qrSync.ts";
 import {
   scheduleGrid,
@@ -41,6 +42,7 @@ export function TournamentInit() {
   const [date, setDate] = useState(todayIso);
   const [opening, setOpening] = useState(false);
   const [seeding, setSeeding] = useState(false);
+  const [importing, setImporting] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const [openAttempted, setOpenAttempted] = useState(false);
@@ -90,6 +92,28 @@ export function TournamentInit() {
       seedLock.current = false;
       setSeeding(false);
     }
+  }
+
+  async function importOnline() {
+    if (locked || importing) return;
+    setImporting(true);
+    const loaded = await loadOnlineNames();
+    if (!loaded.ok) {
+      setImporting(false);
+      toast("err", loaded.error);
+      return;
+    }
+    const result = await useMatchStore.getState().importOnlineRoster(loaded.names);
+    setImporting(false);
+    if (!result.ok) {
+      toast("err", result.error);
+      return;
+    }
+    const range = result.fromBib === result.toBib ? `номер ${result.fromBib}` : `номера ${result.fromBib}–${result.toBib}`;
+    const duplicate =
+      result.alreadyOnSheet > 0 ? ` Уже были в листе: ${result.alreadyOnSheet}.` : "";
+    toast("ok", `В стартовый лист добавлено: ${result.added}. Присвоены ${range}.${duplicate}`);
+    document.getElementById("starter-list")?.scrollIntoView({ block: "nearest" });
   }
 
   async function clearList() {
@@ -284,6 +308,17 @@ export function TournamentInit() {
             Добавить
           </button>
         </div>
+        <button
+          type="button"
+          className="mt-3 h-12 w-full rounded-xl bg-white text-sm font-black text-slate-950 disabled:bg-slate-700 disabled:text-slate-400"
+          disabled={locked || importing}
+          onClick={() => void importOnline()}
+        >
+          {importing ? "Загружаем список..." : "Импортировать список из онлайна"}
+        </button>
+        <p className="mt-2 text-xs leading-relaxed text-slate-400">
+          ФИО с сервера встанут в лист по порядку заявок. Каждому присваивается следующий номер: 1, 2, 3 без пропусков.
+        </p>
       </form>
 
       <ParticipantList

@@ -66,6 +66,8 @@ export function Leaderboard() {
   const participants = useMatchStore((state) => state.participants);
   const [edit, setEdit] = useState<{ slotId: string; period: PeriodIndex } | null>(null);
   const [cardSlotId, setCardSlotId] = useState<string | null>(null);
+  const [archiving, setArchiving] = useState(false);
+  const [archiveUrl, setArchiveUrl] = useState<string | null>(null);
   const ghostIds = new Set(participants.filter((participant) => participant.ghost).map((participant) => participant.slotId));
   const editing = edit ? rows.find((entry) => entry.slotId === edit.slotId) ?? null : null;
   const cardEntry = cardSlotId ? rows.find((entry) => entry.slotId === cardSlotId) ?? null : null;
@@ -194,7 +196,30 @@ export function Leaderboard() {
           {playoffError && <p className="mt-2 text-sm text-rose-300">{playoffError}</p>}
         </div>
       )}
-      <PlayoffBracket />
+      <PlayoffBracket
+        onArchive={() => {
+          if (archiving) return;
+          setArchiving(true);
+          void useMatchStore
+            .getState()
+            .archiveTournament()
+            .then((result) => {
+              setArchiving(false);
+              if (!result.ok) {
+                toast("err", result.error);
+                return;
+              }
+              setArchiveUrl(new URL(result.path, window.location.origin).href);
+              toast("ok", "Турнир записан в архив");
+            })
+            .catch(() => {
+              setArchiving(false);
+              toast("err", "Не удалось собрать архив турнира");
+            });
+        }}
+        archiving={archiving}
+        archiveUrl={archiveUrl}
+      />
       {editing && edit && (
         <PeriodScoreDialog
           key={`${edit.slotId}-${edit.period}`}

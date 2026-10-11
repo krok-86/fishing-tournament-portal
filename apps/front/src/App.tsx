@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { ArchivePage } from "./components/ArchivePage.tsx";
 import { AthleteQrButton } from "./components/AthleteQrButton.tsx";
 import { DrawScanner } from "./components/DrawScanner.tsx";
 import { Leaderboard } from "./components/Leaderboard.tsx";
@@ -6,6 +7,7 @@ import { PlayoffEntryDialog, playoffStageTitle } from "./components/PlayoffBrack
 import { QrIntake } from "./components/QrIntake.tsx";
 import { Toaster } from "./components/Toaster.tsx";
 import { TournamentInit } from "./components/TournamentInit.tsx";
+import { registerOnline } from "./onlineRoster.ts";
 import { primeScanBeep } from "./scanBeep.ts";
 import { isRealAthleteName, useMatchStore } from "./store.ts";
 import { confirmAndToast, toast } from "./toast.ts";
@@ -39,8 +41,37 @@ function useSurface(): Surface {
   return surface;
 }
 
+function readArchiveId(location: Pick<Location, "pathname" | "hash">): string | null {
+  const pathMatch = /^\/archive\/([^/?#]+)\/?$/.exec(location.pathname);
+  const hash = location.hash.replace(/^#/, "");
+  const hashMatch = /^\/archive\/([^/?#]+)\/?$/.exec(hash);
+  const raw = pathMatch?.[1] ?? hashMatch?.[1];
+  if (!raw) return null;
+  try {
+    const id = decodeURIComponent(raw);
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id) ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+function useArchiveId(): string | null {
+  const [id, setId] = useState(() => readArchiveId(window.location));
+  useEffect(() => {
+    const sync = () => setId(readArchiveId(window.location));
+    window.addEventListener("hashchange", sync);
+    window.addEventListener("popstate", sync);
+    return () => {
+      window.removeEventListener("hashchange", sync);
+      window.removeEventListener("popstate", sync);
+    };
+  }, []);
+  return id;
+}
+
 function App() {
   const surface = useSurface();
+  const archiveId = useArchiveId();
   const hydrate = useMatchStore((state) => state.hydrate);
 
   useEffect(() => {
@@ -52,7 +83,7 @@ function App() {
 
   return (
     <>
-      {surface === "organizer" ? <OrganizerScreen /> : <PlayerScreen />}
+      {archiveId ? <ArchivePage id={archiveId} /> : surface === "organizer" ? <OrganizerScreen /> : <PlayerScreen />}
       <Toaster />
     </>
   );
@@ -74,7 +105,7 @@ function OrganizerScreen() {
 
   return (
     <main
-      className={`mx-auto flex min-h-dvh w-full flex-col bg-slate-950 px-3 pt-[max(0.75rem,env(safe-area-inset-top))] pb-[max(0.75rem,env(safe-area-inset-bottom))] text-white sm:px-6 ${wide ? "max-w-6xl" : "max-w-lg"}`}
+      className={`mx-auto flex min-h-dvh w-full flex-col bg-slate-950 px-3 pt-[max(0.75rem,env(safe-area-inset-top))] pb-[max(0.75rem,env(safe-area-inset-bottom))] text-white sm:px-6 ${wide ? "max-w-[90rem]" : "max-w-lg"}`}
     >
       <div className="grid grid-cols-3 gap-1 rounded-2xl bg-slate-900 p-1" role="tablist" aria-label="Организатор">
         <TabButton active={tab === "setup"} onClick={() => setTab("setup")}>
@@ -108,7 +139,7 @@ function OrganizerScreen() {
       ) : (
         <Leaderboard />
       )}
-      <PlayoffEntryDialog />
+      <PlayoffEntryDialog organizer />
     </main>
   );
 }
@@ -195,19 +226,93 @@ function AwaitingDraw() {
   }
 
   return (
-    <section className="mt-4 flex flex-1 flex-col justify-center">
-      <h1 className="text-2xl font-black tracking-tight">Турнир ещё не на этом телефоне</h1>
-      <p className="mt-2 text-sm leading-relaxed text-slate-300">
-        Сканируйте стартовый QR с ноутбука организатора. Сетка Бергера запишется в телефон, и сразу откроется ввод поимок.
-      </p>
-      <button
-        type="button"
-        className="mt-6 h-16 rounded-2xl bg-cyan-300 text-lg font-black text-slate-950"
-        onClick={() => setScanning(true)}
-      >
-        Сканировать жеребьевку организатора
-      </button>
+    <section className="mt-4 flex flex-1 flex-col">
+      <PreRegistration />
+      <div className="mt-6">
+        <h1 className="text-2xl font-black tracking-tight">Турнир ещё не на этом телефоне</h1>
+        <p className="mt-2 text-sm leading-relaxed text-slate-300">
+          Сканируйте стартовый QR с ноутбука организатора. Сетка Бергера запишется в телефон, и сразу откроется ввод поимок.
+        </p>
+        <button
+          type="button"
+          className="mt-6 h-16 w-full rounded-2xl bg-cyan-300 text-lg font-black text-slate-950"
+          onClick={() => setScanning(true)}
+        >
+          Сканировать жеребьевку организатора
+        </button>
+      </div>
     </section>
+  );
+}
+
+function PreRegistration() {
+  const [name, setName] = useState("");
+  const [sending, setSending] = useState(false);
+  const [done, setDone] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const fullName = name.trim().replace(/\s+/g, " ");
+  const ready = fullName.length >= 3;
+
+  if (done) {
+    return (
+      <section className="rounded-3xl border border-emerald-300/40 bg-emerald-300/10 px-4 py-4" role="status">
+        <h2 className="text-sm font-bold tracking-wide text-emerald-200 uppercase">Предварительная регистрация</h2>
+        <p className="mt-2 text-base leading-relaxed font-semibold text-emerald-50">
+          Вы успешно записаны. Утром на водоеме отсканируйте Стартовый QR-код у организатора.
+        </p>
+      </section>
+    );
+  }
+
+  return (
+    <form
+      className="rounded-3xl bg-slate-900 px-4 py-4"
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (!ready || sending) {
+          setError("Введите ваше ФИО");
+          return;
+        }
+        setSending(true);
+        setError(null);
+        void registerOnline(fullName).then((result) => {
+          setSending(false);
+          if (!result.ok) {
+            setError(result.error);
+            toast("err", result.error);
+            return;
+          }
+          setDone(true);
+        });
+      }}
+    >
+      <h2 className="text-sm font-bold tracking-wide text-cyan-100/80 uppercase">Предварительная регистрация</h2>
+      <p className="mt-2 text-sm leading-relaxed text-slate-400">
+        Заявка уходит на сервер, пока есть интернет. На берегу турнир откроется по QR без сети.
+      </p>
+      <label className="mt-3 block text-sm font-bold text-slate-200" htmlFor="preregister-name">
+        Введите ваше ФИО
+      </label>
+      <input
+        id="preregister-name"
+        className="mt-2 h-12 w-full rounded-xl border border-white/10 bg-slate-950 px-3 text-base font-semibold text-white outline-none placeholder:text-slate-500 focus:border-cyan-300"
+        value={name}
+        placeholder="Иванов Иван Иванович"
+        autoComplete="name"
+        required
+        minLength={3}
+        disabled={sending}
+        onChange={(event) => setName(event.target.value)}
+      />
+      <button
+        type="submit"
+        className="mt-3 h-12 w-full rounded-xl bg-cyan-300 text-sm font-black text-slate-950 disabled:bg-slate-700 disabled:text-slate-400"
+        disabled={sending || !ready}
+      >
+        {sending ? "Отправляем..." : "Отправить заявку"}
+      </button>
+      {error && <p className="mt-2 text-sm font-semibold text-rose-300">{error}</p>}
+    </form>
   );
 }
 
@@ -283,7 +388,7 @@ function JudgeScreen({
   const alone = tournamentOpened && !playoffFormed && athleteSlotId.length > 0 && !hasOpponent;
   const cupMatches = playoffMatches(playoff);
   const nameOf = (slotId: string | null) => {
-    if (!slotId) return "Победитель пары";
+    if (!slotId) return "ожидается";
     const person = participants.find((participant) => participant.slotId === slotId);
     return person ? `${person.bibNumber}. ${person.displayName}` : "—";
   };

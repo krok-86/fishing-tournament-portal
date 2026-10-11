@@ -34,6 +34,12 @@ interface MatchStore extends SectorView {
     officiallyStarted: boolean;
     athleteFish: number;
     opponentFish: number;
+    athleteExtraFish: number;
+    opponentExtraFish: number;
+    athleteGoldenFish: number;
+    opponentGoldenFish: number;
+    goldenFirst: "a" | "b" | null;
+    playoffDraftActive: boolean;
     pending: PendingCatch[];
     confirmed: boolean;
     saving: boolean;
@@ -67,6 +73,8 @@ interface MatchStore extends SectorView {
     playoffSaving: boolean;
     playoffError: string | null;
     adjustFish: (who: "athlete" | "opponent", delta: FishDelta) => void;
+    adjustPlayoffLine: (phase: "extra" | "golden", who: "athlete" | "opponent", delta: FishDelta) => void;
+    setGoldenFirst: (side: "a" | "b") => void;
     /** Период отбора 1–8. Пишет тот же сигнал, что и сирена орга. */
     setPeriod: (period: PeriodIndex) => void;
     /** Записать активный период и фазу сирены. Игрок без связи вызывает это вручную. */
@@ -84,7 +92,11 @@ interface MatchStore extends SectorView {
         ok: false;
         error: string;
     }>;
-    confirmPeriod: () => Promise<void>;
+    /**
+     * Подтверждение периода игрока или дуэли.
+     * `asOrganizer` — ввод поимок в сетке кубка: ФИО на этом телефоне не требуется.
+     */
+    confirmPeriod: (asOrganizer?: boolean) => Promise<void>;
     loadLeaderboard: () => Promise<LeaderboardEntry[]>;
     hydrate: () => Promise<void>;
     registerParticipant: (displayName: string) => Promise<boolean>;
@@ -159,8 +171,6 @@ export type RegistrationBatchResult = {
     ok: false;
     error: string;
 };
-/** Настоящее ФИО: не короче трёх символов и не служебное «Спортсмен №N» / «ФАНТОМ N». */
-export declare function isRealAthleteName(displayName: string, bibNumber: number): boolean;
 export declare function numberedAthleteName(bibNumber: number): string;
 export declare function numberedRegistrationBatch(count: number): RegistrationBatch;
 export declare function parseRegistrationBatch(value: unknown): RegistrationBatchResult;
@@ -200,9 +210,11 @@ export interface PeriodSeat {
 }
 /** Сектор, соперник Бергера и соперник для счёта в одном периоде. */
 export declare function periodSeat(grid: readonly GridSlot[], participants: readonly RegisteredParticipant[], slotId: string, period: PeriodIndex): PeriodSeat | null;
-/** Другое место того же сектора, если там фантом. */
-export declare function ghostSeatPartner(participants: readonly RegisteredParticipant[], sectorCount: number, slotId: string): RegisteredParticipant | null;
-/** Ближайший живой сосед по секторам. Очки одиночки считаются против него, ему эти очки не идут. */
-export declare function loneNeighborSlotId(participants: readonly RegisteredParticipant[], sectorCount: number, loneSlotId: string): string | null;
+/** Другое место того же сектора в первом периоде, если там фантом или GHOST. */
+export declare function ghostSeatPartner(participants: readonly RegisteredParticipant[], _sectorCount: number, slotId: string): RegisteredParticipant | null;
+/** Ближайший живой сосед по карте секторов первого периода. Очки одиночки считаются против него. */
+export declare function loneNeighborSlotId(participants: readonly RegisteredParticipant[], _sectorCount: number, loneSlotId: string): string | null;
 export declare function waitingParticipants(participants: readonly RegisteredParticipant[], sectorCount: number): RegisteredParticipant[];
+/** Настоящее ФИО: не короче трёх символов и не служебное «Спортсмен №N» / «ФАНТОМ N». */
+export declare function isRealAthleteName(displayName: string, bibNumber: number): boolean;
 export {};

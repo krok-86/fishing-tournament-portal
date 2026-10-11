@@ -1,11 +1,9 @@
 import { create } from "zustand";
-import { buildQuarterfinals, emptyPlayoffProjection, generateTournamentGrid, playoffMatches, projectPlayoff, seedsFromRanking, tournamentCalculator, withPlayoffDuel, withPlayoffReport, } from "../../../packages/shared/src/calculator.ts";
+import { buildQuarterfinals, comparisonNeighborFromGrid, emptyPlayoffProjection, generateTournamentGrid, isGhostOpponent, playoffMatches, projectPlayoff, seedsFromRanking, tournamentCalculator, withPlayoffDuel, withPlayoffReport, } from "../../../packages/shared/src/calculator.ts";
 import { QUALIFYING_PERIOD_COUNT, QUALIFYING_PERIODS, } from "../../../packages/shared/src/types.ts";
 import { db } from "./db.ts";
-import { decodeCatchSnapshot, encodeCatchSnapshot, encodePlayoffSnapshot, expandCatchEvents, playoffMatchId, playoffStageCode, snapshotFromEvents, totalFish, } from "./qrSync.ts";
-const PERIOD_SECONDS = 20 * 60;
+import { decodeCatchSnapshot, decodePeriodSignal, decodeStartSnapshot, encodeCatchSnapshot, isTournamentDate, encodePlayoffSnapshot, expandCatchEvents, periodStatusLabel, playoffMatchId, playoffStageCode, totalFish, } from "./qrSync.ts";
 const PERIODS_PER_ROUND = QUALIFYING_PERIOD_COUNT;
-const TOURNAMENT_NAME = "Локальный турнир";
 const emptySector = {
     sectorLabel: "—",
     sideLabel: "СЛЕВА",
@@ -14,15 +12,18 @@ const emptySector = {
     athleteName: "Вы",
     opponentName: "Соперник",
     briefing: "",
+    neighborLabel: "",
 };
 export const useMatchStore = create((set, get) => ({
     tournamentId: "local-session",
     ...emptySector,
+    playerNamedSlotIds: [],
     round: 1,
     period: 1,
+    periodPhase: "waiting",
+    officiallyStarted: false,
     athleteFish: 0,
     opponentFish: 0,
-    secondsLeft: PERIOD_SECONDS,
     pending: [],
     confirmed: false,
     saving: false,
@@ -33,7 +34,10 @@ export const useMatchStore = create((set, get) => ({
     participants: [],
     grid: [],
     sectorCount: 0,
+    periodsCount: PERIODS_PER_ROUND,
     tournamentOpened: false,
+    tournamentName: "",
+    tournamentDate: "",
     setupSaving: false,
     setupError: null,
     hydrated: false,
@@ -44,6 +48,10 @@ export const useMatchStore = create((set, get) => ({
     playoffSaving: false,
     playoffError: null,
     selfSlotId: "",
+    qualifyingHandoffReady: false,
+    qualifyingSavedCount: 0,
+    cupHandoffReady: false,
+    signalSaving: false,
     adjustFish(who, delta) {
         const state = get();
         if (!state.tournamentOpened || state.saving)
@@ -80,40 +88,100 @@ export const useMatchStore = create((set, get) => ({
             error: null,
         });
     },
-    tick() {
-        const { secondsLeft, confirmed, tournamentOpened } = get();
-        if (!tournamentOpened || confirmed || secondsLeft <= 0)
-            return;
-        set({ secondsLeft: secondsLeft - 1 });
-    },
     setPeriod(period) {
         const state = get();
-        if (!state.tournamentOpened || state.saving || state.playoff.formed)
-            return;
         if (!isQualifyingPeriod(period) || period === state.period)
             return;
-        const selected = state.athleteSlotId;
-        set({
-            period,
-            ...emptySector,
-            athleteFish: 0,
-            opponentFish: 0,
-            pending: [],
-            confirmed: false,
-            savedCount: null,
-            error: null,
-            secondsLeft: PERIOD_SECONDS,
-        });
-        if (selected)
-            get().selectAthlete(selected);
+        void state.signalPeriod(period, state.periodPhase);
     },
-    async confirmPeriod() {
+    async signalPeriod(period, phase) {
         const state = get();
+        if (!state.tournamentOpened || state.saving || state.signalSaving || state.playoff.formed)
+            return false;
+        if (!isQualifyingPeriod(period))
+            return false;
+        if (period === state.period && phase === state.periodPhase)
+            return true;
+        const event = {
+            id: crypto.randomUUID(),
+            tournamentId: state.tournamentId,
+            type: "PERIOD_SIGNAL",
+            timestamp: Date.now(),
+            payload: { period, phase },
+        };
+        const periodChanged = period !== state.period;
+        const resumeFishing = !periodChanged && phase === "fishing" && state.periodPhase !== "fishing";
+        const selected = state.athleteSlotId;
+        set({ signalSaving: true, error: null });
+        try {
+            await db.events.add(toRecord(event));
+            set({
+                signalSaving: false,
+                period,
+                periodPhase: phase,
+                officiallyStarted: state.officiallyStarted || phase !== "waiting",
+                ...(periodChanged
+                    ? {
+                        ...emptySector,
+                        athleteFish: 0,
+                        opponentFish: 0,
+                        pending: [],
+                        confirmed: false,
+                        savedCount: null,
+                    }
+                    : resumeFishing
+                        ? { confirmed: false, pending: [] }
+                        : {}),
+            });
+            if (periodChanged && selected)
+                get().selectAthlete(selected);
+            return true;
+        }
+        catch (error) {
+            set({
+                signalSaving: false,
+                error: error instanceof Error ? error.message : "Не удалось записать сигнал периода",
+            });
+            return false;
+        }
+    },
+    async acceptOrganizerCode(payload) {
+        const text = payload.trim();
+        if (text.startsWith("FTPP1")) {
+            const decoded = decodePeriodSignal(text);
+            if (!decoded.ok)
+                return decoded;
+            if (!get().tournamentOpened) {
+                return { ok: false, error: "Сначала сканируйте стартовый QR с жеребьёвкой" };
+            }
+            const saved = await get().signalPeriod(decoded.mark.period, decoded.mark.phase);
+            if (!saved)
+                return { ok: false, error: get().error ?? "Не удалось записать период" };
+            return { ok: true, fresh: false, label: periodStatusLabel(decoded.mark.period, decoded.mark.phase) };
+        }
+        if (text.startsWith("FTPS1"))
+            return importStartDraw(get, set, text);
+        if (text.startsWith("FTP1")) {
+            return { ok: false, error: "Это код результатов игрока, а не жеребьёвка организатора" };
+        }
+        return { ok: false, error: "Это не код организатора" };
+    },
+    async confirmPeriod(asOrganizer) {
+        const state = get();
+        if (state.playoff.formed && asOrganizer) {
+            await savePlayoffDuel(get, set);
+            return;
+        }
+        const identityId = state.playoff.formed ? state.selfSlotId : state.athleteSlotId;
+        if (!hasSavedRealName(state, identityId)) {
+            set({ error: "Выберите номер и введите ФИО" });
+            return;
+        }
         if (state.playoff.formed) {
             await savePlayoffDuel(get, set);
             return;
         }
-        if (!state.tournamentOpened || state.confirmed || state.saving || !state.athleteSlotId)
+        if (!state.tournamentOpened || state.confirmed || state.saving || state.signalSaving || !state.athleteSlotId)
             return;
         set({ saving: true, error: null });
         const timestamp = Date.now();
@@ -145,6 +213,10 @@ export const useMatchStore = create((set, get) => ({
                 savedCount: events.length,
             });
             await get().loadLeaderboard();
+            await get().refreshHandoff();
+            if (state.period < QUALIFYING_PERIOD_COUNT) {
+                await get().signalPeriod((state.period + 1), "waiting");
+            }
         }
         catch (error) {
             set({
@@ -183,26 +255,41 @@ export const useMatchStore = create((set, get) => ({
             const rows = await db.events.where("tournamentId").equals(tournamentId).sortBy("timestamp");
             const stored = rows.map((row) => row.event);
             const snapshot = readSetup(stored);
-            const grid = snapshot.tournamentOpened ? gridOf(snapshot.participants, snapshot.periodsPerRound) : [];
+            const participants = snapshot.tournamentOpened
+                ? snapshot.participants
+                : await healedStartList(tournamentId, snapshot.participants);
+            const grid = snapshot.tournamentOpened ? gridOf(participants, snapshot.periodsPerRound) : [];
             const playoff = projectPlayoff(stored);
+            const signal = snapshot.tournamentOpened
+                ? publishedPeriod(stored)
+                : { period: 1, phase: "waiting", officiallyStarted: false };
             set({
-                participants: snapshot.participants,
+                participants,
                 grid,
                 tournamentOpened: snapshot.tournamentOpened,
+                tournamentName: snapshot.tournamentName,
+                tournamentDate: snapshot.tournamentDate,
                 sectorCount: snapshot.tournamentOpened
                     ? snapshot.sectorCount
-                    : requiredSectorCount(snapshot.participants.length),
+                    : requiredSectorCount(participants.length),
+                periodsCount: snapshot.periodsPerRound,
                 hydrated: true,
                 setupError: null,
+                period: signal.period,
+                periodPhase: signal.phase,
+                officiallyStarted: signal.officiallyStarted,
+                playerNamedSlotIds: playerNamedFromEvents(stored).filter((slotId) => participants.some((participant) => participant.slotId === slotId)),
                 ...emptySector,
-                ...cupPatch(stored, snapshot.participants, grid),
+                ...cupPatch(stored, participants, grid),
                 selectedPlayoffMatchId: "",
                 playoffEntryOpen: false,
             });
+            await get().loadLeaderboard();
             const opening = playoffMatches(playoff).find((match) => match.slotIdA && match.slotIdB && !match.winnerSlotId)
                 ?? playoffMatches(playoff).find((match) => match.slotIdA && match.slotIdB);
             if (opening)
                 get().selectPlayoffMatch(opening.matchId);
+            await get().refreshHandoff();
         }
         catch (error) {
             set({
@@ -216,7 +303,8 @@ export const useMatchStore = create((set, get) => ({
         const state = get();
         if (!name || state.tournamentOpened || state.setupSaving)
             return false;
-        const bibNumber = state.participants.reduce((max, participant) => Math.max(max, participant.bibNumber), 0) + 1;
+        const roster = denseStartList(state.participants);
+        const bibNumber = roster.length + 1;
         const participant = {
             slotId: crypto.randomUUID(),
             bibNumber,
@@ -237,23 +325,29 @@ export const useMatchStore = create((set, get) => ({
             },
         };
         const previous = state.participants;
-        const nextParticipants = [...previous, participant];
+        const nextParticipants = [...roster, participant];
         set({
             participants: nextParticipants,
             sectorCount: requiredSectorCount(nextParticipants.length),
             setupSaving: true,
             setupError: null,
         });
+        let rosterSaved = sameRoster(previous, roster);
         try {
+            if (!rosterSaved) {
+                await persistDenseRoster(state.tournamentId, roster);
+                rosterSaved = true;
+            }
             await db.events.add(toRecord(event));
             set({ setupSaving: false });
             return true;
         }
         catch (error) {
+            const restored = rosterSaved ? roster : previous;
             set({
                 setupSaving: false,
-                participants: previous,
-                sectorCount: requiredSectorCount(previous.length),
+                participants: restored,
+                sectorCount: requiredSectorCount(restored.length),
                 setupError: error instanceof Error ? error.message : "Не удалось записать участника",
             });
             return false;
@@ -285,15 +379,17 @@ export const useMatchStore = create((set, get) => ({
         return appendRegisteredParticipants(set, state, parsed.batch.participants);
     },
     async replaceParticipant(slotId, displayName) {
-        const name = displayName.trim();
+        const name = displayName.trim().replace(/\s+/g, " ");
         const state = get();
         if (!name || state.setupSaving)
             return false;
         const current = state.participants.find((participant) => participant.slotId === slotId);
-        if (!current || current.displayName === name)
+        if (!current)
             return false;
         if (state.tournamentOpened && current.ghost)
             return false;
+        if (current.displayName === name && state.playerNamedSlotIds.includes(slotId))
+            return true;
         const event = {
             id: crypto.randomUUID(),
             tournamentId: state.tournamentId,
@@ -306,41 +402,45 @@ export const useMatchStore = create((set, get) => ({
         };
         const nextParticipant = {
             ...current,
+            bibNumber: current.bibNumber,
             displayName: name,
             ghost: state.tournamentOpened ? current.ghost : false,
         };
+        const nextLeaderboard = state.leaderboard.map((entry) => entry.slotId === slotId ? { ...entry, bibNumber: entry.bibNumber, displayName: name } : entry);
         const saved = await commitParticipantUpdate(set, state.participants, slotId, nextParticipant, event, {
-            optimistic: renamedLabels(state, current.bibNumber, slotId, name),
-            rollback: { athleteName: state.athleteName, opponentName: state.opponentName, briefing: state.briefing },
+            optimistic: {
+                ...renamedLabels(state, current.bibNumber, slotId, name),
+                leaderboard: nextLeaderboard,
+            },
+            rollback: {
+                athleteName: state.athleteName,
+                opponentName: state.opponentName,
+                briefing: state.briefing,
+                neighborLabel: state.neighborLabel,
+                leaderboard: state.leaderboard,
+            },
         });
-        if (saved && get().tournamentOpened) {
+        if (!saved)
+            return false;
+        const named = get().playerNamedSlotIds;
+        if (!named.includes(slotId))
+            set({ playerNamedSlotIds: [...named, slotId] });
+        if (get().tournamentOpened) {
             const selected = get().athleteSlotId;
             if (selected)
                 get().selectAthlete(selected);
             await get().loadLeaderboard();
         }
-        return saved;
+        return true;
     },
     async setParticipantGhost(slotId) {
         const state = get();
-        if (state.tournamentOpened || state.setupSaving)
+        if (state.setupSaving)
             return false;
-        const current = state.participants.find((participant) => participant.slotId === slotId);
-        if (!current || current.ghost)
-            return false;
-        const displayName = phantomName(current.bibNumber);
-        const event = {
-            id: crypto.randomUUID(),
-            tournamentId: state.tournamentId,
-            type: "PARTICIPANT_SET_GHOST",
-            timestamp: Date.now(),
-            payload: {
-                slotId,
-                ghost: true,
-                displayName,
-            },
-        };
-        return commitParticipantUpdate(set, state.participants, slotId, { ...current, displayName, ghost: true }, event);
+        // До сетки переходов пустой слот держит номер и оставляет дыру. Строка снимается целиком.
+        if (!state.tournamentOpened)
+            return get().removeParticipant(slotId);
+        return false;
     },
     async removeParticipant(slotId) {
         const state = get();
@@ -360,12 +460,14 @@ export const useMatchStore = create((set, get) => ({
                 ...emptySector,
                 round: 1,
                 period: 1,
+                periodPhase: "waiting",
+                officiallyStarted: false,
                 athleteFish: 0,
                 opponentFish: 0,
-                secondsLeft: PERIOD_SECONDS,
                 pending: [],
                 confirmed: false,
                 saving: false,
+                signalSaving: false,
                 savedCount: null,
                 error: null,
                 leaderboard: [],
@@ -373,7 +475,10 @@ export const useMatchStore = create((set, get) => ({
                 participants: [],
                 grid: [],
                 sectorCount: 0,
+                periodsCount: PERIODS_PER_ROUND,
                 tournamentOpened: false,
+                tournamentName: "",
+                tournamentDate: "",
                 setupSaving: false,
                 setupError: null,
                 hydrated: true,
@@ -384,6 +489,10 @@ export const useMatchStore = create((set, get) => ({
                 playoffSaving: false,
                 playoffError: null,
                 selfSlotId: "",
+                qualifyingHandoffReady: false,
+                qualifyingSavedCount: 0,
+                cupHandoffReady: false,
+                playerNamedSlotIds: [],
             });
             return true;
         }
@@ -403,12 +512,22 @@ export const useMatchStore = create((set, get) => ({
             return false;
         return dropParticipants(set, state, state.participants.map((participant) => participant.slotId));
     },
-    async startTournament() {
+    async startTournament(meta) {
         const state = get();
         if (state.tournamentOpened || state.setupSaving)
             return state.tournamentOpened;
         if (state.participants.length < 2) {
             set({ setupError: "Добавьте хотя бы двух участников" });
+            return false;
+        }
+        const tournamentName = (meta?.name ?? state.tournamentName).trim().replace(/\s+/g, " ");
+        const tournamentDate = (meta?.date ?? state.tournamentDate).trim();
+        if (!tournamentName) {
+            set({ setupError: "Укажите название турнира" });
+            return false;
+        }
+        if (!isTournamentDate(tournamentDate)) {
+            set({ setupError: "Укажите дату проведения" });
             return false;
         }
         const ordered = [...state.participants].sort(byBib);
@@ -424,7 +543,8 @@ export const useMatchStore = create((set, get) => ({
             timestamp,
             payload: {
                 rulesetId: "pal-trout-2026",
-                name: TOURNAMENT_NAME,
+                name: tournamentName,
+                date: tournamentDate,
                 periodsPerRound: PERIODS_PER_ROUND,
                 rounds: 2,
                 sectorCount,
@@ -453,12 +573,20 @@ export const useMatchStore = create((set, get) => ({
                 const stored = existing.map((row) => row.event);
                 const snapshot = readSetup(stored);
                 const openedGrid = gridOf(snapshot.participants, snapshot.periodsPerRound);
+                const signal = publishedPeriod(stored);
                 set({
                     setupSaving: false,
                     tournamentOpened: true,
                     participants: snapshot.participants,
                     sectorCount: snapshot.sectorCount,
+                    periodsCount: snapshot.periodsPerRound,
+                    tournamentName: snapshot.tournamentName,
+                    tournamentDate: snapshot.tournamentDate,
                     grid: openedGrid,
+                    period: signal.period,
+                    periodPhase: signal.phase,
+                    officiallyStarted: signal.officiallyStarted,
+                    playerNamedSlotIds: playerNamedFromEvents(stored),
                     ...emptySector,
                     ...cupPatch(stored, snapshot.participants, openedGrid),
                 });
@@ -468,11 +596,15 @@ export const useMatchStore = create((set, get) => ({
             set({
                 setupSaving: false,
                 tournamentOpened: true,
+                tournamentName,
+                tournamentDate,
                 sectorCount,
+                periodsCount: PERIODS_PER_ROUND,
                 grid,
                 round: 1,
                 period: 1,
-                secondsLeft: PERIOD_SECONDS,
+                periodPhase: "waiting",
+                officiallyStarted: false,
                 confirmed: false,
                 athleteFish: 0,
                 opponentFish: 0,
@@ -575,7 +707,6 @@ export const useMatchStore = create((set, get) => ({
             confirmed: scored,
             savedCount: null,
             error: null,
-            secondsLeft: PERIOD_SECONDS,
         });
     },
     openPlayoffEntry(matchId) {
@@ -602,12 +733,14 @@ export const useMatchStore = create((set, get) => ({
         if (state.playoff.formed) {
             if (!slotId) {
                 set({ selfSlotId: "" });
+                void get().refreshHandoff();
                 return;
             }
             const playing = state.participants.find((item) => item.slotId === slotId);
             if (!playing || playing.ghost)
                 return;
             set({ selfSlotId: slotId, error: null });
+            void get().refreshHandoff();
             return;
         }
         if (!slotId) {
@@ -621,6 +754,7 @@ export const useMatchStore = create((set, get) => ({
                 savedCount: null,
                 error: null,
             });
+            void get().refreshHandoff();
             return;
         }
         const participant = state.participants.find((item) => item.slotId === slotId);
@@ -646,6 +780,7 @@ export const useMatchStore = create((set, get) => ({
                     savedCount: null,
                 }),
         });
+        void get().refreshHandoff();
     },
     async exportAthleteResults() {
         const state = get();
@@ -662,36 +797,46 @@ export const useMatchStore = create((set, get) => ({
             if (state.playoff.formed) {
                 const playoffCells = playoffSnapshot(state, rows, slotId);
                 if (playoffCells.length === 0)
-                    return { ok: false, error: "Нет несинхронизированных поимок" };
+                    return { ok: false, error: "Сначала сохраните кубковый матч" };
+                const mark = currentPeriodMark(state);
+                const athleteName = state.playerNamedSlotIds.includes(participant.slotId) ? participant.displayName : null;
                 return {
                     ok: true,
                     packet: {
-                        payload: encodePlayoffSnapshot(participant.bibNumber, playoffCells),
+                        payload: encodePlayoffSnapshot(participant.bibNumber, playoffCells, mark, athleteName),
                         bibNumber: participant.bibNumber,
                         displayName: participant.displayName,
                         fish: totalFish(playoffCells),
                         periods: playoffCells.length,
                         cells: [],
                         playoffCells,
+                        markLabel: periodStatusLabel(mark.period, mark.phase),
                     },
                 };
             }
-            const live = !state.confirmed && state.pending.some((item) => item.slotId === slotId)
-                ? { round: state.round, period: state.period, fish: state.athleteFish }
-                : null;
-            const cells = snapshotFromEvents(rows, slotId, live);
-            if (cells.length === 0)
-                return { ok: false, error: "Нет несинхронизированных поимок" };
+            const stored = rows.map((row) => row.event);
+            if (!closedQualifyingPeriods(stored, slotId).has(QUALIFYING_PERIOD_COUNT)) {
+                return { ok: false, error: "QR отбора собирается после 8-го периода" };
+            }
+            const entry = tournamentCalculator.generateLeaderboard(stored).find((item) => item.slotId === slotId);
+            const cells = QUALIFYING_PERIODS.map((period) => ({
+                round: 1,
+                period,
+                fish: entry?.periods.find((item) => item.period === period)?.fish ?? 0,
+            }));
+            const mark = currentPeriodMark(state);
+            const athleteName = state.playerNamedSlotIds.includes(participant.slotId) ? participant.displayName : null;
             return {
                 ok: true,
                 packet: {
-                    payload: encodeCatchSnapshot(participant.bibNumber, cells),
+                    payload: encodeCatchSnapshot(participant.bibNumber, cells, mark, athleteName),
                     bibNumber: participant.bibNumber,
                     displayName: participant.displayName,
                     fish: totalFish(cells),
                     periods: cells.length,
                     cells,
                     playoffCells: [],
+                    markLabel: periodStatusLabel(mark.period, mark.phase),
                 },
             };
         }
@@ -703,22 +848,34 @@ export const useMatchStore = create((set, get) => ({
         }
     },
     async importAthleteResults(payload) {
+        const trimmed = payload.trim();
+        if (trimmed.startsWith("FTPS1") || trimmed.startsWith("FTPP1")) {
+            return { ok: false, error: "Это код жеребьёвки или сигнала периода. Его сканирует телефон игрока." };
+        }
         const decoded = decodeCatchSnapshot(payload);
         if (!decoded.ok)
             return decoded;
         const state = get();
         if (!state.tournamentOpened)
             return { ok: false, error: "Сначала откройте турнир" };
+        const markLabel = decoded.mark ? periodStatusLabel(decoded.mark.period, decoded.mark.phase) : undefined;
         const participant = state.participants.find((item) => item.bibNumber === decoded.bibNumber);
         if (!participant)
             return { ok: false, error: `Игрок №${decoded.bibNumber} не найден в этом турнире` };
         if (participant.ghost)
             return { ok: false, error: `Игрок №${decoded.bibNumber} отмечен как не пришедший` };
+        let athlete = participant;
+        if (decoded.displayName) {
+            await get().replaceParticipant(participant.slotId, decoded.displayName);
+            athlete = get().participants.find((item) => item.slotId === participant.slotId) ?? participant;
+        }
         if (decoded.mode === "playoff") {
-            return importPlayoffSnapshot(get, set, participant, decoded.cells);
+            return importPlayoffSnapshot(get, set, athlete, decoded.cells, markLabel);
         }
         const covered = new Set(decoded.cells.map((cell) => periodKey(cell)));
-        const events = expandCatchEvents(state.tournamentId, participant.slotId, decoded.cells, Date.now());
+        const started = Date.now();
+        const events = expandCatchEvents(state.tournamentId, participant.slotId, decoded.cells, started);
+        const closures = closeQualifyingCells(state.tournamentId, participant.slotId, decoded.cells, started + events.length);
         try {
             await db.transaction("rw", db.events, async () => {
                 const rows = await db.events.where("tournamentId").equals(state.tournamentId).toArray();
@@ -734,17 +891,20 @@ export const useMatchStore = create((set, get) => ({
                 });
                 if (staleIds.length > 0)
                     await db.events.bulkDelete(staleIds);
-                if (events.length > 0)
-                    await db.events.bulkAdd(events.map(toSyncedRecord));
+                const written = [...events, ...closures];
+                if (written.length > 0)
+                    await db.events.bulkAdd(written.map(toSyncedRecord));
             });
             await get().loadLeaderboard();
+            await get().refreshHandoff();
             return {
                 ok: true,
                 packet: {
-                    bibNumber: participant.bibNumber,
-                    displayName: participant.displayName,
+                    bibNumber: athlete.bibNumber,
+                    displayName: athlete.displayName,
                     fish: totalFish(decoded.cells),
                     periods: decoded.cells.length,
+                    mark: markLabel,
                 },
             };
         }
@@ -755,10 +915,115 @@ export const useMatchStore = create((set, get) => ({
             };
         }
     },
+    async refreshHandoff() {
+        const state = get();
+        const playoffFormed = state.playoff.formed;
+        const slotId = playoffFormed ? state.selfSlotId : state.athleteSlotId;
+        if (!state.tournamentOpened || !slotId) {
+            set({ qualifyingHandoffReady: false, qualifyingSavedCount: 0, cupHandoffReady: false });
+            return;
+        }
+        try {
+            const rows = await db.events.where("tournamentId").equals(state.tournamentId).sortBy("timestamp");
+            const current = get();
+            const currentSlot = current.playoff.formed ? current.selfSlotId : current.athleteSlotId;
+            if (currentSlot !== slotId || current.playoff.formed !== playoffFormed)
+                return;
+            if (current.playoff.formed) {
+                set({
+                    cupHandoffReady: playoffSnapshot(current, rows, slotId).length > 0,
+                    qualifyingHandoffReady: false,
+                });
+                return;
+            }
+            const closed = closedQualifyingPeriods(rows.map((row) => row.event), slotId);
+            set({
+                qualifyingHandoffReady: closed.has(QUALIFYING_PERIOD_COUNT),
+                qualifyingSavedCount: QUALIFYING_PERIODS.filter((period) => closed.has(period)).length,
+                cupHandoffReady: false,
+            });
+        }
+        catch {
+            set({ qualifyingHandoffReady: false, qualifyingSavedCount: 0, cupHandoffReady: false });
+        }
+    },
+    async correctPeriodFish(slotId, period, ownFish, opponentFish) {
+        const state = get();
+        if (!state.tournamentOpened || state.saving || state.setupSaving)
+            return "Сейчас журнал занят";
+        if (!isQualifyingPeriod(period))
+            return "Этот период нельзя править";
+        const participant = state.participants.find((item) => item.slotId === slotId);
+        if (!participant)
+            return "Игрок не найден";
+        if (participant.ghost)
+            return "Пустой слот нельзя править";
+        const own = clampFish(ownFish);
+        const opp = clampFish(opponentFish);
+        if (own === null || opp === null)
+            return "Укажите число поимок";
+        const seat = periodSeat(state.grid, state.participants, slotId, period);
+        const opponentSlotId = seat?.opponentSlotId ?? null;
+        if (opponentSlotId) {
+            const opponent = state.participants.find((item) => item.slotId === opponentSlotId);
+            if (!opponent || opponent.ghost)
+                return "Соперник этого периода не найден";
+        }
+        const counts = new Map([[slotId, own]]);
+        if (opponentSlotId)
+            counts.set(opponentSlotId, opp);
+        const paired = opponentSlotId !== null && seat?.bergerOpponentSlotId === opponentSlotId;
+        const timestamp = Date.now();
+        const catches = catchEventsForCounts(state.tournamentId, period, counts, timestamp);
+        const closed = {
+            id: crypto.randomUUID(),
+            tournamentId: state.tournamentId,
+            type: "PERIOD_COMPLETED",
+            timestamp: timestamp + catches.length,
+            payload: {
+                round: 1,
+                period,
+                protocols: [
+                    {
+                        slotIdA: slotId,
+                        slotIdB: paired ? opponentSlotId : null,
+                        signed: true,
+                    },
+                ],
+            },
+        };
+        try {
+            await replacePeriodCatches(state.tournamentId, 1, period, [...counts.keys()], [...catches, closed]);
+            const next = get();
+            if (!next.playoff.formed &&
+                next.period === period &&
+                (next.athleteSlotId === slotId || (opponentSlotId !== null && next.athleteSlotId === opponentSlotId))) {
+                set({
+                    athleteFish: next.athleteSlotId === slotId ? own : opponentSlotId !== null && next.athleteSlotId === opponentSlotId ? opp : next.athleteFish,
+                    opponentFish: next.opponentSlotId === slotId
+                        ? own
+                        : opponentSlotId !== null && next.opponentSlotId === opponentSlotId
+                            ? opp
+                            : next.opponentFish,
+                    pending: [],
+                    confirmed: true,
+                    error: null,
+                });
+            }
+            await get().loadLeaderboard();
+            await get().refreshHandoff();
+            return null;
+        }
+        catch (error) {
+            return error instanceof Error ? error.message : "Не удалось записать поимки";
+        }
+    },
 }));
 function readSetup(events) {
     const participants = [];
     let tournamentOpened = false;
+    let tournamentName = "";
+    let tournamentDate = "";
     let sectorCount = 0;
     let periodsPerRound = PERIODS_PER_ROUND;
     let matrix = [];
@@ -793,6 +1058,8 @@ function readSetup(events) {
         }
         else if (event.type === "TOURNAMENT_OPENED") {
             tournamentOpened = true;
+            tournamentName = event.payload.name;
+            tournamentDate = event.payload.date ?? "";
             sectorCount = event.payload.sectorCount;
             periodsPerRound = event.payload.periodsPerRound;
         }
@@ -801,7 +1068,7 @@ function readSetup(events) {
         }
     }
     participants.sort((left, right) => left.bibNumber - right.bibNumber || left.slotId.localeCompare(right.slotId));
-    return { participants, tournamentOpened, sectorCount, periodsPerRound, matrix };
+    return { participants, tournamentOpened, tournamentName, tournamentDate, sectorCount, periodsPerRound, matrix };
 }
 const MAX_REGISTRATION_BATCH = 200;
 export function numberedAthleteName(bibNumber) {
@@ -859,7 +1126,7 @@ export function phantomName(bibNumber) {
     return `ФАНТОМ ${bibNumber}`;
 }
 /**
- * Период 1 полной сетки: пары по порядку номеров, меньший слева.
+ * Период 1 полной сетки. Нечётный номер слева, чётный справа.
  * Фантом место не освобождает: живой соперник остаётся один.
  */
 export function planPeriodOne(participants, sectorCount) {
@@ -868,35 +1135,91 @@ export function planPeriodOne(participants, sectorCount) {
     const ordered = [...participants].sort(byBib).slice(0, sectorCount * 2);
     return matrixFromGrid(gridOf(ordered, 1), ordered);
 }
-/** Другое место того же сектора, если там фантом. */
-export function ghostSeatPartner(participants, sectorCount, slotId) {
-    for (const seat of sectorSeats(participants, sectorCount)) {
-        if (seat.left.slotId === slotId)
-            return seat.right?.ghost ? seat.right : null;
-        if (seat.right?.slotId === slotId)
-            return seat.left.ghost ? seat.left : null;
-    }
-    return null;
+/** Сетка переходов на все периоды. Тот же расчёт, что пишется в журнал при открытии. */
+export function scheduleGrid(participants, periodsCount) {
+    return gridOf(participants, periodsCount);
 }
-/** Ближайший живой сосед по секторам. Очки одиночки считаются против него, ему эти очки не идут. */
-export function loneNeighborSlotId(participants, sectorCount, loneSlotId) {
-    const seats = sectorSeats(participants, sectorCount);
-    const sectorIndex = seats.findIndex((seat) => seat.left.slotId === loneSlotId || seat.right?.slotId === loneSlotId);
-    if (sectorIndex < 0)
-        return null;
-    const loneOnLeft = seats[sectorIndex]?.left.slotId === loneSlotId;
-    const nearestFirst = loneOnLeft ? [sectorIndex + 1, sectorIndex - 1] : [sectorIndex - 1, sectorIndex + 1];
-    for (const index of nearestFirst) {
-        const adjacent = seats[index];
-        if (!adjacent)
+/** Секторы одного периода из уже посчитанной сетки. Сосед одиночки берётся из этого же периода. */
+export function sectorsForPeriod(grid, participants, period) {
+    const slots = grid.filter((slot) => slot.round === 1 && slot.period === period);
+    const byId = new Map(participants.map((participant) => [participant.slotId, participant]));
+    const ghosts = new Set(participants.filter((participant) => participant.ghost).map((participant) => participant.slotId));
+    const sectors = [];
+    for (const seat of gridSeats(slots)) {
+        const left = seat.left ? byId.get(seat.left.slotId) : undefined;
+        const right = seat.right ? byId.get(seat.right.slotId) : undefined;
+        const leftFishing = isFishing(left ?? null);
+        const rightFishing = isFishing(right ?? null);
+        if (leftFishing && rightFishing && seat.left && seat.right) {
+            sectors.push({
+                sectorId: seat.sectorId,
+                kind: "pair",
+                leftSlotId: seat.left.slotId,
+                rightSlotId: seat.right.slotId,
+            });
             continue;
-        const towardLone = index > sectorIndex ? [adjacent.left, adjacent.right] : [adjacent.right, adjacent.left];
-        for (const candidate of towardLone) {
-            if (isFishing(candidate) && candidate.slotId !== loneSlotId)
-                return candidate.slotId;
+        }
+        const loneSlot = leftFishing ? seat.left : rightFishing ? seat.right : null;
+        if (!loneSlot)
+            continue;
+        const opponent = loneSlot.opponentSlotId ? byId.get(loneSlot.opponentSlotId) : undefined;
+        sectors.push({
+            sectorId: seat.sectorId,
+            kind: "lone",
+            slotId: loneSlot.slotId,
+            side: drawnSide(loneSlot),
+            vacant: isGhostOpponent(loneSlot.opponentSlotId) || opponent?.ghost === true,
+            neighborSlotId: gridNeighbor(slots, loneSlot, ghosts),
+        });
+    }
+    return sectors;
+}
+/** Сектор, соперник Бергера и соперник для счёта в одном периоде. */
+export function periodSeat(grid, participants, slotId, period) {
+    const drawn = grid.find((slot) => slot.round === 1 && slot.period === period && slot.slotId === slotId);
+    if (!drawn)
+        return null;
+    const sectors = sectorsForPeriod(grid, participants, period);
+    for (const sector of sectors) {
+        if (sector.kind === "pair") {
+            if (sector.leftSlotId === slotId) {
+                return { sectorId: sector.sectorId, opponentSlotId: sector.rightSlotId, bergerOpponentSlotId: drawn.opponentSlotId };
+            }
+            if (sector.rightSlotId === slotId) {
+                return { sectorId: sector.sectorId, opponentSlotId: sector.leftSlotId, bergerOpponentSlotId: drawn.opponentSlotId };
+            }
+        }
+        else if (sector.slotId === slotId) {
+            return {
+                sectorId: sector.sectorId,
+                opponentSlotId: sector.neighborSlotId,
+                bergerOpponentSlotId: drawn.opponentSlotId,
+            };
         }
     }
-    return null;
+    return { sectorId: drawn.sectorId, opponentSlotId: null, bergerOpponentSlotId: drawn.opponentSlotId };
+}
+/** Другое место того же сектора в первом периоде, если там фантом или GHOST. */
+export function ghostSeatPartner(participants, _sectorCount, slotId) {
+    const slot = gridOf(participants, 1).find((item) => item.period === 1 && item.slotId === slotId);
+    if (!slot?.opponentSlotId || isGhostOpponent(slot.opponentSlotId))
+        return null;
+    const partner = participants.find((participant) => participant.slotId === slot.opponentSlotId);
+    return partner?.ghost ? partner : null;
+}
+/** Ближайший живой сосед по карте секторов первого периода. Очки одиночки считаются против него. */
+export function loneNeighborSlotId(participants, _sectorCount, loneSlotId) {
+    const grid = gridOf(participants, 1);
+    const slot = grid.find((item) => item.period === 1 && item.slotId === loneSlotId);
+    if (!slot || !isGhostOpponent(slot.opponentSlotId)) {
+        const opponent = slot?.opponentSlotId
+            ? participants.find((participant) => participant.slotId === slot.opponentSlotId)
+            : undefined;
+        if (opponent && !opponent.ghost)
+            return null;
+    }
+    const ghosts = new Set(participants.filter((participant) => participant.ghost).map((participant) => participant.slotId));
+    return comparisonNeighborFromGrid(grid, loneSlotId, 1, 1, ghosts);
 }
 export function waitingParticipants(participants, sectorCount) {
     const seated = new Set();
@@ -912,7 +1235,8 @@ export function waitingParticipants(participants, sectorCount) {
     return participants.filter((participant) => !participant.ghost && !seated.has(participant.slotId));
 }
 function gridOf(participants, periodsCount) {
-    return generateTournamentGrid([...participants].sort(byBib).map((participant) => participant.slotId), periodsCount);
+    const fishing = [...participants].filter((participant) => !participant.ghost).sort(byBib);
+    return generateTournamentGrid(fishing.map((participant) => participant.slotId), periodsCount, fishing.map((participant) => participant.bibNumber));
 }
 function matrixFromGrid(grid, participants) {
     const byId = new Map(participants.map((participant) => [participant.slotId, participant]));
@@ -927,8 +1251,8 @@ function matrixFromGrid(grid, participants) {
     const keys = [...grouped.keys()].sort((left, right) => compareMatrixKey(left) - compareMatrixKey(right) || left.localeCompare(right));
     for (const key of keys) {
         const slots = grouped.get(key) ?? [];
-        const left = slots.find((slot) => slot.side === "left");
-        const right = slots.find((slot) => slot.side === "right");
+        const left = slots.find((slot) => drawnSide(slot) === "left");
+        const right = slots.find((slot) => drawnSide(slot) === "right");
         const sample = left ?? right;
         if (!sample)
             continue;
@@ -978,6 +1302,9 @@ function zoneOf(groupId, round) {
         return round === 1 ? "blue" : "red";
     return round === 1 ? "red" : "blue";
 }
+function drawnSide(slot) {
+    return slot.side;
+}
 function gridSeats(slots) {
     const bySector = new Map();
     for (const slot of slots) {
@@ -987,7 +1314,7 @@ function gridSeats(slots) {
             left: null,
             right: null,
         };
-        if (slot.side === "right")
+        if (drawnSide(slot) === "right")
             seat.right = slot;
         else
             seat.left = slot;
@@ -996,30 +1323,13 @@ function gridSeats(slots) {
     return [...bySector.values()].sort((left, right) => left.order - right.order || left.sectorId.localeCompare(right.sectorId, undefined, { numeric: true }));
 }
 function gridNeighbor(slots, lone, ghosts) {
-    const seats = gridSeats(slots);
-    const sectorIndex = seats.findIndex((seat) => seat.left?.slotId === lone.slotId || seat.right?.slotId === lone.slotId);
-    if (sectorIndex < 0)
-        return null;
-    const loneOnLeft = seats[sectorIndex]?.left?.slotId === lone.slotId;
-    const nearestFirst = loneOnLeft ? [sectorIndex + 1, sectorIndex - 1] : [sectorIndex - 1, sectorIndex + 1];
-    for (const index of nearestFirst) {
-        const adjacent = seats[index];
-        if (!adjacent)
-            continue;
-        const towardLone = index > sectorIndex ? [adjacent.left, adjacent.right] : [adjacent.right, adjacent.left];
-        for (const candidate of towardLone) {
-            if (!candidate || candidate.slotId === lone.slotId || ghosts.has(candidate.slotId))
-                continue;
-            return candidate.slotId;
-        }
-    }
-    return null;
+    return comparisonNeighborFromGrid(slots, lone.slotId, lone.period, lone.round, ghosts);
 }
 function viewFromGrid(participants, grid, slot) {
     const byId = new Map(participants.map((participant) => [participant.slotId, participant]));
     const athlete = byId.get(slot.slotId);
-    const opponent = slot.opponentSlotId ? byId.get(slot.opponentSlotId) : undefined;
-    const sideLabel = slot.side === "left" ? "СЛЕВА" : "СПРАВА";
+    const opponent = slot.opponentSlotId && !isGhostOpponent(slot.opponentSlotId) ? byId.get(slot.opponentSlotId) : undefined;
+    const sideLabel = drawnSide(slot) === "left" ? "СЛЕВА" : "СПРАВА";
     const periodSlots = grid.filter((item) => item.round === slot.round && item.period === slot.period);
     const ghosts = new Set(participants.filter((participant) => participant.ghost).map((participant) => participant.slotId));
     if (opponent && !opponent.ghost) {
@@ -1031,22 +1341,29 @@ function viewFromGrid(participants, grid, slot) {
             athleteName: athleteLabel(athlete),
             opponentName: athleteLabel(opponent),
             briefing: `Вы в секторе ${slot.sectorId} ${sideLabel}, ваш соперник ${opponent.displayName}`,
+            neighborLabel: "",
         };
     }
     const neighborId = gridNeighbor(periodSlots, slot, ghosts);
     const neighbor = neighborId ? byId.get(neighborId) : undefined;
-    const vacant = opponent?.ghost === true;
     return {
         sectorLabel: slot.sectorId,
         sideLabel,
         athleteSlotId: slot.slotId,
         opponentSlotId: "",
         athleteName: athleteLabel(athlete),
-        opponentName: vacant ? "Пустой слот" : "Нет соперника",
-        briefing: neighbor
-            ? `Вы в секторе ${slot.sectorId} ${sideLabel}, соперника в паре нет, сравнение с ${neighbor.displayName}`
-            : `Вы в секторе ${slot.sectorId} ${sideLabel}, соперника в паре нет`,
+        opponentName: "Вы один",
+        briefing: `Вы в секторе ${slot.sectorId} ${sideLabel}`,
+        neighborLabel: neighborCardLabel(neighbor),
     };
+}
+function neighborCardLabel(participant) {
+    if (!participant)
+        return "сосед не определён";
+    const auto = numberedAthleteName(participant.bibNumber);
+    if (participant.displayName.trim() === auto)
+        return auto;
+    return `Спортсмен №${participant.bibNumber} ${participant.displayName.trim()}`;
 }
 function athleteLabel(participant) {
     if (!participant)
@@ -1093,28 +1410,144 @@ async function commitParticipantUpdate(set, previous, slotId, next, event, label
         return false;
     }
 }
+/** До старта лист плотный: без фантомов и без пропусков в номерах. */
+function denseStartList(participants) {
+    return [...participants]
+        .filter((participant) => !participant.ghost)
+        .sort(byBib)
+        .map((participant, index) => {
+        const bibNumber = index + 1;
+        const displayName = isAutoName(participant.displayName, participant.bibNumber)
+            ? numberedAthleteName(bibNumber)
+            : participant.displayName;
+        return { ...participant, bibNumber, displayName, ghost: false };
+    });
+}
+function isAutoName(displayName, bibNumber) {
+    return displayName === numberedAthleteName(bibNumber) || displayName === phantomName(bibNumber);
+}
+/** Настоящее ФИО: не короче трёх символов и не служебное «Спортсмен №N» / «ФАНТОМ N». */
+export function isRealAthleteName(displayName, bibNumber) {
+    const name = displayName.trim().replace(/\s+/g, " ");
+    return name.length >= 3 && !isAutoName(name, bibNumber);
+}
+function hasSavedRealName(state, slotId) {
+    if (!slotId || !state.playerNamedSlotIds.includes(slotId))
+        return false;
+    const participant = state.participants.find((item) => item.slotId === slotId);
+    if (!participant || participant.ghost)
+        return false;
+    return isRealAthleteName(participant.displayName, participant.bibNumber);
+}
+function sameRoster(left, right) {
+    if (left.length !== right.length)
+        return false;
+    const orderedLeft = [...left].sort(byBib);
+    const orderedRight = [...right].sort(byBib);
+    return orderedLeft.every((participant, index) => {
+        const other = orderedRight[index];
+        return (other !== undefined &&
+            participant.slotId === other.slotId &&
+            participant.bibNumber === other.bibNumber &&
+            participant.displayName === other.displayName &&
+            participant.groupId === other.groupId &&
+            participant.ghost === other.ghost);
+    });
+}
+async function healedStartList(tournamentId, participants) {
+    const dense = denseStartList(participants);
+    if (sameRoster(participants, dense))
+        return [...participants];
+    await persistDenseRoster(tournamentId, dense);
+    return dense;
+}
+function rosterSlotId(event) {
+    switch (event.type) {
+        case "PARTICIPANT_REGISTERED":
+        case "PARTICIPANT_REPLACED":
+        case "PARTICIPANT_SET_GHOST":
+        case "PARTICIPANT_REMOVED":
+            return event.payload.slotId;
+        default:
+            return null;
+    }
+}
+/** Стирает снятых игроков из журнала и записывает сомкнутые номера оставшимся. */
+async function persistDenseRoster(tournamentId, next) {
+    const keep = new Map(next.map((participant) => [participant.slotId, participant]));
+    await db.transaction("rw", db.events, async () => {
+        const rows = await db.events.where("tournamentId").equals(tournamentId).toArray();
+        const registeredBib = new Map();
+        for (const row of rows) {
+            if (row.event.type === "PARTICIPANT_REGISTERED") {
+                registeredBib.set(row.event.payload.slotId, row.event.payload.bibNumber);
+            }
+        }
+        const deleteIds = [];
+        for (const row of rows) {
+            const slotId = rosterSlotId(row.event);
+            if (slotId === null)
+                continue;
+            const kept = keep.get(slotId);
+            if (!kept || row.event.type === "PARTICIPANT_REMOVED" || row.event.type === "PARTICIPANT_SET_GHOST") {
+                deleteIds.push(row.id);
+                continue;
+            }
+            if (row.event.type === "PARTICIPANT_REGISTERED") {
+                const previousBib = row.event.payload.bibNumber;
+                const displayName = isAutoName(row.event.payload.displayName, previousBib)
+                    ? numberedAthleteName(kept.bibNumber)
+                    : row.event.payload.displayName;
+                if (previousBib === kept.bibNumber && displayName === row.event.payload.displayName)
+                    continue;
+                await db.events.update(row.id, {
+                    event: {
+                        ...row.event,
+                        payload: {
+                            ...row.event.payload,
+                            bibNumber: kept.bibNumber,
+                            displayName,
+                        },
+                    },
+                });
+                continue;
+            }
+            if (row.event.type !== "PARTICIPANT_REPLACED")
+                continue;
+            const previousBib = registeredBib.get(slotId);
+            if (previousBib === undefined || !isAutoName(row.event.payload.displayName, previousBib))
+                continue;
+            const displayName = numberedAthleteName(kept.bibNumber);
+            if (displayName === row.event.payload.displayName)
+                continue;
+            await db.events.update(row.id, {
+                event: {
+                    ...row.event,
+                    payload: { ...row.event.payload, displayName },
+                },
+            });
+        }
+        if (deleteIds.length > 0)
+            await db.events.bulkDelete(deleteIds);
+    });
+}
 async function dropParticipants(set, state, slotIds) {
     const removing = new Set(slotIds);
     const previous = state.participants;
-    const nextParticipants = previous.filter((participant) => !removing.has(participant.slotId));
-    if (nextParticipants.length === previous.length)
+    const kept = previous.filter((participant) => !removing.has(participant.slotId));
+    if (kept.length === previous.length)
         return false;
-    const timestamp = Date.now();
-    const events = [...removing].map((slotId, index) => ({
-        id: crypto.randomUUID(),
-        tournamentId: state.tournamentId,
-        type: "PARTICIPANT_REMOVED",
-        timestamp: timestamp + index,
-        payload: { slotId },
-    }));
+    const nextParticipants = denseStartList(kept);
+    const named = state.playerNamedSlotIds.filter((slotId) => nextParticipants.some((participant) => participant.slotId === slotId));
     set({
         participants: nextParticipants,
+        playerNamedSlotIds: named,
         sectorCount: requiredSectorCount(nextParticipants.length),
         setupSaving: true,
         setupError: null,
     });
     try {
-        await db.events.bulkAdd(events.map(toRecord));
+        await persistDenseRoster(state.tournamentId, nextParticipants);
         set({ setupSaving: false });
         return true;
     }
@@ -1122,6 +1555,7 @@ async function dropParticipants(set, state, slotIds) {
         set({
             setupSaving: false,
             participants: [...previous],
+            playerNamedSlotIds: state.playerNamedSlotIds,
             sectorCount: requiredSectorCount(previous.length),
             setupError: error instanceof Error ? error.message : "Не удалось удалить участника",
         });
@@ -1129,7 +1563,8 @@ async function dropParticipants(set, state, slotIds) {
     }
 }
 async function appendRegisteredParticipants(set, state, entries) {
-    const normalized = normalizeRegistrationEntries(entries, state.participants);
+    const roster = denseStartList(state.participants);
+    const normalized = normalizeRegistrationEntries(entries, roster);
     if (!normalized.ok) {
         set({ setupError: normalized.error });
         return false;
@@ -1147,23 +1582,29 @@ async function appendRegisteredParticipants(set, state, entries) {
             groupId: participant.groupId,
         },
     }));
-    const nextParticipants = [...state.participants, ...normalized.participants].sort(byBib);
+    const nextParticipants = [...roster, ...normalized.participants].sort(byBib);
     set({
         participants: nextParticipants,
         sectorCount: requiredSectorCount(nextParticipants.length),
         setupSaving: true,
         setupError: null,
     });
+    let rosterSaved = sameRoster(state.participants, roster);
     try {
+        if (!rosterSaved) {
+            await persistDenseRoster(state.tournamentId, roster);
+            rosterSaved = true;
+        }
         await db.events.bulkAdd(events.map(toRecord));
         set({ setupSaving: false });
         return true;
     }
     catch (error) {
+        const restored = rosterSaved ? roster : state.participants;
         set({
             setupSaving: false,
-            participants: [...state.participants],
-            sectorCount: requiredSectorCount(state.participants.length),
+            participants: [...restored],
+            sectorCount: requiredSectorCount(restored.length),
             setupError: error instanceof Error ? error.message : "Не удалось записать участников",
         });
         return false;
@@ -1207,21 +1648,6 @@ function normalizeRegistrationEntries(entries, existing) {
     }
     return { ok: true, participants };
 }
-function sectorSeats(participants, sectorCount) {
-    if (!Number.isInteger(sectorCount) || sectorCount < 1)
-        return [];
-    const active = [...participants].sort(byBib).slice(0, sectorCount * 2);
-    const seats = [];
-    for (let index = 0; index < active.length; index += 2) {
-        const first = active[index];
-        const second = active[index + 1] ?? null;
-        if (!first)
-            break;
-        const [left, right] = !second || first.bibNumber <= second.bibNumber ? [first, second] : [second, first];
-        seats.push({ sectorId: String(seats.length + 1), left, right });
-    }
-    return seats;
-}
 function isFishing(participant) {
     return participant !== null && !participant.ghost;
 }
@@ -1261,14 +1687,29 @@ function loneComparisonEvents(tournamentId, participants, grid, timestamp) {
     return events;
 }
 function renamedLabels(state, bibNumber, slotId, displayName) {
+    const participants = state.participants.map((participant) => participant.slotId === slotId
+        ? { ...participant, bibNumber: participant.bibNumber, displayName, ghost: state.tournamentOpened ? participant.ghost : false }
+        : participant);
+    if (state.playoff.formed && state.selectedPlayoffMatchId) {
+        const match = playoffMatches(state.playoff).find((item) => item.matchId === state.selectedPlayoffMatchId);
+        if (match) {
+            const view = viewFromPlayoff(participants, match);
+            return {
+                athleteName: view.athleteName,
+                opponentName: view.opponentName,
+                briefing: view.briefing,
+                neighborLabel: view.neighborLabel,
+            };
+        }
+    }
     const label = `${bibNumber}. ${displayName}`;
-    const participants = state.participants.map((participant) => participant.slotId === slotId ? { ...participant, displayName, ghost: false } : participant);
     const slot = state.grid.find((item) => item.slotId === state.athleteSlotId && item.round === state.round && item.period === state.period);
-    const briefing = slot ? viewFromGrid(participants, state.grid, slot).briefing : state.briefing;
+    const view = slot ? viewFromGrid(participants, state.grid, slot) : null;
     return {
-        athleteName: state.athleteSlotId === slotId ? label : state.athleteName,
-        opponentName: state.opponentSlotId === slotId ? label : state.opponentName,
-        briefing,
+        athleteName: state.athleteSlotId === slotId ? label : (view?.athleteName ?? state.athleteName),
+        opponentName: state.opponentSlotId === slotId ? label : (view?.opponentName ?? state.opponentName),
+        briefing: view?.briefing ?? state.briefing,
+        neighborLabel: view?.neighborLabel ?? state.neighborLabel,
     };
 }
 function byBib(left, right) {
@@ -1301,6 +1742,31 @@ function absoluteCatches(state, slotIds, timestamp) {
     }
     return events;
 }
+function clampFish(fish) {
+    if (!Number.isFinite(fish))
+        return null;
+    return Math.max(0, Math.min(9999, Math.trunc(fish)));
+}
+function catchEventsForCounts(tournamentId, period, counts, timestamp) {
+    const events = [];
+    for (const [slotId, count] of counts) {
+        for (let index = 0; index < count; index += 1) {
+            events.push({
+                id: crypto.randomUUID(),
+                tournamentId,
+                type: "CATCH_RECORDED",
+                timestamp: timestamp + events.length,
+                payload: {
+                    slotId,
+                    round: 1,
+                    period,
+                    delta: 1,
+                },
+            });
+        }
+    }
+    return events;
+}
 async function replacePeriodCatches(tournamentId, round, period, slotIds, events) {
     const replacing = new Set(slotIds);
     await db.transaction("rw", db.events, async () => {
@@ -1323,6 +1789,32 @@ async function replacePeriodCatches(tournamentId, round, period, slotIds, events
 }
 function isQualifyingPeriod(period) {
     return QUALIFYING_PERIODS.includes(period);
+}
+function closedQualifyingPeriods(events, slotId) {
+    const closed = new Set();
+    for (const event of events) {
+        if (event.type !== "PERIOD_COMPLETED" || event.payload.round !== 1)
+            continue;
+        if (!isQualifyingPeriod(event.payload.period))
+            continue;
+        const covers = event.payload.protocols.some((protocol) => protocol.signed && (protocol.slotIdA === slotId || protocol.slotIdB === slotId));
+        if (covers)
+            closed.add(event.payload.period);
+    }
+    return closed;
+}
+function closeQualifyingCells(tournamentId, slotId, cells, timestamp) {
+    return cells.map((cell, index) => ({
+        id: crypto.randomUUID(),
+        tournamentId,
+        type: "PERIOD_COMPLETED",
+        timestamp: timestamp + index,
+        payload: {
+            round: cell.round,
+            period: cell.period,
+            protocols: [{ slotIdA: slotId, slotIdB: null, signed: true }],
+        },
+    }));
 }
 function cupPatch(events, participants, grid) {
     return {
@@ -1369,6 +1861,7 @@ function viewFromPlayoff(participants, match) {
         athleteName: athleteLabel(athlete),
         opponentName: athleteLabel(opponent),
         briefing: `${stage}: ${athlete?.displayName ?? "—"} (место ${match.placeA ?? "—"}) против ${opponent?.displayName ?? "—"} (место ${match.placeB ?? "—"}). При равных поимках побеждает более высокое место отбора.`,
+        neighborLabel: "",
     };
 }
 async function savePlayoffDuel(get, set) {
@@ -1402,6 +1895,7 @@ async function savePlayoffDuel(get, set) {
         set({ saving: false, playoff, confirmed: true, pending: [], savedCount: 1, playoffEntryOpen: false });
         const next = playoffMatches(playoff).find((item) => item.slotIdA && item.slotIdB && !item.winnerSlotId);
         get().selectPlayoffMatch((next ?? match).matchId);
+        await get().refreshHandoff();
     }
     catch (error) {
         set({
@@ -1410,7 +1904,7 @@ async function savePlayoffDuel(get, set) {
         });
     }
 }
-async function importPlayoffSnapshot(get, set, participant, cells) {
+async function importPlayoffSnapshot(get, set, participant, cells, markLabel) {
     const state = get();
     if (!state.playoff.formed)
         return { ok: false, error: "Сначала сформируйте плей-офф" };
@@ -1441,6 +1935,7 @@ async function importPlayoffSnapshot(get, set, participant, cells) {
         await replaceEventLog(rows, next, true);
         set({ playoff: projectPlayoff(next), playoffError: null });
         await get().loadLeaderboard();
+        await get().refreshHandoff();
         const selected = get().selectedPlayoffMatchId;
         if (selected && cells.some((cell) => playoffMatchId(cell.stage, cell.pair) === selected)) {
             const live = playoffMatches(get().playoff).find((item) => item.matchId === selected);
@@ -1455,6 +1950,7 @@ async function importPlayoffSnapshot(get, set, participant, cells) {
                 fish: totalFish(cells),
                 periods: cells.length,
                 cup: describeCupImport(get().participants, get().playoff, cells),
+                mark: markLabel,
             },
         };
     }
@@ -1470,13 +1966,7 @@ function playoffSnapshot(state, records, slotId) {
     for (const match of playoffMatches(state.playoff)) {
         if (match.slotIdA !== slotId && match.slotIdB !== slotId)
             continue;
-        const onScreen = state.selectedPlayoffMatchId === match.matchId;
-        const started = state.confirmed || state.athleteFish > 0 || state.opponentFish > 0;
-        const fish = onScreen && started && (slotId === state.athleteSlotId || slotId === state.opponentSlotId)
-            ? slotId === state.athleteSlotId
-                ? state.athleteFish
-                : state.opponentFish
-            : unsyncedPlayoffFish(records, match.matchId, slotId);
+        const fish = unsyncedPlayoffFish(records, match.matchId, slotId);
         if (fish === null)
             continue;
         cells.push({ stage: playoffStageCode(match.stage), pair: match.order + 1, fish });
@@ -1564,8 +2054,233 @@ function toSyncedRecord(event) {
 function periodKey(cell) {
     return `${cell.round}.${cell.period}`;
 }
-export function formatClock(totalSeconds) {
-    const minutes = Math.floor(totalSeconds / 60);
-    const seconds = totalSeconds % 60;
-    return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+function currentPeriodMark(state) {
+    return { period: state.period, phase: state.periodPhase };
+}
+function playerNamedFromEvents(events) {
+    const ids = [];
+    for (const event of events) {
+        if (event.type !== "PARTICIPANT_REPLACED")
+            continue;
+        if (!ids.includes(event.payload.slotId))
+            ids.push(event.payload.slotId);
+    }
+    return ids;
+}
+function readPeriodSignal(events) {
+    let period = 1;
+    let phase = "waiting";
+    for (const event of events) {
+        if (event.type !== "PERIOD_SIGNAL")
+            continue;
+        if (!isQualifyingPeriod(event.payload.period))
+            continue;
+        period = event.payload.period;
+        phase = event.payload.phase;
+    }
+    return { period, phase };
+}
+/** До кнопки «Запустить период» журнал не двигает текущий период с 1. */
+function publishedPeriod(events) {
+    const officiallyStarted = events.some((event) => event.type === "PERIOD_SIGNAL" && event.payload.phase !== "waiting");
+    if (!officiallyStarted)
+        return { period: 1, phase: "waiting", officiallyStarted: false };
+    return { ...readPeriodSignal(events), officiallyStarted: true };
+}
+async function importStartDraw(get, set, payload) {
+    const decoded = await decodeStartSnapshot(payload);
+    if (!decoded.ok)
+        return decoded;
+    const state = get();
+    if (state.saving || state.setupSaving || state.signalSaving) {
+        return { ok: false, error: "Журнал сейчас занят" };
+    }
+    const participants = participantsFromStart(decoded.snapshot.participants);
+    const grid = gridFromSeats(participants, decoded.snapshot.seats);
+    if (grid.length === 0)
+        return { ok: false, error: "В стартовом коде нет сетки" };
+    const matrix = matrixFromGrid(grid, participants);
+    const timestamp = Date.now();
+    const events = participants.map((participant, index) => ({
+        id: crypto.randomUUID(),
+        tournamentId: state.tournamentId,
+        type: "PARTICIPANT_REGISTERED",
+        timestamp: timestamp + index,
+        payload: {
+            slotId: participant.slotId,
+            bibNumber: participant.bibNumber,
+            displayName: participant.displayName,
+            groupId: participant.groupId,
+        },
+    }));
+    let cursor = timestamp + events.length;
+    for (const participant of participants) {
+        if (!participant.ghost)
+            continue;
+        events.push({
+            id: crypto.randomUUID(),
+            tournamentId: state.tournamentId,
+            type: "PARTICIPANT_SET_GHOST",
+            timestamp: cursor,
+            payload: {
+                slotId: participant.slotId,
+                ghost: true,
+                displayName: participant.displayName,
+            },
+        });
+        cursor += 1;
+    }
+    events.push({
+        id: crypto.randomUUID(),
+        tournamentId: state.tournamentId,
+        type: "TOURNAMENT_OPENED",
+        timestamp: cursor,
+        payload: {
+            rulesetId: "pal-trout-2026",
+            name: decoded.snapshot.tournamentName,
+            date: decoded.snapshot.tournamentDate,
+            periodsPerRound: PERIODS_PER_ROUND,
+            rounds: 2,
+            sectorCount: decoded.snapshot.sectorCount,
+        },
+    });
+    cursor += 1;
+    events.push({
+        id: crypto.randomUUID(),
+        tournamentId: state.tournamentId,
+        type: "DRAW_SEEDED",
+        timestamp: cursor,
+        payload: {
+            slots: participants.map((participant) => ({
+                slotId: participant.slotId,
+                bibNumber: participant.bibNumber,
+                groupId: participant.groupId,
+                displayName: participant.displayName,
+                ghost: participant.ghost,
+            })),
+            matrix,
+        },
+    });
+    cursor += 1;
+    events.push(...loneComparisonEvents(state.tournamentId, participants, grid, cursor + 1));
+    const signalAt = cursor + 1 + events.length;
+    events.push({
+        id: crypto.randomUUID(),
+        tournamentId: state.tournamentId,
+        type: "PERIOD_SIGNAL",
+        timestamp: signalAt,
+        payload: {
+            period: decoded.snapshot.period,
+            phase: decoded.snapshot.phase,
+        },
+    });
+    set({ setupSaving: true, setupError: null, error: null });
+    try {
+        await db.transaction("rw", db.events, async () => {
+            await db.events.clear();
+            await db.events.bulkAdd(events.map(toRecord));
+        });
+        set({
+            setupSaving: false,
+            tournamentOpened: true,
+            tournamentName: decoded.snapshot.tournamentName,
+            tournamentDate: decoded.snapshot.tournamentDate,
+            participants,
+            sectorCount: decoded.snapshot.sectorCount,
+            periodsCount: decoded.snapshot.periodsPerRound,
+            grid,
+            round: 1,
+            period: decoded.snapshot.phase === "waiting" && decoded.snapshot.period === 1 ? 1 : decoded.snapshot.period,
+            periodPhase: decoded.snapshot.phase,
+            officiallyStarted: decoded.snapshot.phase !== "waiting" || decoded.snapshot.period > 1,
+            confirmed: false,
+            athleteFish: 0,
+            opponentFish: 0,
+            pending: [],
+            savedCount: null,
+            error: null,
+            setupError: null,
+            hydrated: true,
+            leaderboard: [],
+            leaderboardReady: true,
+            playoff: emptyPlayoffProjection,
+            eighthPeriodClosed: false,
+            selectedPlayoffMatchId: "",
+            playoffEntryOpen: false,
+            playoffSaving: false,
+            playoffError: null,
+            selfSlotId: "",
+            qualifyingHandoffReady: false,
+            qualifyingSavedCount: 0,
+            cupHandoffReady: false,
+            playerNamedSlotIds: [],
+            signalSaving: false,
+            saving: false,
+            ...emptySector,
+        });
+        await get().loadLeaderboard();
+        await get().refreshHandoff();
+        return {
+            ok: true,
+            fresh: true,
+            label: periodStatusLabel(decoded.snapshot.period, decoded.snapshot.phase),
+        };
+    }
+    catch (error) {
+        set({
+            setupSaving: false,
+            setupError: error instanceof Error ? error.message : "Не удалось записать жеребьёвку",
+        });
+        return {
+            ok: false,
+            error: error instanceof Error ? error.message : "Не удалось записать жеребьёвку",
+        };
+    }
+}
+function participantsFromStart(entries) {
+    return entries
+        .map((entry) => ({
+        slotId: crypto.randomUUID(),
+        bibNumber: entry.bibNumber,
+        displayName: entry.ghost ? entry.displayName.trim() : numberedAthleteName(entry.bibNumber),
+        groupId: entry.groupId,
+        ghost: entry.ghost,
+    }))
+        .sort(byBib);
+}
+function gridFromSeats(participants, seats) {
+    const byBib = new Map(participants.map((participant) => [participant.bibNumber, participant]));
+    const slots = [];
+    for (const seat of seats) {
+        const left = seat.leftBib > 0 ? (byBib.get(seat.leftBib) ?? null) : null;
+        const right = seat.rightBib !== null && seat.rightBib > 0 ? (byBib.get(seat.rightBib) ?? null) : null;
+        if (seat.leftBib > 0 && !left)
+            continue;
+        if (seat.rightBib !== null && seat.rightBib > 0 && !right)
+            continue;
+        if (left && right) {
+            slots.push(seatSlot(seat, left, right.slotId));
+            slots.push(seatSlot(seat, right, left.slotId));
+        }
+        else if (left) {
+            slots.push(seatSlot(seat, left, null));
+        }
+        else if (right) {
+            slots.push(seatSlot(seat, right, null));
+        }
+    }
+    return slots;
+}
+function seatSlot(seat, person, opponentSlotId) {
+    return {
+        round: seat.round,
+        period: seat.period,
+        groupId: person.groupId,
+        zoneId: zoneOf(person.groupId, seat.round),
+        sectorId: seat.sectorId,
+        slotId: person.slotId,
+        bibNumber: person.bibNumber,
+        side: person.bibNumber === seat.leftBib ? "left" : "right",
+        opponentSlotId,
+    };
 }

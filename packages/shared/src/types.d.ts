@@ -226,7 +226,7 @@ export interface PeriodSignalEvent extends TournamentEventBase {
         phase: PeriodPhase;
     };
 }
-export type PlayoffStage = "quarterfinal" | "semifinal" | "final";
+export type PlayoffStage = "quarterfinal" | "semifinal" | "final" | "third";
 /** Место отбора. seed 1 — первый в таблице, даже если place совпал с соседом. */
 export interface PlayoffSeed {
     slotId: string;
@@ -265,6 +265,11 @@ export interface PlayoffDuelScoredEvent extends TournamentEventBase {
         slotIdB: string;
         fishA: FishCount;
         fishB: FishCount;
+        extraFishA?: FishCount;
+        extraFishB?: FishCount;
+        goldenFishA?: FishCount;
+        goldenFishB?: FishCount;
+        goldenFirst?: "a" | "b" | null;
     };
 }
 /** Поимки одной стороны пары, пришедшие отдельно (QR). Победителя ещё нет. */
@@ -276,13 +281,30 @@ export interface PlayoffSideReportedEvent extends TournamentEventBase {
         fish: FishCount;
     };
 }
-export type PlayoffTieBreak = "catches" | "qualifyingPlace";
-/** Ничья по поимкам невозможна: при равенстве побеждает более высокое место отбора. */
-export interface PlayoffDecision {
-    winner: "a" | "b";
+export type PlayoffTieBreak = "regulation" | "extraTime" | "goldenFish" | "qualifyingPlace";
+export interface PlayoffDuelInput {
     fishA: FishCount;
     fishB: FishCount;
-    decidedBy: PlayoffTieBreak;
+    extraFishA?: FishCount | null;
+    extraFishB?: FishCount | null;
+    goldenFishA?: FishCount | null;
+    goldenFishB?: FishCount | null;
+    goldenFirst?: "a" | "b" | null;
+    placeA: number;
+    seedA: number;
+    placeB: number;
+    seedB: number;
+}
+export interface PlayoffDecision {
+    winner: "a" | "b" | null;
+    fishA: FishCount;
+    fishB: FishCount;
+    extraFishA: FishCount | null;
+    extraFishB: FishCount | null;
+    goldenFishA: FishCount | null;
+    goldenFishB: FishCount | null;
+    goldenFirst: "a" | "b" | null;
+    decidedBy: PlayoffTieBreak | null;
 }
 export interface PlayoffBracketMatch {
     matchId: string;
@@ -296,6 +318,11 @@ export interface PlayoffBracketMatch {
     placeB: number | null;
     fishA: number | null;
     fishB: number | null;
+    extraFishA: number | null;
+    extraFishB: number | null;
+    goldenFishA: number | null;
+    goldenFishB: number | null;
+    goldenFirst: "a" | "b" | null;
     winnerSlotId: string | null;
     decidedBy: PlayoffTieBreak | null;
 }
@@ -305,6 +332,7 @@ export interface PlayoffProjection {
     quarterfinals: readonly PlayoffBracketMatch[];
     semifinals: readonly PlayoffBracketMatch[];
     final: PlayoffBracketMatch | null;
+    thirdPlace: PlayoffBracketMatch | null;
 }
 export interface ProtocolSignature {
     slotIdA: string;
@@ -463,7 +491,7 @@ export interface TournamentCalculator {
      * Кубковая дуэль. При равных поимках побеждает более высокое место отбора.
      * Ничьи нет: при одном месте решает меньший seed.
      */
-    scorePlayoffDuel(fishA: FishCount, fishB: FishCount, placeA: number, seedA: number, placeB: number, seedB: number): PlayoffDecision;
+    scorePlayoffDuel(input: PlayoffDuelInput): PlayoffDecision;
     /** Четвертьфинал из FORM_PLAYOFF, полуфинал и финал — из победителей. */
     projectPlayoff(events: readonly TournamentEvent[]): PlayoffProjection;
     /**

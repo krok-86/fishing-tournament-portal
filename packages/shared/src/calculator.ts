@@ -13,6 +13,7 @@ import {
   type PeriodResult,
   type PlayoffBracketMatch,
   type PlayoffDecision,
+  type PlayoffDuelInput,
   type PlayoffPairing,
   type PlayoffProjection,
   type PlayoffSeed,
@@ -68,27 +69,61 @@ export function pointsAgainst(ownFish: FishCount, opponentFish: FishCount): Peri
 }
 
 /**
- * Плей-офф не знает ничьей.
- * Больше поимок — победа. Поровну, включая 0:0 и 2:2, — побеждает более высокое место отбора.
- * Одинаковое место отбора разводит меньший seed: это порядок строк таблицы.
+ * Кубковая дуэль PAL Trout 2026.
+ * 1. Больше рыб в основное время.
+ * 2. Ничья основного времени — доп. 5 минут.
+ * 3. Ничья доп. времени — «Золотая рыба»: больше рыб, либо кто поймал первым при равном ненулевом счёте.
+ * 4. Только 0:0 в золотой рыбе отдаёт победу более высокому месту группы (меньший place, затем меньший seed).
  */
-export function scorePlayoffDuel(
-  fishA: FishCount,
-  fishB: FishCount,
-  placeA: number,
-  seedA: number,
-  placeB: number,
-  seedB: number,
-): PlayoffDecision {
-  const left = normalizeFish(fishA);
-  const right = normalizeFish(fishB);
-  if (left !== right) {
-    return { winner: left > right ? "a" : "b", fishA: left, fishB: right, decidedBy: "catches" };
+export function scorePlayoffDuel(input: PlayoffDuelInput): PlayoffDecision {
+  const fishA = normalizeFish(input.fishA);
+  const fishB = normalizeFish(input.fishB);
+  const blank: PlayoffDecision = {
+    winner: null,
+    fishA,
+    fishB,
+    extraFishA: null,
+    extraFishB: null,
+    goldenFishA: null,
+    goldenFishB: null,
+    goldenFirst: null,
+    decidedBy: null,
+  };
+
+  if (fishA !== fishB) {
+    return { ...blank, winner: fishA > fishB ? "a" : "b", decidedBy: "regulation" };
   }
+
+  const extraFishA = normalizeFish(input.extraFishA ?? 0);
+  const extraFishB = normalizeFish(input.extraFishB ?? 0);
+  const afterExtra: PlayoffDecision = { ...blank, extraFishA, extraFishB };
+  if (extraFishA !== extraFishB) {
+    return { ...afterExtra, winner: extraFishA > extraFishB ? "a" : "b", decidedBy: "extraTime" };
+  }
+
+  const goldenFishA = normalizeFish(input.goldenFishA ?? 0);
+  const goldenFishB = normalizeFish(input.goldenFishB ?? 0);
+  const afterGolden: PlayoffDecision = {
+    ...afterExtra,
+    goldenFishA,
+    goldenFishB,
+    goldenFirst: input.goldenFirst === "a" || input.goldenFirst === "b" ? input.goldenFirst : null,
+  };
+  if (goldenFishA !== goldenFishB) {
+    const winner = goldenFishA > goldenFishB ? "a" : "b";
+    return { ...afterGolden, winner, goldenFirst: winner, decidedBy: "goldenFish" };
+  }
+  if (goldenFishA > 0) {
+    if (afterGolden.goldenFirst) {
+      return { ...afterGolden, winner: afterGolden.goldenFirst, decidedBy: "goldenFish" };
+    }
+    return { ...afterGolden, winner: null, goldenFirst: null, decidedBy: null };
+  }
+
   return {
-    winner: betterQualifier(placeA, seedA, placeB, seedB),
-    fishA: left,
-    fishB: right,
+    ...afterGolden,
+    goldenFirst: null,
+    winner: betterQualifier(input.placeA, input.seedA, input.placeB, input.seedB),
     decidedBy: "qualifyingPlace",
   };
 }
@@ -360,6 +395,7 @@ export const emptyPlayoffProjection: PlayoffProjection = {
   quarterfinals: [],
   semifinals: [],
   final: null,
+  thirdPlace: null,
 };
 
 /** Первые восемь строк таблицы. seed — порядок, place — место отбора. */
@@ -400,8 +436,8 @@ export function buildQuarterfinals(seeds: readonly PlayoffSeed[]): PlayoffPairin
 }
 
 export function playoffMatches(projection: PlayoffProjection): PlayoffBracketMatch[] {
-  if (!projection.formed || !projection.final) return [];
-  return [...projection.quarterfinals, ...projection.semifinals, projection.final];
+  if (!projection.formed || !projection.final || !projection.thirdPlace) return [];
+  return [...projection.quarterfinals, ...projection.semifinals, projection.final, projection.thirdPlace];
 }
 
 /** Сетка кубка. Очки отбора не меняет: события плей-офф в таблицу не входят. */
@@ -417,13 +453,7 @@ export function projectPlayoff(events: readonly TournamentEvent[]): PlayoffProje
     if (event.type === "FORM_PLAYOFF") formed = event;
     if (event.type === "PLAYOFF_DUEL_SCORED") {
       sides.delete(event.payload.matchId);
-      scores.set(event.payload.matchId, {
-        matchId: event.payload.matchId,
-        slotIdA: event.payload.slotIdA,
-        slotIdB: event.payload.slotIdB,
-        fishA: event.payload.fishA,
-        fishB: event.payload.fishB,
-      });
+      scores.set(event.payload.matchId, duelScoreFromEvent(event.payload));
     }
     if (event.type === "PLAYOFF_SIDE_REPORTED") {
       const score = scores.get(event.payload.matchId);
@@ -452,18 +482,28 @@ export function projectPlayoff(events: readonly TournamentEvent[]): PlayoffProje
   return assemblePlayoff(formed.payload.seeds, formed.payload.quarterfinals, resolvePlayoffScore(scores, sides));
 }
 
+/** Черновик строк дуэли, пока окно ввода ещё не подтверждено. */
+export interface PlayoffDraftLines {
+  fishA: FishCount;
+  fishB: FishCount;
+  extraFishA?: FishCount;
+  extraFishB?: FishCount;
+  goldenFishA?: FishCount;
+  goldenFishB?: FishCount;
+  goldenFirst?: "a" | "b" | null;
+}
+
 /**
  * Черновик поимок поверх уже собранной сетки.
- * Победитель и следующий раунд считаются тем же тай-брейком, что и при записи дуэли.
+ * Победитель, финал и матч за 3-е место считаются тем же регламентом, что и при записи дуэли.
  * Счёт следующего раунда сохраняется, только если в паре остались те же спортсмены.
  */
 export function previewPlayoffScore(
   projection: PlayoffProjection,
   matchId: string,
-  fishA: FishCount,
-  fishB: FishCount,
+  lines: PlayoffDraftLines,
 ): PlayoffProjection {
-  if (!projection.formed || !projection.final) return projection;
+  if (!projection.formed || !projection.final || !projection.thirdPlace) return projection;
   const pairings = projection.quarterfinals.map(matchToPairing);
   if (pairings.some((pairing) => pairing === null)) return projection;
   const target = playoffMatches(projection).find((match) => match.matchId === matchId);
@@ -474,8 +514,13 @@ export function previewPlayoffScore(
     matchId,
     slotIdA: target.slotIdA,
     slotIdB: target.slotIdB,
-    fishA,
-    fishB,
+    fishA: lines.fishA,
+    fishB: lines.fishB,
+    extraFishA: normalizeFish(lines.extraFishA ?? 0),
+    extraFishB: normalizeFish(lines.extraFishB ?? 0),
+    goldenFishA: normalizeFish(lines.goldenFishA ?? 0),
+    goldenFishB: normalizeFish(lines.goldenFishB ?? 0),
+    goldenFirst: lines.goldenFirst === "a" || lines.goldenFirst === "b" ? lines.goldenFirst : null,
   });
   return assemblePlayoff(
     projection.seeds,
@@ -984,6 +1029,38 @@ interface PlayoffScore {
   slotIdB: string;
   fishA: FishCount | null;
   fishB: FishCount | null;
+  extraFishA: FishCount;
+  extraFishB: FishCount;
+  goldenFishA: FishCount;
+  goldenFishB: FishCount;
+  goldenFirst: "a" | "b" | null;
+}
+
+const UNSCORED_LINES = {
+  fishA: null,
+  fishB: null,
+  extraFishA: null,
+  extraFishB: null,
+  goldenFishA: null,
+  goldenFishB: null,
+  goldenFirst: null,
+  winnerSlotId: null,
+  decidedBy: null,
+} as const;
+
+function duelScoreFromEvent(payload: Extract<TournamentEvent, { type: "PLAYOFF_DUEL_SCORED" }>["payload"]): PlayoffScore {
+  return {
+    matchId: payload.matchId,
+    slotIdA: payload.slotIdA,
+    slotIdB: payload.slotIdB,
+    fishA: payload.fishA,
+    fishB: payload.fishB,
+    extraFishA: normalizeFish(payload.extraFishA ?? 0),
+    extraFishB: normalizeFish(payload.extraFishB ?? 0),
+    goldenFishA: normalizeFish(payload.goldenFishA ?? 0),
+    goldenFishB: normalizeFish(payload.goldenFishB ?? 0),
+    goldenFirst: payload.goldenFirst === "a" || payload.goldenFirst === "b" ? payload.goldenFirst : null,
+  };
 }
 
 type PlayoffScoreLookup = (matchId: string, slotIdA: string, slotIdB: string) => PlayoffScore | undefined;
@@ -1010,6 +1087,11 @@ function resolvePlayoffScore(
       slotIdB,
       fishA: fishA ?? null,
       fishB: fishB ?? null,
+      extraFishA: 0,
+      extraFishB: 0,
+      goldenFishA: 0,
+      goldenFishB: 0,
+      goldenFirst: null,
     };
   };
 }
@@ -1031,10 +1113,7 @@ function pairingToMatch(pairing: PlayoffPairing): PlayoffBracketMatch {
     seedB: pairing.seedB,
     placeA: pairing.placeA,
     placeB: pairing.placeB,
-    fishA: null,
-    fishB: null,
-    winnerSlotId: null,
-    decidedBy: null,
+    ...UNSCORED_LINES,
   };
 }
 
@@ -1049,10 +1128,7 @@ function blankPlayoffMatch(matchId: string, stage: PlayoffStage, order: number):
     seedB: null,
     placeA: null,
     placeB: null,
-    fishA: null,
-    fishB: null,
-    winnerSlotId: null,
-    decidedBy: null,
+    ...UNSCORED_LINES,
   };
 }
 
@@ -1063,18 +1139,34 @@ function applyPlayoffScore(match: PlayoffBracketMatch, score: PlayoffScore | und
   if (score.fishA === null || score.fishB === null) {
     return {
       ...match,
+      ...UNSCORED_LINES,
       fishA: score.fishA,
       fishB: score.fishB,
-      winnerSlotId: null,
-      decidedBy: null,
     };
   }
-  const decision = scorePlayoffDuel(score.fishA, score.fishB, match.placeA, match.seedA, match.placeB, match.seedB);
+  const decision = scorePlayoffDuel({
+    fishA: score.fishA,
+    fishB: score.fishB,
+    extraFishA: score.extraFishA,
+    extraFishB: score.extraFishB,
+    goldenFishA: score.goldenFishA,
+    goldenFishB: score.goldenFishB,
+    goldenFirst: score.goldenFirst,
+    placeA: match.placeA,
+    seedA: match.seedA,
+    placeB: match.placeB,
+    seedB: match.seedB,
+  });
   return {
     ...match,
     fishA: decision.fishA,
     fishB: decision.fishB,
-    winnerSlotId: decision.winner === "a" ? match.slotIdA : match.slotIdB,
+    extraFishA: decision.extraFishA,
+    extraFishB: decision.extraFishB,
+    goldenFishA: decision.goldenFishA,
+    goldenFishB: decision.goldenFishB,
+    goldenFirst: decision.goldenFirst,
+    winnerSlotId: decision.winner === "a" ? match.slotIdA : decision.winner === "b" ? match.slotIdB : null,
     decidedBy: decision.decidedBy,
   };
 }
@@ -1089,22 +1181,24 @@ function assemblePlayoff(
     applyPlayoffScore(pairingToMatch(pairing), lookup(pairing.matchId, pairing.slotIdA, pairing.slotIdB)),
   );
   const semifinals = SEMIFINAL_SOURCES.map((sources, order) =>
-    advancePlayoff(`sf-${order}`, "semifinal", order, [quarterfinals[sources[0]], quarterfinals[sources[1]]], lookup),
+    advancePlayoff(`sf-${order}`, "semifinal", order, [quarterfinals[sources[0]], quarterfinals[sources[1]]], lookup, "winner"),
   );
-  const finalMatch = advancePlayoff("final", "final", 0, [semifinals[0], semifinals[1]], lookup);
+  const finalMatch = advancePlayoff("final", "final", 0, [semifinals[0], semifinals[1]], lookup, "winner");
+  const thirdPlace = advancePlayoff("third", "third", 0, [semifinals[0], semifinals[1]], lookup, "loser");
   return {
     formed: true,
     seeds,
     quarterfinals,
     semifinals,
     final: finalMatch,
+    thirdPlace,
   };
 }
 
 function scoresFromProjection(projection: PlayoffProjection): Map<string, PlayoffScore> {
   const scores = new Map<string, PlayoffScore>();
-  if (!projection.final) return scores;
-  for (const match of [...projection.quarterfinals, ...projection.semifinals, projection.final]) {
+  if (!projection.final || !projection.thirdPlace) return scores;
+  for (const match of playoffMatches(projection)) {
     if (!match.slotIdA || !match.slotIdB || (match.fishA === null && match.fishB === null)) continue;
     scores.set(match.matchId, {
       matchId: match.matchId,
@@ -1112,6 +1206,11 @@ function scoresFromProjection(projection: PlayoffProjection): Map<string, Playof
       slotIdB: match.slotIdB,
       fishA: match.fishA,
       fishB: match.fishB,
+      extraFishA: match.extraFishA ?? 0,
+      extraFishB: match.extraFishB ?? 0,
+      goldenFishA: match.goldenFishA ?? 0,
+      goldenFishB: match.goldenFishB ?? 0,
+      goldenFirst: match.goldenFirst,
     });
   }
   return scores;
@@ -1148,10 +1247,11 @@ function advancePlayoff(
   order: number,
   sources: readonly (PlayoffBracketMatch | undefined)[],
   lookup: PlayoffScoreLookup,
+  pick: "winner" | "loser",
 ): PlayoffBracketMatch {
   const ranked = sources
-    .map(playoffWinner)
-    .filter((winner): winner is PlayoffAdvanced => winner !== null)
+    .map((match) => (pick === "loser" ? playoffLoser(match) : playoffWinner(match)))
+    .filter((athlete): athlete is PlayoffAdvanced => athlete !== null)
     .sort((left, right) => left.seed - right.seed || left.place - right.place || left.slotId.localeCompare(right.slotId));
   const higherSeed = ranked[0];
   const lowerSeed = ranked[1];
@@ -1166,10 +1266,7 @@ function advancePlayoff(
     seedB: lowerSeed?.seed ?? null,
     placeA: higherSeed.place,
     placeB: lowerSeed?.place ?? null,
-    fishA: null,
-    fishB: null,
-    winnerSlotId: null,
-    decidedBy: null,
+    ...UNSCORED_LINES,
   };
   if (!lowerSeed) return match;
   return applyPlayoffScore(match, lookup(matchId, higherSeed.slotId, lowerSeed.slotId));
@@ -1180,6 +1277,15 @@ function playoffWinner(match: PlayoffBracketMatch | undefined): PlayoffAdvanced 
   if (match.seedA === null || match.seedB === null || match.placeA === null || match.placeB === null) return null;
   if (match.winnerSlotId === match.slotIdA) return { slotId: match.slotIdA, seed: match.seedA, place: match.placeA };
   if (match.winnerSlotId === match.slotIdB) return { slotId: match.slotIdB, seed: match.seedB, place: match.placeB };
+  return null;
+}
+
+function playoffLoser(match: PlayoffBracketMatch | undefined): PlayoffAdvanced | null {
+  const winner = playoffWinner(match);
+  if (!winner || !match?.slotIdA || !match.slotIdB) return null;
+  if (match.seedA === null || match.seedB === null || match.placeA === null || match.placeB === null) return null;
+  if (winner.slotId === match.slotIdA) return { slotId: match.slotIdB, seed: match.seedB, place: match.placeB };
+  if (winner.slotId === match.slotIdB) return { slotId: match.slotIdA, seed: match.seedA, place: match.placeA };
   return null;
 }
 
@@ -1194,7 +1300,7 @@ export interface PlayoffSideReport {
 
 /**
  * Полный счёт пары, как при ручном подтверждении.
- * Ничья разбирается внутри projectPlayoff: больше рыб или более высокое место отбора.
+ * Ничья разбирается внутри projectPlayoff: доп. 5 минут, золотая рыба, затем рейтинг группы.
  */
 export function withPlayoffDuel(
   events: readonly TournamentEvent[],
@@ -1206,7 +1312,7 @@ export function withPlayoffDuel(
 
 /**
  * Одна сторона пары. Вторая уже известная сторона сохраняется.
- * Когда известны обе, пишется PLAYOFF_DUEL_SCORED и победитель считается тем же тай-брейком.
+ * Когда известны обе, пишется PLAYOFF_DUEL_SCORED. QR несёт только основное время: уже введённый овертайм сохраняется.
  * Если пару записать нельзя, возвращается тот же массив.
  */
 export function withPlayoffReport(
@@ -1246,6 +1352,11 @@ export function withPlayoffReport(
               slotIdB: match.slotIdB,
               fishA: report.slotId === match.slotIdA ? fish : otherFish,
               fishB: report.slotId === match.slotIdB ? fish : otherFish,
+              extraFishA: match.extraFishA ?? 0,
+              extraFishB: match.extraFishB ?? 0,
+              goldenFishA: match.goldenFishA ?? 0,
+              goldenFishB: match.goldenFishB ?? 0,
+              goldenFirst: match.goldenFirst,
             },
           },
         ];

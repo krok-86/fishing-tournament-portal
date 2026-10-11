@@ -7,6 +7,7 @@ import {
   isGhostOpponent,
   playoffMatches,
   projectPlayoff,
+  scorePlayoffDuel,
   seedsFromRanking,
   tournamentCalculator,
   withPlayoffDuel,
@@ -29,6 +30,8 @@ import {
   type TournamentEvent,
   type ZoneId,
 } from "../../../packages/shared/src/types.ts";
+import { buildTournamentArchive } from "../../../packages/shared/src/archive.ts";
+import { postTournamentArchive, type ArchivePostResult } from "./archiveApi.ts";
 import { db, type EventRecord } from "./db.ts";
 import {
   decodeCatchSnapshot,
@@ -89,6 +92,16 @@ interface MatchStore extends SectorView {
   officiallyStarted: boolean;
   athleteFish: number;
   opponentFish: number;
+  /** Доп. 5 минут выбранной кубковой пары. */
+  athleteExtraFish: number;
+  opponentExtraFish: number;
+  /** Золотая рыба выбранной кубковой пары. */
+  athleteGoldenFish: number;
+  opponentGoldenFish: number;
+  /** Кто первым поймал золотую рыбу. Сторона A — спортсмен слева в паре. */
+  goldenFirst: "a" | "b" | null;
+  /** Организатор уже менял счёт открытой пары: сетка показывает черновик. */
+  playoffDraftActive: boolean;
   pending: PendingCatch[];
   confirmed: boolean;
   saving: boolean;
@@ -122,6 +135,9 @@ interface MatchStore extends SectorView {
   playoffSaving: boolean;
   playoffError: string | null;
   adjustFish: (who: "athlete" | "opponent", delta: FishDelta) => void;
+  /** Доп. 5 минут или золотая рыба в открытой кубковой паре. */
+  adjustPlayoffLine: (phase: "extra" | "golden", who: "athlete" | "opponent", delta: FishDelta) => void;
+  setGoldenFirst: (side: "a" | "b") => void;
   /** Период отбора 1–8. Пишет тот же сигнал, что и сирена орга. */
   setPeriod: (period: PeriodIndex) => void;
   /** Записать активный период и фазу сирены. Игрок без связи вызывает это вручную. */
@@ -134,7 +150,11 @@ interface MatchStore extends SectorView {
   acceptOrganizerCode: (payload: string) => Promise<
     { ok: true; fresh: boolean; label: string } | { ok: false; error: string }
   >;
-  confirmPeriod: () => Promise<void>;
+  /**
+   * Подтверждение периода игрока или дуэли.
+   * `asOrganizer` — ввод поимок в сетке кубка: ФИО на этом телефоне не требуется.
+   */
+  confirmPeriod: (asOrganizer?: boolean) => Promise<void>;
   loadLeaderboard: () => Promise<LeaderboardEntry[]>;
   hydrate: () => Promise<void>;
   registerParticipant: (displayName: string) => Promise<boolean>;
@@ -145,6 +165,11 @@ interface MatchStore extends SectorView {
    * Форма файла: { "participants": [{ "bibNumber": 1, "displayName": "Иванов", "groupId": "A" }] }
    */
   importRegistrationBatch: (value: unknown) => Promise<boolean>;
+  /**
+   * ФИО с `GET /api/participants` в порядке заявок.
+   * Новые имена дописываются в лист и получают следующие номера: 1, 2, 3 без пропусков.
+   */
+  importOnlineRoster: (names: readonly string[]) => Promise<OnlineRosterImportResult>;
   replaceParticipant: (slotId: string, displayName: string) => Promise<boolean>;
   /**
    * До открытия турнира фантома не создаёт: строка снимается целиком, номера смыкаются.
@@ -183,6 +208,8 @@ interface MatchStore extends SectorView {
   correctPeriodFish: (slotId: string, period: PeriodIndex, ownFish: number, opponentFish: number) => Promise<string | null>;
   /** Топ-8 после 8-го периода: пары 1–8, 2–7, 3–6, 4–5. Пишет FORM_PLAYOFF. */
   formPlayoff: () => Promise<boolean>;
+  /** Финал и матч за 3-е место уже есть: снимок уходит в PostgreSQL. */
+  archiveTournament: () => Promise<ArchivePostResult>;
   selectPlayoffMatch: (matchId: string) => void;
   /** Открывает окно поимок четвертьфинала, полуфинала или финала. */
   openPlayoffEntry: (matchId: string) => void;
@@ -210,6 +237,12 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
   officiallyStarted: false,
   athleteFish: 0,
   opponentFish: 0,
+  athleteExtraFish: 0,
+  opponentExtraFish: 0,
+  athleteGoldenFish: 0,
+  opponentGoldenFish: 0,
+  goldenFirst: null,
+  playoffDraftActive: false,
   pending: [],
   confirmed: false,
   saving: false,
@@ -249,6 +282,7 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
       if (nextCount < 0) return;
       set({
         [countKey]: nextCount,
+        playoffDraftActive: true,
         pending: [],
         confirmed: false,
         savedCount: null,
@@ -267,6 +301,43 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
     set({
       [countKey]: nextCount,
       pending: [...state.pending, { slotId, delta }],
+      savedCount: null,
+      error: null,
+    });
+  },
+
+  adjustPlayoffLine(phase, who, delta) {
+    const state = get();
+    if (!state.tournamentOpened || state.saving || !state.playoff.formed || !state.selectedPlayoffMatchId) return;
+    const countKey =
+      phase === "extra"
+        ? who === "athlete"
+          ? "athleteExtraFish"
+          : "opponentExtraFish"
+        : who === "athlete"
+          ? "athleteGoldenFish"
+          : "opponentGoldenFish";
+    const nextCount = state[countKey] + delta;
+    if (nextCount < 0) return;
+    set({
+      [countKey]: nextCount,
+      goldenFirst: phase === "golden" ? null : state.goldenFirst,
+      playoffDraftActive: true,
+      pending: [],
+      confirmed: false,
+      savedCount: null,
+      error: null,
+    });
+  },
+
+  setGoldenFirst(side) {
+    const state = get();
+    if (!state.playoff.formed || state.saving || !state.selectedPlayoffMatchId) return;
+    set({
+      goldenFirst: side,
+      playoffDraftActive: true,
+      pending: [],
+      confirmed: false,
       savedCount: null,
       error: null,
     });
@@ -345,8 +416,12 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
     return { ok: false, error: "Это не код организатора" };
   },
 
-  async confirmPeriod() {
+  async confirmPeriod(asOrganizer) {
     const state = get();
+    if (state.playoff.formed && asOrganizer) {
+      await savePlayoffDuel(get, set);
+      return;
+    }
     const identityId = state.playoff.formed ? state.selfSlotId : state.athleteSlotId;
     if (!hasSavedRealName(state, identityId)) {
       set({ error: "Выберите номер и введите ФИО" });
@@ -558,6 +633,54 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
     return appendRegisteredParticipants(set, state, parsed.batch.participants);
   },
 
+  async importOnlineRoster(names) {
+    const state = get();
+    if (state.tournamentOpened) {
+      return { ok: false, error: "Турнир уже открыт — лист больше не меняется" };
+    }
+    if (state.setupSaving) {
+      return { ok: false, error: "Стартовый лист сейчас записывается" };
+    }
+
+    const roster = denseStartList(state.participants);
+    const taken = new Set(roster.map((participant) => registrationKey(participant.displayName)));
+    const fresh: string[] = [];
+    let alreadyOnSheet = 0;
+    for (const raw of names) {
+      const displayName = registrationName(raw);
+      if (displayName.length < 3) continue;
+      const key = registrationKey(displayName);
+      if (taken.has(key)) {
+        alreadyOnSheet += 1;
+        continue;
+      }
+      taken.add(key);
+      fresh.push(displayName);
+    }
+
+    if (fresh.length === 0) {
+      if (names.length === 0) return { ok: false, error: "На сервере пока нет заявок" };
+      if (alreadyOnSheet > 0) return { ok: false, error: "Эти спортсмены уже есть в стартовом листе" };
+      return { ok: false, error: "В онлайн-списке нет ФИО" };
+    }
+
+    const fromBib = roster.length + 1;
+    const entries: RegistrationBatchEntry[] = fresh.map((displayName, index) => ({
+      bibNumber: fromBib + index,
+      displayName,
+      groupId: "A",
+    }));
+    const saved = await appendRegisteredParticipants(set, get(), entries);
+    if (!saved) return { ok: false, error: get().setupError ?? "Не удалось записать участников" };
+    return {
+      ok: true,
+      added: fresh.length,
+      alreadyOnSheet,
+      fromBib,
+      toBib: fromBib + fresh.length - 1,
+    };
+  },
+
   async replaceParticipant(slotId, displayName) {
     const name = displayName.trim().replace(/\s+/g, " ");
     const state = get();
@@ -584,13 +707,20 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
       displayName: name,
       ghost: state.tournamentOpened ? current.ghost : false,
     };
+    const nextLeaderboard = state.leaderboard.map((entry) =>
+      entry.slotId === slotId ? { ...entry, bibNumber: entry.bibNumber, displayName: name } : entry,
+    );
     const saved = await commitParticipantUpdate(set, state.participants, slotId, nextParticipant, event, {
-      optimistic: renamedLabels(state, current.bibNumber, slotId, name),
+      optimistic: {
+        ...renamedLabels(state, current.bibNumber, slotId, name),
+        leaderboard: nextLeaderboard,
+      },
       rollback: {
         athleteName: state.athleteName,
         opponentName: state.opponentName,
         briefing: state.briefing,
         neighborLabel: state.neighborLabel,
+        leaderboard: state.leaderboard,
       },
     });
     if (!saved) return false;
@@ -865,6 +995,43 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
     }
   },
 
+  async archiveTournament() {
+    const state = get();
+    if (!state.tournamentOpened) return { ok: false, error: "Сначала откройте турнир" };
+    try {
+      const rows = await db.events.where("tournamentId").equals(state.tournamentId).sortBy("timestamp");
+      const events = rows.map((row) => row.event);
+      const qualifyingLeaderboard = tournamentCalculator.generateLeaderboard(events);
+      const playoff = projectPlayoff(events);
+      const snapshot = buildTournamentArchive({
+        tournament: {
+          id: state.tournamentId,
+          name: state.tournamentName,
+          date: state.tournamentDate,
+          sectorCount: state.sectorCount,
+          periodsCount: state.periodsCount,
+        },
+        participants: state.participants.map((participant) => ({
+          slotId: participant.slotId,
+          bibNumber: participant.bibNumber,
+          displayName: participant.displayName,
+          groupId: participant.groupId,
+          ghost: participant.ghost,
+        })),
+        qualifyingLeaderboard,
+        playoff,
+        events,
+      });
+      if (!snapshot) return { ok: false, error: "Сначала завершите финал и матч за 3-е место" };
+      return await postTournamentArchive(snapshot);
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : "Не удалось собрать архив турнира",
+      };
+    }
+  },
+
   selectPlayoffMatch(matchId) {
     const state = get();
     if (!state.playoff.formed || state.saving) return;
@@ -876,6 +1043,12 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
       selectedPlayoffMatchId: matchId,
       athleteFish: scored ? match.fishA ?? 0 : 0,
       opponentFish: scored ? match.fishB ?? 0 : 0,
+      athleteExtraFish: scored ? match.extraFishA ?? 0 : 0,
+      opponentExtraFish: scored ? match.extraFishB ?? 0 : 0,
+      athleteGoldenFish: scored ? match.goldenFishA ?? 0 : 0,
+      opponentGoldenFish: scored ? match.goldenFishB ?? 0 : 0,
+      goldenFirst: scored ? match.goldenFirst : null,
+      playoffDraftActive: false,
       pending: [],
       confirmed: scored,
       savedCount: null,
@@ -1269,6 +1442,11 @@ export interface RegistrationBatch {
 }
 
 export type RegistrationBatchResult = { ok: true; batch: RegistrationBatch } | { ok: false; error: string };
+
+/** Результат кнопки «Импортировать список из онлайна». Номера — место в стартовом листе. */
+export type OnlineRosterImportResult =
+  | { ok: true; added: number; alreadyOnSheet: number; fromBib: number; toBib: number }
+  | { ok: false; error: string };
 
 export function numberedAthleteName(bibNumber: number): string {
   return `Спортсмен №${bibNumber}`;
@@ -1674,8 +1852,12 @@ async function commitParticipantUpdate(
   next: RegisteredParticipant,
   event: TournamentEvent,
   labels?: {
-    optimistic: Pick<SectorView, "athleteName" | "opponentName" | "briefing" | "neighborLabel">;
-    rollback: Pick<SectorView, "athleteName" | "opponentName" | "briefing" | "neighborLabel">;
+    optimistic: Pick<SectorView, "athleteName" | "opponentName" | "briefing" | "neighborLabel"> & {
+      leaderboard?: LeaderboardEntry[];
+    };
+    rollback: Pick<SectorView, "athleteName" | "opponentName" | "briefing" | "neighborLabel"> & {
+      leaderboard?: LeaderboardEntry[];
+    };
   },
 ): Promise<boolean> {
   set({
@@ -1712,6 +1894,14 @@ function denseStartList(participants: readonly RegisteredParticipant[]): Registe
         : participant.displayName;
       return { ...participant, bibNumber, displayName, ghost: false };
     });
+}
+
+function registrationName(value: string): string {
+  return value.trim().replace(/\s+/g, " ");
+}
+
+function registrationKey(value: string): string {
+  return registrationName(value).toLocaleLowerCase("ru");
 }
 
 function isAutoName(displayName: string, bibNumber: number): boolean {
@@ -2011,17 +2201,31 @@ function renamedLabels(
   slotId: string,
   displayName: string,
 ): Pick<SectorView, "athleteName" | "opponentName" | "briefing" | "neighborLabel"> {
-  const label = `${bibNumber}. ${displayName}`;
   const participants = state.participants.map((participant) =>
-    participant.slotId === slotId ? { ...participant, displayName, ghost: false } : participant,
+    participant.slotId === slotId
+      ? { ...participant, bibNumber: participant.bibNumber, displayName, ghost: state.tournamentOpened ? participant.ghost : false }
+      : participant,
   );
+  if (state.playoff.formed && state.selectedPlayoffMatchId) {
+    const match = playoffMatches(state.playoff).find((item) => item.matchId === state.selectedPlayoffMatchId);
+    if (match) {
+      const view = viewFromPlayoff(participants, match);
+      return {
+        athleteName: view.athleteName,
+        opponentName: view.opponentName,
+        briefing: view.briefing,
+        neighborLabel: view.neighborLabel,
+      };
+    }
+  }
+  const label = `${bibNumber}. ${displayName}`;
   const slot = state.grid.find(
     (item) => item.slotId === state.athleteSlotId && item.round === state.round && item.period === state.period,
   );
   const view = slot ? viewFromGrid(participants, state.grid, slot) : null;
   return {
-    athleteName: state.athleteSlotId === slotId ? label : state.athleteName,
-    opponentName: state.opponentSlotId === slotId ? label : state.opponentName,
+    athleteName: state.athleteSlotId === slotId ? label : (view?.athleteName ?? state.athleteName),
+    opponentName: state.opponentSlotId === slotId ? label : (view?.opponentName ?? state.opponentName),
     briefing: view?.briefing ?? state.briefing,
     neighborLabel: view?.neighborLabel ?? state.neighborLabel,
   };
@@ -2190,8 +2394,16 @@ function viewFromPlayoff(participants: readonly RegisteredParticipant[], match: 
   const byId = new Map(participants.map((participant) => [participant.slotId, participant]));
   const athlete = match.slotIdA ? byId.get(match.slotIdA) : undefined;
   const opponent = match.slotIdB ? byId.get(match.slotIdB) : undefined;
-  const stage = match.stage === "quarterfinal" ? "1/4 финала" : match.stage === "semifinal" ? "1/2 финала" : "Финал";
-  const stageShort = match.stage === "quarterfinal" ? "1/4" : match.stage === "semifinal" ? "1/2" : "ФИНАЛ";
+  const stage =
+    match.stage === "quarterfinal"
+      ? "1/4 финала"
+      : match.stage === "semifinal"
+        ? "1/2 финала"
+        : match.stage === "third"
+          ? "Матч за 3-е место"
+          : "Финал";
+  const stageShort =
+    match.stage === "quarterfinal" ? "1/4" : match.stage === "semifinal" ? "1/2" : match.stage === "third" ? "3-е" : "ФИНАЛ";
   return {
     sectorLabel: stageShort,
     sideLabel: "СЛЕВА",
@@ -2199,7 +2411,7 @@ function viewFromPlayoff(participants: readonly RegisteredParticipant[], match: 
     opponentSlotId: match.slotIdB ?? "",
     athleteName: athleteLabel(athlete),
     opponentName: athleteLabel(opponent),
-    briefing: `${stage}: ${athlete?.displayName ?? "—"} (место ${match.placeA ?? "—"}) против ${opponent?.displayName ?? "—"} (место ${match.placeB ?? "—"}). При равных поимках побеждает более высокое место отбора.`,
+    briefing: `${stage}: ${athlete?.displayName ?? "—"} (место ${match.placeA ?? "—"}) против ${opponent?.displayName ?? "—"} (место ${match.placeB ?? "—"}). Ничья основного времени решается доп. 5-минуткой, затем «Золотой рыбой». Если за 10 минут никто не поймал, проходит более высокое место группы.`,
     neighborLabel: "",
   };
 }
@@ -2208,8 +2420,26 @@ async function savePlayoffDuel(get: () => MatchStore, set: (partial: Partial<Mat
   const state = get();
   if (state.saving || !state.playoff.formed || !state.selectedPlayoffMatchId) return;
   const match = playoffMatches(state.playoff).find((item) => item.matchId === state.selectedPlayoffMatchId);
-  if (!match?.slotIdA || !match.slotIdB) {
+  if (!match?.slotIdA || !match.slotIdB || match.placeA === null || match.placeB === null || match.seedA === null || match.seedB === null) {
     set({ error: "Эта пара ещё не собрана" });
+    return;
+  }
+
+  const decision = scorePlayoffDuel({
+    fishA: state.athleteFish,
+    fishB: state.opponentFish,
+    extraFishA: state.athleteExtraFish,
+    extraFishB: state.opponentExtraFish,
+    goldenFishA: state.athleteGoldenFish,
+    goldenFishB: state.opponentGoldenFish,
+    goldenFirst: state.goldenFirst,
+    placeA: match.placeA,
+    seedA: match.seedA,
+    placeB: match.placeB,
+    seedB: match.seedB,
+  });
+  if (!decision.winner || !decision.decidedBy) {
+    set({ error: "Отметьте, кто первым поймал золотую рыбу" });
     return;
   }
 
@@ -2222,8 +2452,13 @@ async function savePlayoffDuel(get: () => MatchStore, set: (partial: Partial<Mat
       matchId: match.matchId,
       slotIdA: match.slotIdA,
       slotIdB: match.slotIdB,
-      fishA: state.athleteFish,
-      fishB: state.opponentFish,
+      fishA: decision.fishA,
+      fishB: decision.fishB,
+      extraFishA: decision.extraFishA ?? 0,
+      extraFishB: decision.extraFishB ?? 0,
+      goldenFishA: decision.goldenFishA ?? 0,
+      goldenFishB: decision.goldenFishB ?? 0,
+      goldenFirst: decision.goldenFirst,
     },
   };
 
@@ -2350,8 +2585,14 @@ function describeCupImport(
     const winner = participants.find((item) => item.slotId === match.winnerSlotId);
     const winnerName = winner?.displayName ?? "победитель";
     const score = `${match.fishA}:${match.fishB}`;
+    if (match.decidedBy === "extraTime") {
+      return `${title}: ${score}, доп. ${match.extraFishA ?? 0}:${match.extraFishB ?? 0}. Дальше ${winnerName} — победа в доп. время.`;
+    }
+    if (match.decidedBy === "goldenFish") {
+      return `${title}: ${score}. Дальше ${winnerName} — победа по золотой рыбе.`;
+    }
     if (match.decidedBy === "qualifyingPlace") {
-      return `${title}: ничья ${score}. Дальше ${winnerName} — более высокое место отбора.`;
+      return `${title}: ничья ${score}. Дальше ${winnerName} — по рейтингу группы.`;
     }
     return `${title}: ${score}. Дальше ${winnerName}.`;
   });
@@ -2361,6 +2602,7 @@ function describeCupImport(
 function cupStageLabel(stage: QrPlayoffCell["stage"]): string {
   if (stage === "QF") return "Четвертьфинал";
   if (stage === "SF") return "Полуфинал";
+  if (stage === "TF") return "Матч за 3-е место";
   return "Финал";
 }
 
