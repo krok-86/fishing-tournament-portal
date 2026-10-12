@@ -75,6 +75,8 @@ export interface PlayerQrImport {
   cup?: string;
   /** Период, который телефон игрока вложил в код при сдаче. Сирену орга не перебивает. */
   mark?: string;
+  /** Сколько периодов QR не совпали с уже записанным счётом. */
+  disputes?: number;
 }
 
 export type PlayerQrImportResult = { ok: true; packet: PlayerQrImport } | { ok: false; error: string };

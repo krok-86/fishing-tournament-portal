@@ -11,8 +11,31 @@ export interface EventRecord {
   event: TournamentEvent;
 }
 
+/** Пакет улова, который ещё не принял сервер. Телефон шлёт его снова, когда появляется сеть. */
+export interface OutboxItem {
+  id: string;
+  createdAt: number;
+  bibNumber: number;
+  opponentBib: number | null;
+  period: number;
+  ownFish: number;
+  opponentFish: number;
+}
+
+/** Расхождение дуэли на ноутбуке организатора. Решение орга снимает подсветку. */
+export interface DuelConflictRecord {
+  id: string;
+  period: number;
+  slotId: string;
+  fingerprint: string;
+  status: "open" | "resolved";
+  detail: string;
+}
+
 class TournamentDatabase extends Dexie {
   events!: Table<EventRecord, string>;
+  outboxQueue!: Table<OutboxItem, string>;
+  duelConflicts!: Table<DuelConflictRecord, string>;
 
   constructor() {
     super("FishingTournamentPortal");
@@ -43,6 +66,12 @@ class TournamentDatabase extends Dexie {
         events: "id, tournamentId, type, timestamp, isSynced",
       })
       .upgrade((tx) => tx.table("events").clear());
+    // Очередь отправки и споры дуэлей. Журнал турнира не трогаем.
+    this.version(6).stores({
+      events: "id, tournamentId, type, timestamp, isSynced",
+      outboxQueue: "id, createdAt",
+      duelConflicts: "id, period, slotId, status",
+    });
   }
 }
 

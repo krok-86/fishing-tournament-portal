@@ -50,5 +50,9 @@ export async function confirmAndToast(confirmPeriod: () => Promise<void>) {
     after.savedCount !== before.savedCount ||
     after.playoffEntryOpen !== before.playoffEntryOpen;
   if (!changed) return;
+  if (!before.playoff.formed && after.syncNote) {
+    toast("ok", after.syncNote);
+    return;
+  }
   toast("ok", before.playoff.formed ? "Дуэль сохранена" : `Период ${before.period} сохранён`);
 }

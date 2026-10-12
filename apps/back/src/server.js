@@ -1,5 +1,6 @@
 const express = require("express");
 const { attachArchiveRoutes, prepareArchiveStore } = require("./archiveStore");
+const { attachMatchRoutes } = require("./index.js"); // собран из index.ts: npm run build -w apps/back
 
 const PORT = Number(process.env.PORT) || 3001;
 
@@ -53,6 +54,8 @@ app.post("/api/register", (req, res) => {
   participants.push({ fullName, registeredAt: new Date().toISOString() });
   res.status(201).json({ ok: true, fullName, alreadyRegistered: false });
 });
+
+attachMatchRoutes(app);
 
 app.get("/api/participants", (_req, res) => {
   res.json({

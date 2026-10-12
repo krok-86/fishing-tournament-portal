@@ -103,7 +103,9 @@ export function QrIntake() {
       playScanBeep();
       const message = result.packet.cup
         ? `Игрок №${result.packet.bibNumber} принят. ${result.packet.cup}${result.packet.mark ? ` На телефоне: ${result.packet.mark}.` : ""}`
-        : `Игрок №${result.packet.bibNumber}, ${result.packet.displayName}, принят. Рыб: ${result.packet.fish}. Периодов: ${result.packet.periods}.${result.packet.mark ? ` На телефоне: ${result.packet.mark}.` : ""} Таблица пересчитана.`;
+        : `Игрок №${result.packet.bibNumber}, ${result.packet.displayName}, принят. Рыб: ${result.packet.fish}. Периодов: ${result.packet.periods}.${result.packet.mark ? ` На телефоне: ${result.packet.mark}.` : ""}${
+            result.packet.disputes ? " Есть расхождения — оранжевые ячейки в таблице." : " Таблица пересчитана."
+          }`;
       setStatus({ tone: "ok", text: message });
       toast("ok", message);
       if (origin === "field") fieldRef.current?.focus();

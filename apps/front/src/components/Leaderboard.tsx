@@ -64,6 +64,7 @@ export function Leaderboard() {
   const signalPeriod = useMatchStore((state) => state.signalPeriod);
   const signalSaving = useMatchStore((state) => state.signalSaving);
   const participants = useMatchStore((state) => state.participants);
+  const duelConflicts = useMatchStore((state) => state.duelConflicts);
   const [edit, setEdit] = useState<{ slotId: string; period: PeriodIndex } | null>(null);
   const [cardSlotId, setCardSlotId] = useState<string | null>(null);
   const [archiving, setArchiving] = useState(false);
@@ -108,7 +109,7 @@ export function Leaderboard() {
         <div>
           <h2 className="text-lg font-black tracking-tight sm:text-2xl">Таблица лидеров</h2>
           <p className="text-xs text-slate-400 sm:text-sm">
-            Ячейка периода: свои рыбы : рыбы соперника (очки). Имя открывает карточку, ячейка — правку поимок. Баллы считает калькулятор.
+            Ячейка периода: свои рыбы : рыбы соперника (очки). Имя открывает карточку, ячейка — правку поимок. Оранжевая ячейка — расхождение в дуэли.
           </p>
         </div>
         <p className="rounded-full border border-amber-300/40 bg-amber-300/10 px-3 py-1 text-[11px] font-bold tracking-wide text-amber-100 uppercase">
@@ -164,6 +165,7 @@ export function Leaderboard() {
                 entry={entry}
                 activePeriod={activePeriod}
                 editable={tournamentOpened && !ghostIds.has(entry.slotId)}
+                conflictPeriods={conflictPeriodsFor(duelConflicts, entry.slotId)}
                 onEdit={(period) => setEdit({ slotId: entry.slotId, period })}
                 onOpenCard={() => setCardSlotId(entry.slotId)}
               />
@@ -248,12 +250,14 @@ function LeaderboardRow({
   entry,
   activePeriod,
   editable,
+  conflictPeriods,
   onEdit,
   onOpenCard,
 }: {
   entry: LeaderboardEntry;
   activePeriod: PeriodIndex;
   editable: boolean;
+  conflictPeriods: ReadonlySet<PeriodIndex>;
   onEdit: (period: PeriodIndex) => void;
   onOpenCard: () => void;
 }) {
@@ -280,18 +284,25 @@ function LeaderboardRow({
       </td>
       {PERIODS.map((period) => {
         const cell = entry.periods.find((item) => item.period === period);
+        const conflict = conflictPeriods.has(period);
         return (
           <td
             key={period}
             className={`px-1 py-2 text-center text-xs font-semibold tabular-nums whitespace-nowrap ${
-              period === activePeriod ? "bg-cyan-300/10 text-cyan-50" : ""
+              conflict
+                ? "bg-red-700/90 text-white shadow-[inset_0_0_0_2px_#fb923c]"
+                : period === activePeriod
+                  ? "bg-cyan-300/10 text-cyan-50"
+                  : ""
             }`}
           >
             {editable ? (
               <button
                 type="button"
-                className="min-h-11 min-w-11 rounded-lg px-1 font-semibold text-inherit"
-                aria-label={`Период ${period}, ${formatDrawName(entry.bibNumber, entry.displayName)}, изменить поимки`}
+                className={`min-h-11 min-w-11 rounded-lg px-1 font-semibold ${
+                  conflict ? "bg-orange-500 font-black text-slate-950 ring-2 ring-red-500" : "text-inherit"
+                }`}
+                aria-label={`Период ${period}, ${formatDrawName(entry.bibNumber, entry.displayName)}, ${conflict ? "расхождение, изменить поимки" : "изменить поимки"}`}
                 onClick={() => onEdit(period)}
               >
                 {formatPeriod(cell)}
@@ -333,6 +344,9 @@ function PeriodScoreDialog({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const points = opponentId ? pointsAgainst(ownFish, opponentFish) : null;
+  const dispute = useMatchStore((state) =>
+    state.duelConflicts.find((item) => item.status === "open" && item.slotId === entry.slotId && item.period === period),
+  );
 
   async function save() {
     if (saving) return;
@@ -370,6 +384,11 @@ function PeriodScoreDialog({
             ? "Одиночка. Поимки соперника — рыба соседа по сектору. Баллы после записи посчитает калькулятор."
             : "Меняются только поимки. Баллы 4, 2, 1 или 0 после записи посчитает калькулятор."}
         </p>
+        {dispute && (
+          <p className="mt-3 rounded-2xl bg-orange-500/20 px-3 py-2 text-sm font-bold text-orange-100">
+            Расхождение: {dispute.detail}. Утвердите финальный счёт.
+          </p>
+        )}
         <div className="mt-4 grid gap-3">
           <FishStepper label="Поимки игрока" value={ownFish} disabled={saving} onChange={setOwnFish} />
           <FishStepper
@@ -621,6 +640,20 @@ function CardStat({ label, value }: { label: string; value: string }) {
       <p className="text-lg font-black tabular-nums">{value}</p>
     </div>
   );
+}
+
+function conflictPeriodsFor(
+  conflicts: readonly { status: "open" | "resolved"; slotId: string; period: number }[],
+  slotId: string,
+): ReadonlySet<PeriodIndex> {
+  const periods = new Set<PeriodIndex>();
+  for (const item of conflicts) {
+    if (item.status !== "open" || item.slotId !== slotId) continue;
+    const period = item.period as PeriodIndex;
+    if (!PERIODS.includes(period)) continue;
+    periods.add(period);
+  }
+  return periods;
 }
 
 function formatPeriod(cell: PeriodResult | undefined): string {

@@ -8,6 +8,7 @@ import { QrIntake } from "./components/QrIntake.tsx";
 import { Toaster } from "./components/Toaster.tsx";
 import { TournamentInit } from "./components/TournamentInit.tsx";
 import { registerOnline } from "./onlineRoster.ts";
+import { fetchMatchSync } from "./matchSync.ts";
 import { primeScanBeep } from "./scanBeep.ts";
 import { isRealAthleteName, useMatchStore } from "./store.ts";
 import { confirmAndToast, toast } from "./toast.ts";
@@ -15,6 +16,8 @@ import { playoffMatches } from "../../../packages/shared/src/calculator.ts";
 import { QUALIFYING_PERIODS } from "../../../packages/shared/src/types.ts";
 
 const ORGANIZER_SEGMENT = "admin-secret-setup";
+const OUTBOX_FLUSH_MS = 45_000;
+const MATCH_SYNC_MS = 30_000;
 
 type Surface = "player" | "organizer";
 type OrganizerTab = "setup" | "scan" | "table";
@@ -81,6 +84,21 @@ function App() {
     });
   }, [hydrate]);
 
+  useEffect(() => {
+    if (archiveId) return;
+    const flush = () => {
+      void useMatchStore.getState().flushOutbox().then((result) => {
+        if (result.sent > 0) toast("ok", "Результат синхронизирован по сети");
+      });
+    };
+    window.addEventListener("online", flush);
+    const timer = window.setInterval(flush, OUTBOX_FLUSH_MS);
+    return () => {
+      window.removeEventListener("online", flush);
+      window.clearInterval(timer);
+    };
+  }, [archiveId]);
+
   return (
     <>
       {archiveId ? <ArchivePage id={archiveId} /> : surface === "organizer" ? <OrganizerScreen /> : <PlayerScreen />}
@@ -101,7 +119,25 @@ async function takeOrganizerCode(raw: string): Promise<string | null> {
 
 function OrganizerScreen() {
   const [tab, setTab] = useState<OrganizerTab>("setup");
+  const tournamentOpened = useMatchStore((state) => state.tournamentOpened);
   const wide = tab === "table";
+
+  useEffect(() => {
+    if (!tournamentOpened) return;
+    let stop = false;
+    const pull = () => {
+      void fetchMatchSync().then(async (result) => {
+        if (stop || !result.ok) return;
+        await useMatchStore.getState().applyOnlineMatches(result.matches);
+      });
+    };
+    pull();
+    const timer = window.setInterval(pull, MATCH_SYNC_MS);
+    return () => {
+      stop = true;
+      window.clearInterval(timer);
+    };
+  }, [tournamentOpened]);
 
   return (
     <main
@@ -364,6 +400,7 @@ function JudgeScreen({
   confirmPeriod: () => Promise<void>;
 }) {
   const participants = useMatchStore((state) => state.participants);
+  const syncNote = useMatchStore((state) => state.syncNote);
   const athleteSlotId = useMatchStore((state) => state.athleteSlotId);
   const selfSlotId = useMatchStore((state) => state.selfSlotId);
   const briefing = useMatchStore((state) => state.briefing);
@@ -556,6 +593,7 @@ function JudgeScreen({
         {savedCount !== null && (
           <p className="mt-2 text-center text-sm text-emerald-300">В IndexedDB записано событий: {savedCount}</p>
         )}
+        {syncNote && <p className="mt-2 text-center text-sm text-emerald-300">{syncNote}</p>}
         {error && <p className="mt-2 text-center text-sm text-rose-300">{error}</p>}
         <AthleteQrButton />
       </div>

@@ -32,7 +32,8 @@ import {
 } from "../../../packages/shared/src/types.ts";
 import { buildTournamentArchive } from "../../../packages/shared/src/archive.ts";
 import { postTournamentArchive, type ArchivePostResult } from "./archiveApi.ts";
-import { db, type EventRecord } from "./db.ts";
+import { db, type DuelConflictRecord, type EventRecord, type OutboxItem } from "./db.ts";
+import { postMatchReport, type SyncMatch } from "./matchSync.ts";
 import {
   decodeCatchSnapshot,
   decodePeriodSignal,
@@ -40,7 +41,6 @@ import {
   encodeCatchSnapshot,
   isTournamentDate,
   encodePlayoffSnapshot,
-  expandCatchEvents,
   periodStatusLabel,
   playoffMatchId,
   playoffStageCode,
@@ -214,6 +214,16 @@ interface MatchStore extends SectorView {
   /** Открывает окно поимок четвертьфинала, полуфинала или финала. */
   openPlayoffEntry: (matchId: string) => void;
   closePlayoffEntry: () => void;
+  /** Пакеты улова, которые сервер ещё не принял. */
+  outboxQueue: OutboxItem[];
+  /** Открытые расхождения дуэлей. Ячейка таблицы орга красится по этому списку. */
+  duelConflicts: DuelConflictRecord[];
+  /** Тихий итог последней отправки периода: сеть или только телефон. */
+  syncNote: string | null;
+  /** По очереди отправляет всё, что зависло, пока есть сеть. */
+  flushOutbox: () => Promise<{ sent: number }>;
+  /** Вносит онлайн-результаты в пустые ячейки и помечает расхождения. */
+  applyOnlineMatches: (matches: readonly SyncMatch[]) => Promise<void>;
 }
 
 const emptySector: SectorView = {
@@ -271,6 +281,9 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
   qualifyingSavedCount: 0,
   cupHandoffReady: false,
   signalSaving: false,
+  outboxQueue: [],
+  duelConflicts: [],
+  syncNote: null,
 
   adjustFish(who, delta) {
     const state = get();
@@ -433,7 +446,7 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
     }
     if (!state.tournamentOpened || state.confirmed || state.saving || state.signalSaving || !state.athleteSlotId) return;
 
-    set({ saving: true, error: null });
+    set({ saving: true, error: null, syncNote: null });
     const timestamp = Date.now();
     const slotIds = [state.athleteSlotId, state.opponentSlotId].filter((slotId) => slotId.length > 0);
     const events: TournamentEvent[] = absoluteCatches(state, slotIds, timestamp);
@@ -458,11 +471,18 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
 
     try {
       await replacePeriodCatches(state.tournamentId, state.round, state.period, slotIds, events);
+      let syncNote = LOCAL_SAVE_NOTE;
+      try {
+        syncNote = await enqueuePeriodReport(state);
+      } catch {
+        syncNote = LOCAL_SAVE_NOTE;
+      }
       set({
         saving: false,
         confirmed: true,
         pending: [],
         savedCount: events.length,
+        syncNote,
       });
       await get().loadLeaderboard();
       await get().refreshHandoff();
@@ -506,6 +526,10 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
     try {
       const rows = await db.events.where("tournamentId").equals(tournamentId).sortBy("timestamp");
       const stored = rows.map((row) => row.event);
+      const [outboxQueue, duelConflicts] = await Promise.all([
+        db.outboxQueue.orderBy("createdAt").toArray(),
+        db.duelConflicts.toArray(),
+      ]);
       const snapshot = readSetup(stored);
       const participants = snapshot.tournamentOpened
         ? snapshot.participants
@@ -537,6 +561,9 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
         ...cupPatch(stored, participants, grid),
         selectedPlayoffMatchId: "",
         playoffEntryOpen: false,
+        outboxQueue,
+        duelConflicts,
+        syncNote: null,
       });
       await get().loadLeaderboard();
       const opening = playoffMatches(playoff).find((match) => match.slotIdA && match.slotIdB && !match.winnerSlotId)
@@ -754,6 +781,8 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
     set({ setupSaving: true, setupError: null });
     try {
       await db.events.clear();
+      await db.outboxQueue.clear();
+      await db.duelConflicts.clear();
       set({
         ...emptySector,
         round: 1,
@@ -791,6 +820,9 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
         qualifyingSavedCount: 0,
         cupHandoffReady: false,
         playerNamedSlotIds: [],
+        outboxQueue: [],
+        duelConflicts: [],
+        syncNote: null,
       });
       return true;
     } catch (error) {
@@ -1220,25 +1252,31 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
       return importPlayoffSnapshot(get, set, athlete, decoded.cells, markLabel);
     }
 
-    const covered = new Set(decoded.cells.map((cell) => periodKey(cell)));
-    const started = Date.now();
-    const events = expandCatchEvents(state.tournamentId, participant.slotId, decoded.cells, started);
-    const closures = closeQualifyingCells(state.tournamentId, participant.slotId, decoded.cells, started + events.length);
+    let disputes = 0;
 
     try {
-      await db.transaction("rw", db.events, async () => {
-        const rows = await db.events.where("tournamentId").equals(state.tournamentId).toArray();
-        const staleIds = rows.flatMap((row) => {
-          const event = row.event;
-          if (event.type !== "CATCH_RECORDED") return [];
-          if (event.payload.slotId !== participant.slotId) return [];
-          if (!covered.has(periodKey(event.payload))) return [];
-          return [row.id];
+      for (const cell of decoded.cells) {
+        if (cell.round !== 1 || !isQualifyingPeriod(cell.period)) continue;
+        const seat = periodSeat(get().grid, get().participants, participant.slotId, cell.period);
+        const opponent = seat?.opponentSlotId
+          ? get().participants.find((item) => item.slotId === seat.opponentSlotId)
+          : undefined;
+        const result = await ingestMatch(get, {
+          period: cell.period,
+          status: "PENDING",
+          reports: [
+            {
+              bibNumber: participant.bibNumber,
+              opponentBib: opponent && !opponent.ghost ? opponent.bibNumber : null,
+              ownFish: cell.fish,
+              opponentFish: null,
+            },
+          ],
         });
-        if (staleIds.length > 0) await db.events.bulkDelete(staleIds);
-        const written = [...events, ...closures];
-        if (written.length > 0) await db.events.bulkAdd(written.map(toSyncedRecord));
-      });
+        disputes += result.conflicts;
+      }
+      const duelConflicts = await db.duelConflicts.toArray();
+      set({ duelConflicts });
       await get().loadLeaderboard();
       await get().refreshHandoff();
       return {
@@ -1249,6 +1287,7 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
           fish: totalFish(decoded.cells),
           periods: decoded.cells.length,
           mark: markLabel,
+          disputes,
         },
       };
     } catch (error) {
@@ -1360,11 +1399,66 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
           error: null,
         });
       }
+      await resolveSlots(
+        [slotId, opponentSlotId].filter((id): id is string => id !== null && id.length > 0),
+        period,
+      );
       await get().loadLeaderboard();
       await get().refreshHandoff();
       return null;
     } catch (error) {
       return error instanceof Error ? error.message : "Не удалось записать поимки";
+    }
+  },
+
+  async flushOutbox() {
+    if (typeof navigator !== "undefined" && !navigator.onLine) return { sent: 0 };
+    try {
+      const items = await db.outboxQueue.orderBy("createdAt").toArray();
+      let sent = 0;
+      for (const item of items) {
+        const ok = await postMatchReport({
+          bibNumber: item.bibNumber,
+          opponentBib: item.opponentBib,
+          period: item.period,
+          ownFish: item.ownFish,
+          opponentFish: item.opponentFish,
+        });
+        if (!ok) break;
+        await db.outboxQueue.delete(item.id);
+        sent += 1;
+      }
+      set({ outboxQueue: await db.outboxQueue.orderBy("createdAt").toArray() });
+      return { sent };
+    } catch {
+      return { sent: 0 };
+    }
+  },
+
+  async applyOnlineMatches(matches) {
+    if (!get().tournamentOpened || matches.length === 0) return;
+    try {
+      let filled = 0;
+      for (const match of matches) {
+        const result = await ingestMatch(get, {
+          period: match.period,
+          status: match.status,
+          reports: match.reports.map((report) => ({
+            bibNumber: report.bibNumber,
+            opponentBib: report.opponentBib,
+            ownFish: report.ownFish,
+            opponentFish: report.opponentFish,
+          })),
+        });
+        filled += result.filled;
+      }
+      set({ duelConflicts: await db.duelConflicts.toArray() });
+      if (filled > 0) {
+        await get().loadLeaderboard();
+        await get().refreshHandoff();
+      }
+    } catch {
+      // Сеть или журнал заняты. Следующий опрос повторит те же пакеты.
     }
   },
 }));
@@ -2299,6 +2393,7 @@ async function replacePeriodCatches(
   period: PeriodIndex,
   slotIds: readonly string[],
   events: readonly TournamentEvent[],
+  synced = false,
 ): Promise<void> {
   const replacing = new Set(slotIds);
   await db.transaction("rw", db.events, async () => {
@@ -2311,7 +2406,9 @@ async function replacePeriodCatches(
       return [row.id];
     });
     if (staleIds.length > 0) await db.events.bulkDelete(staleIds);
-    if (events.length > 0) await db.events.bulkAdd(events.map(toRecord));
+    if (events.length > 0) {
+      await db.events.bulkAdd(events.map((event) => (synced ? toSyncedRecord(event) : toRecord(event))));
+    }
   });
 }
 
@@ -2330,25 +2427,6 @@ function closedQualifyingPeriods(events: readonly TournamentEvent[], slotId: str
     if (covers) closed.add(event.payload.period);
   }
   return closed;
-}
-
-function closeQualifyingCells(
-  tournamentId: string,
-  slotId: string,
-  cells: readonly QrCatchCell[],
-  timestamp: number,
-): TournamentEvent[] {
-  return cells.map((cell, index) => ({
-    id: crypto.randomUUID(),
-    tournamentId,
-    type: "PERIOD_COMPLETED",
-    timestamp: timestamp + index,
-    payload: {
-      round: cell.round,
-      period: cell.period,
-      protocols: [{ slotIdA: slotId, slotIdB: null, signed: true }],
-    },
-  }));
 }
 
 function cupPatch(
@@ -2644,8 +2722,239 @@ function toSyncedRecord(event: TournamentEvent): EventRecord {
   return { ...toRecord(event), isSynced: true };
 }
 
-function periodKey(cell: Pick<QrCatchCell, "round" | "period">): string {
-  return `${cell.round}.${cell.period}`;
+const LOCAL_SAVE_NOTE = "Результат сохранен локально";
+const NETWORK_SAVE_NOTE = "Результат синхронизирован по сети";
+
+interface IngestReport {
+  bibNumber: number;
+  opponentBib: number | null;
+  ownFish: number;
+  opponentFish: number | null;
+}
+
+interface IngestMatch {
+  period: number;
+  status: SyncMatch["status"];
+  reports: readonly IngestReport[];
+}
+
+/** Сначала журнал, потом очередь. Сеть только пытается отдать уже сохранённый пакет. */
+async function enqueuePeriodReport(state: MatchStore): Promise<string> {
+  const athlete = state.participants.find((item) => item.slotId === state.athleteSlotId);
+  if (!athlete || athlete.ghost) return LOCAL_SAVE_NOTE;
+  const opponent = state.opponentSlotId
+    ? state.participants.find((item) => item.slotId === state.opponentSlotId)
+    : undefined;
+  const item: OutboxItem = {
+    id: crypto.randomUUID(),
+    createdAt: Date.now(),
+    bibNumber: athlete.bibNumber,
+    opponentBib: opponent && !opponent.ghost ? opponent.bibNumber : null,
+    period: state.period,
+    ownFish: state.athleteFish,
+    opponentFish: state.opponentFish,
+  };
+  await db.outboxQueue.add(item);
+  useMatchStore.setState({ outboxQueue: await db.outboxQueue.orderBy("createdAt").toArray() });
+  if (typeof navigator === "undefined" || !navigator.onLine) return LOCAL_SAVE_NOTE;
+  const sent = await postMatchReport({
+    bibNumber: item.bibNumber,
+    opponentBib: item.opponentBib,
+    period: item.period,
+    ownFish: item.ownFish,
+    opponentFish: item.opponentFish,
+  });
+  if (!sent) return LOCAL_SAVE_NOTE;
+  await db.outboxQueue.delete(item.id);
+  useMatchStore.setState({ outboxQueue: await db.outboxQueue.orderBy("createdAt").toArray() });
+  return NETWORK_SAVE_NOTE;
+}
+
+async function ingestMatch(get: () => MatchStore, match: IngestMatch): Promise<{ filled: number; conflicts: number }> {
+  const state = get();
+  if (!state.tournamentOpened || !isQualifyingPeriod(match.period as PeriodIndex)) return { filled: 0, conflicts: 0 };
+  const period = match.period as PeriodIndex;
+  const slots = duelSlotIds(state, match, period);
+  if (slots.length === 0) return { filled: 0, conflicts: 0 };
+  const fingerprint = matchFingerprint(match);
+
+  if (match.status === "CONFLICT") {
+    const opened = await flagDuel(slots, period, fingerprint, scoreDetail(match.reports));
+    return { filled: 0, conflicts: opened > 0 ? 1 : 0 };
+  }
+
+  const targets = fishTargets(state, match, period);
+  let events = await loadTournamentEvents(state.tournamentId);
+  let filled = 0;
+  const differs: { bib: number; was: number; incoming: number }[] = [];
+  for (const target of targets) {
+    const current = playedFish(events, target.slotId, period);
+    if (current.played && current.fish !== target.fish) {
+      differs.push({ bib: target.bibNumber, was: current.fish, incoming: target.fish });
+      continue;
+    }
+    if (current.played) continue;
+    const written = buildSlotEvents(state.tournamentId, period, target.slotId, target.fish);
+    await replacePeriodCatches(state.tournamentId, 1, period, [target.slotId], written, true);
+    events = events.concat(written);
+    filled += 1;
+  }
+
+  if (differs.length > 0) {
+    const detail =
+      fullScoreDetail(match.reports) ??
+      differs.map((item) => `№${item.bib}: в таблице ${item.was}, пришло ${item.incoming}`).join(", ");
+    const opened = await flagDuel(slots, period, fingerprint, detail);
+    return { filled, conflicts: opened > 0 ? 1 : 0 };
+  }
+
+  if (match.status === "CONFIRMED") await resolveSlots(slots, period);
+  return { filled, conflicts: 0 };
+}
+
+function fishTargets(
+  state: MatchStore,
+  match: IngestMatch,
+  period: PeriodIndex,
+): { slotId: string; bibNumber: number; fish: number }[] {
+  const targets: { slotId: string; bibNumber: number; fish: number }[] = [];
+  const push = (bibNumber: number, fish: number) => {
+    const player = livingByBib(state, bibNumber);
+    if (!player || targets.some((item) => item.slotId === player.slotId)) return;
+    targets.push({ slotId: player.slotId, bibNumber, fish });
+  };
+
+  if (match.status === "CONFIRMED") {
+    for (const report of match.reports) push(report.bibNumber, report.ownFish);
+    return targets;
+  }
+
+  const report = match.reports[0];
+  if (!report) return targets;
+  push(report.bibNumber, report.ownFish);
+  if (report.opponentFish === null || report.opponentBib === null) return targets;
+  const player = livingByBib(state, report.bibNumber);
+  const opponent = livingByBib(state, report.opponentBib);
+  if (!player || !opponent || !mutualPair(state, player.slotId, opponent.slotId, period)) return targets;
+  push(report.opponentBib, report.opponentFish);
+  return targets;
+}
+
+function duelSlotIds(state: MatchStore, match: IngestMatch, period: PeriodIndex): string[] {
+  const ids: string[] = [];
+  const push = (slotId: string | null | undefined) => {
+    if (!slotId || ids.includes(slotId)) return;
+    ids.push(slotId);
+  };
+  for (const report of match.reports) {
+    const player = livingByBib(state, report.bibNumber);
+    if (!player) continue;
+    push(player.slotId);
+    if (report.opponentBib !== null) push(livingByBib(state, report.opponentBib)?.slotId);
+    else push(periodSeat(state.grid, state.participants, player.slotId, period)?.opponentSlotId);
+  }
+  return ids;
+}
+
+function livingByBib(state: MatchStore, bibNumber: number): RegisteredParticipant | undefined {
+  return state.participants.find((item) => item.bibNumber === bibNumber && !item.ghost);
+}
+
+function mutualPair(state: MatchStore, slotId: string, opponentSlotId: string, period: PeriodIndex): boolean {
+  const seat = periodSeat(state.grid, state.participants, slotId, period);
+  const back = periodSeat(state.grid, state.participants, opponentSlotId, period);
+  if (!seat || !back) return false;
+  if (seat.opponentSlotId !== opponentSlotId || back.opponentSlotId !== slotId) return false;
+  return !isGhostOpponent(seat.bergerOpponentSlotId) && !isGhostOpponent(back.bergerOpponentSlotId);
+}
+
+function playedFish(
+  events: readonly TournamentEvent[],
+  slotId: string,
+  period: PeriodIndex,
+): { played: boolean; fish: number } {
+  const entry = tournamentCalculator.generateLeaderboard(events).find((item) => item.slotId === slotId);
+  const cell = entry?.periods.find((item) => item.period === period);
+  if (!cell?.played) return { played: false, fish: 0 };
+  return { played: true, fish: cell.fish };
+}
+
+function buildSlotEvents(tournamentId: string, period: PeriodIndex, slotId: string, fish: number): TournamentEvent[] {
+  const timestamp = Date.now();
+  const catches = catchEventsForCounts(tournamentId, period, new Map([[slotId, fish]]), timestamp);
+  const closed: TournamentEvent = {
+    id: crypto.randomUUID(),
+    tournamentId,
+    type: "PERIOD_COMPLETED",
+    timestamp: timestamp + catches.length,
+    payload: {
+      round: 1,
+      period,
+      protocols: [{ slotIdA: slotId, slotIdB: null, signed: true }],
+    },
+  };
+  return [...catches, closed];
+}
+
+async function loadTournamentEvents(tournamentId: string): Promise<TournamentEvent[]> {
+  const rows = await db.events.where("tournamentId").equals(tournamentId).sortBy("timestamp");
+  return rows.map((row) => row.event);
+}
+
+function matchFingerprint(match: IngestMatch): string {
+  const body = match.reports
+    .map((report) => `${report.bibNumber}=${report.ownFish}:${report.opponentFish ?? "-"}`)
+    .sort()
+    .join("|");
+  return `${match.status}|${body}`;
+}
+
+function fullScoreDetail(reports: readonly IngestReport[]): string | null {
+  const scored = reports.filter((report) => report.opponentFish !== null);
+  if (scored.length < 2) return null;
+  return scored.map((report) => `№${report.bibNumber} ввёл ${report.ownFish}:${report.opponentFish}`).join(", ");
+}
+
+function scoreDetail(reports: readonly IngestReport[]): string {
+  return fullScoreDetail(reports) ?? "Расхождение в счёте дуэли";
+}
+
+function conflictId(period: number, slotId: string): string {
+  return `${period}:${slotId}`;
+}
+
+async function flagDuel(
+  slots: readonly string[],
+  period: PeriodIndex,
+  fingerprint: string,
+  detail: string,
+): Promise<number> {
+  let opened = 0;
+  for (const slotId of slots) {
+    const id = conflictId(period, slotId);
+    const prev = await db.duelConflicts.get(id);
+    if (prev?.status === "resolved" && prev.fingerprint === fingerprint) continue;
+    if (prev?.status === "open" && prev.fingerprint === fingerprint && prev.detail === detail) {
+      opened += 1;
+      continue;
+    }
+    await db.duelConflicts.put({ id, period, slotId, fingerprint, status: "open", detail });
+    opened += 1;
+  }
+  return opened;
+}
+
+async function resolveSlots(slotIds: readonly string[], period: PeriodIndex): Promise<void> {
+  let changed = false;
+  for (const slotId of slotIds) {
+    const id = conflictId(period, slotId);
+    const prev = await db.duelConflicts.get(id);
+    if (!prev || prev.status === "resolved") continue;
+    await db.duelConflicts.put({ ...prev, status: "resolved" });
+    changed = true;
+  }
+  if (!changed) return;
+  useMatchStore.setState({ duelConflicts: await db.duelConflicts.toArray() });
 }
 
 function currentPeriodMark(state: MatchStore): PeriodMark {
