@@ -2,7 +2,7 @@ import type { FinalStage, FinalStanding } from "../../../../packages/shared/src/
 
 export function FinalStandingsTable({ rows }: { rows: readonly FinalStanding[] }) {
   return (
-    <section className="mt-8" aria-label="Итоговая таблица турнира">
+    <section className="mt-16" aria-label="Итоговая таблица турнира">
       <div className="mb-3">
         <h3 className="text-lg font-black tracking-tight sm:text-2xl">Итоговая таблица</h3>
         <p className="text-xs text-slate-400 sm:text-sm">

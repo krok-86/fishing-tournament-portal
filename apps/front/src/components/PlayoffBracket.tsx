@@ -135,8 +135,8 @@ export function PlayoffBracket({
       {podium}
 
       <div className="overflow-x-auto rounded-3xl border border-white/10 bg-slate-950/80 p-3 shadow-xl shadow-black/30 sm:p-6">
-        <div className="flex min-w-[70rem] items-center pb-16">
-          <div className="flex flex-1 flex-col gap-10">
+        <div className="flex w-max items-center gap-x-8 pb-16">
+          <div className="relative flex flex-col gap-8">
             <BracketHalf
               left={[quarter[0]!, quarter[3]!]}
               right={semi[0]!}
@@ -151,8 +151,8 @@ export function PlayoffBracket({
               activeMatchId={activeMatchId}
               openMatch={openMatch}
             />
+            <BracketJoin />
           </div>
-          <BracketJoin />
           <div className="relative w-80 shrink-0">
             <MatchCard
               match={playoff.final}
@@ -498,12 +498,12 @@ function BracketHalf({
   openMatch: (match: PlayoffBracketMatch) => (() => void) | undefined;
 }) {
   return (
-    <div className="flex items-center">
-      <div className="flex w-80 shrink-0 flex-col gap-4">
+    <div className="flex items-center gap-x-8">
+      <div className="relative flex w-80 shrink-0 flex-col gap-4">
         <MatchCard match={left[0]} nameOf={nameOf} active={activeMatchId === left[0].matchId} onOpen={openMatch(left[0])} />
         <MatchCard match={left[1]} nameOf={nameOf} active={activeMatchId === left[1].matchId} onOpen={openMatch(left[1])} />
+        <BracketJoin />
       </div>
-      <BracketJoin />
       <div className="w-80 shrink-0">
         <MatchCard match={right} nameOf={nameOf} active={activeMatchId === right.matchId} onOpen={openMatch(right)} />
       </div>
@@ -513,9 +513,9 @@ function BracketHalf({
 
 function BracketJoin() {
   return (
-    <div className="relative mx-1.5 w-16 shrink-0 self-stretch" aria-hidden="true">
-      <div className="absolute top-[14%] bottom-[14%] left-0 w-9 rounded-r-[1.6rem] border-y-[3px] border-r-[3px] border-cyan-300 shadow-[0_0_18px_rgba(34,211,238,0.45)]" />
-      <div className="absolute top-1/2 left-9 h-[3px] w-7 -translate-y-1/2 bg-cyan-300 shadow-[0_0_14px_rgba(34,211,238,0.7)]" />
+    <div className="pointer-events-none absolute inset-y-0 left-full w-8" aria-hidden="true">
+      <div className="absolute top-[18%] bottom-[18%] left-0 w-4 rounded-r-2xl border-y-2 border-r-2 border-cyan-300 shadow-[0_0_12px_rgba(34,211,238,0.4)]" />
+      <div className="absolute top-1/2 left-4 h-0.5 w-4 -translate-y-1/2 bg-cyan-300 shadow-[0_0_10px_rgba(34,211,238,0.65)]" />
     </div>
   );
 }
@@ -536,6 +536,12 @@ function MatchCard({
   onOpen?: () => void;
 }) {
   const marker = overtimeMarker(match.decidedBy);
+  const goldenTie =
+    match.decidedBy === "goldenFish" &&
+    match.fishA !== null &&
+    match.fishB !== null &&
+    match.fishA === match.fishB &&
+    match.winnerSlotId !== null;
   const className = `w-full overflow-hidden rounded-2xl border bg-slate-900 text-left ${
     active
       ? "border-cyan-300 ring-2 ring-cyan-300"
@@ -549,7 +555,7 @@ function MatchCard({
     <>
       <p className="bg-slate-950 px-4 py-2.5 text-[11px] font-bold tracking-[0.16em] text-slate-300 uppercase">
         {playoffStageTitle(match.stage)}
-        {match.seedA !== null && match.seedB !== null ? ` · ${match.seedA}—${match.seedB}` : ""}
+        {match.stage !== "third" && match.seedA !== null && match.seedB !== null ? ` · ${match.seedA}—${match.seedB}` : ""}
       </p>
       <MatchSide
         name={nameOf(match.slotIdA, match.stage)}
@@ -557,6 +563,8 @@ function MatchCard({
         fish={match.fishA}
         winner={match.winnerSlotId !== null && match.winnerSlotId === match.slotIdA}
         waiting={match.slotIdA === null}
+        goldenTie={goldenTie}
+        trophy={featured && match.winnerSlotId !== null && match.winnerSlotId === match.slotIdA}
       />
       <MatchSide
         name={nameOf(match.slotIdB, match.stage)}
@@ -564,6 +572,8 @@ function MatchCard({
         fish={match.fishB}
         winner={match.winnerSlotId !== null && match.winnerSlotId === match.slotIdB}
         waiting={match.slotIdB === null}
+        goldenTie={goldenTie}
+        trophy={featured && match.winnerSlotId !== null && match.winnerSlotId === match.slotIdB}
         divider
       />
       {marker && (
@@ -610,6 +620,8 @@ function MatchSide({
   fish,
   winner,
   waiting,
+  goldenTie = false,
+  trophy = false,
   divider = false,
 }: {
   name: string;
@@ -617,16 +629,30 @@ function MatchSide({
   fish: number | null;
   winner: boolean;
   waiting: boolean;
+  goldenTie?: boolean;
+  trophy?: boolean;
   divider?: boolean;
 }) {
+  const tone = goldenTie && winner
+    ? "bg-gradient-to-r from-emerald-400/50 to-amber-300/55 text-amber-50"
+    : goldenTie && !winner && !waiting
+      ? "text-slate-100 opacity-50"
+      : winner
+        ? "bg-cyan-300/15 text-cyan-50"
+        : "text-slate-100";
   return (
     <div
-      className={`flex items-center justify-between gap-3 px-4 py-3 ${divider ? "border-t border-white/10" : ""} ${
-        winner ? "bg-cyan-300/15 text-cyan-50" : "text-slate-100"
-      }`}
+      className={`flex items-center justify-between gap-3 px-4 py-3 ${divider ? "border-t border-white/10" : ""} ${tone}`}
       data-advanced={winner ? "true" : "false"}
     >
-      <span className={`line-clamp-2 min-w-0 text-base font-bold leading-snug ${waiting ? "text-slate-500" : ""}`}>{name}</span>
+      <span className={`line-clamp-2 min-w-0 text-base font-bold leading-snug ${waiting ? "text-slate-500" : ""}`}>
+        {trophy && (
+          <span className="mr-1 inline-block align-[-1px] text-sm leading-none" aria-hidden="true">
+            🏆
+          </span>
+        )}
+        {name}
+      </span>
       <span className="flex shrink-0 items-center gap-2">
         {place !== null && <span className="text-[11px] font-bold text-slate-400">#{place}</span>}
         <span className="w-8 text-right text-xl font-black tabular-nums">{fish === null ? "–" : fish}</span>
