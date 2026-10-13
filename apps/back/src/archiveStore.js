@@ -82,6 +82,95 @@ async function ensureTable(nextPool) {
       snapshot JSONB NOT NULL
     )
   `);
+  // Повторная архивация того же соревнования обновляет одну строку, а не копирует её.
+  await nextPool.query(`
+    DELETE FROM tournament_archives
+    WHERE id IN (
+      SELECT id FROM (
+        SELECT id,
+               ROW_NUMBER() OVER (PARTITION BY tournament_id ORDER BY archived_at DESC, id DESC) AS rn
+        FROM tournament_archives
+      ) ranked
+      WHERE rn > 1
+    )
+  `);
+  await nextPool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS tournament_archives_tournament_id_key
+    ON tournament_archives (tournament_id)
+  `);
+}
+
+function readTournamentId(body) {
+  const nested = typeof body.tournament?.id === "string" ? body.tournament.id.trim() : "";
+  const explicit = typeof body.tournamentId === "string" ? body.tournamentId.trim() : "";
+  if (explicit.length > 80) return { ok: false, error: "Нет идентификатора турнира" };
+  if (explicit && nested && explicit !== nested) return { ok: false, error: "Идентификатор турнира не сходится" };
+  const id = explicit || nested;
+  if (!id || id.length > 80) return { ok: false, error: "Нет идентификатора турнира" };
+  return { ok: true, id };
+}
+
+const LIST_SQL = `
+  SELECT
+    id::text AS id,
+    name,
+    COALESCE(to_char(held_on, 'YYYY-MM-DD'), NULLIF(snapshot #>> '{tournament,date}', '')) AS date,
+    COALESCE(
+      (
+        SELECT standing->>'displayName'
+        FROM jsonb_array_elements(
+          CASE
+            WHEN jsonb_typeof(snapshot->'finalStandings') = 'array' THEN snapshot->'finalStandings'
+            ELSE '[]'::jsonb
+          END
+        ) AS standing
+        WHERE standing->>'stage' = 'Чемпион' OR standing->>'place' = '1'
+        ORDER BY CASE WHEN standing->>'stage' = 'Чемпион' THEN 0 ELSE 1 END
+        LIMIT 1
+      ),
+      ''
+    ) AS champion
+  FROM tournament_archives
+  ORDER BY archived_at DESC
+`;
+
+async function writeArchive(db, tournamentId, name, heldOn, snapshot) {
+  const payload = JSON.stringify(snapshot);
+  const existing = await db.query(
+    `SELECT id FROM tournament_archives WHERE tournament_id = $1 ORDER BY archived_at DESC LIMIT 1`,
+    [tournamentId],
+  );
+  if (existing.rows[0]) {
+    const updated = await db.query(
+      `UPDATE tournament_archives
+       SET name = $2, held_on = $3, snapshot = $4::jsonb, archived_at = NOW()
+       WHERE id = $1
+       RETURNING id, archived_at`,
+      [existing.rows[0].id, name, heldOn, payload],
+    );
+    return { row: updated.rows[0], created: false };
+  }
+
+  try {
+    const inserted = await db.query(
+      `INSERT INTO tournament_archives (id, tournament_id, name, held_on, snapshot)
+       VALUES ($1, $2, $3, $4, $5::jsonb)
+       RETURNING id, archived_at`,
+      [randomUUID(), tournamentId, name, heldOn, payload],
+    );
+    return { row: inserted.rows[0], created: true };
+  } catch (error) {
+    if (!error || error.code !== "23505") throw error;
+    const updated = await db.query(
+      `UPDATE tournament_archives
+       SET name = $2, held_on = $3, snapshot = $4::jsonb, archived_at = NOW()
+       WHERE tournament_id = $1
+       RETURNING id, archived_at`,
+      [tournamentId, name, heldOn, payload],
+    );
+    if (!updated.rows[0]) throw error;
+    return { row: updated.rows[0], created: false };
+  }
 }
 
 async function prepareArchiveStore() {
@@ -130,26 +219,82 @@ function attachArchiveRoutes(app) {
       return;
     }
 
-    const id = randomUUID();
+    const tournamentKey = readTournamentId(req.body);
+    if (!tournamentKey.ok) {
+      res.status(400).json({ ok: false, error: tournamentKey.error });
+      return;
+    }
+
     const tournament = req.body.tournament;
     const heldOn = /^\d{4}-\d{2}-\d{2}$/.test(tournament.date) ? tournament.date : null;
     try {
-      const saved = await pool.query(
-        `INSERT INTO tournament_archives (id, tournament_id, name, held_on, snapshot)
-         VALUES ($1, $2, $3, $4, $5::jsonb)
-         RETURNING id, archived_at`,
-        [id, tournament.id.trim(), tournament.name.trim(), heldOn, JSON.stringify(req.body)],
+      const saved = await writeArchive(
+        pool,
+        tournamentKey.id,
+        tournament.name.trim(),
+        heldOn,
+        req.body,
       );
-      const row = saved.rows[0];
-      res.status(201).json({
+      const row = saved.row;
+      res.status(saved.created ? 201 : 200).json({
         ok: true,
         id: row.id,
         path: `/archive/${row.id}`,
         archivedAt: row.archived_at,
+        updated: !saved.created,
       });
     } catch (error) {
-      console.error("Archive insert failed:", error instanceof Error ? error.message : error);
+      console.error("Archive write failed:", error instanceof Error ? error.message : error);
       res.status(500).json({ ok: false, error: "Не удалось записать архив в базу" });
+    }
+  });
+
+  app.get("/api/tournaments/archive", async (_req, res) => {
+    if (!ready || !pool) {
+      res.status(503).json({ ok: false, error: setupError });
+      return;
+    }
+    try {
+      const found = await pool.query(LIST_SQL);
+      res.set("Cache-Control", "no-store");
+      res.json({
+        ok: true,
+        archives: found.rows.map((row) => ({
+          id: row.id,
+          name: row.name,
+          date: typeof row.date === "string" ? row.date : "",
+          champion: typeof row.champion === "string" ? row.champion : "",
+        })),
+      });
+    } catch (error) {
+      console.error("Archive list failed:", error instanceof Error ? error.message : error);
+      res.status(500).json({ ok: false, error: "Не удалось прочитать список архивов" });
+    }
+  });
+
+  app.delete("/api/tournaments/archive/:id", async (req, res) => {
+    if (!ready || !pool) {
+      res.status(503).json({ ok: false, error: setupError });
+      return;
+    }
+    const id = typeof req.params.id === "string" ? req.params.id : "";
+    if (!ID_RE.test(id)) {
+      res.status(400).json({ ok: false, error: "Некорректная ссылка на архив" });
+      return;
+    }
+    try {
+      const removed = await pool.query(
+        "DELETE FROM tournament_archives WHERE id = $1 RETURNING id",
+        [id],
+      );
+      if (removed.rowCount === 0) {
+        res.status(404).json({ ok: false, error: "Такого архива нет" });
+        return;
+      }
+      res.json({ ok: true });
+    } catch (error) {
+      console.error("Archive delete failed:", error instanceof Error ? error.message : error);
+      res.status(500).json({ ok: false, error: "Не удалось удалить архив" });
     }
   });
 

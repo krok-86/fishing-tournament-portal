@@ -110,7 +110,7 @@ async function takeOrganizerCode(raw) {
 function OrganizerScreen() {
     const [tab, setTab] = useState("setup");
     const tournamentOpened = useMatchStore((state) => state.tournamentOpened);
-    const wide = tab === "table";
+    const wide = tab === "setup" || tab === "table";
     useEffect(() => {
         if (!tournamentOpened)
             return;

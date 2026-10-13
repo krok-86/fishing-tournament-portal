@@ -181,6 +181,12 @@ export function TournamentInit() {
         </p>
       </header>
 
+      {tournamentOpened && (<p className="rounded-2xl border border-emerald-300/30 bg-emerald-300/10 px-4 py-3 text-sm font-semibold text-emerald-200">
+          Турнир открыт. Сетка на {periodsCount} периодов записана. На вводе результатов выберите свой номер.
+        </p>)}
+
+      <div className="grid grid-cols-1 gap-8 lg:grid-cols-2 lg:items-start">
+        <div className="grid content-start gap-4">
       <div className="rounded-3xl bg-slate-900 px-4 py-4">
         <label className="text-sm font-bold tracking-wide text-cyan-100/80 uppercase" htmlFor="tournament-name">
           Название турнира
@@ -191,10 +197,6 @@ export function TournamentInit() {
         </label>
         <input id="tournament-date" className={`scheme-dark mt-2 h-12 w-full rounded-xl border bg-slate-950 px-3 text-base text-white outline-none focus:border-cyan-300 disabled:opacity-50 ${openIssues.includes("date") ? "border-rose-400" : "border-white/10"}`} type="date" value={tournamentOpened ? tournamentDate : date} disabled={locked} aria-invalid={openIssues.includes("date")} onChange={(event) => setDate(event.target.value)}/>
       </div>
-
-      {tournamentOpened && (<p className="rounded-2xl border border-emerald-300/30 bg-emerald-300/10 px-4 py-3 text-sm font-semibold text-emerald-200">
-          Турнир открыт. Сетка на {periodsCount} периодов записана. На вводе результатов выберите свой номер.
-        </p>)}
 
       <form className="rounded-3xl bg-slate-900 px-4 py-4" noValidate onSubmit={(event) => void seedNumbers(event)}>
         <h3 className="text-sm font-bold tracking-wide text-cyan-100/80 uppercase">Быстрый старт по номерам</h3>
@@ -240,8 +242,10 @@ export function TournamentInit() {
           ФИО с сервера встанут в лист по порядку заявок. Каждому присваивается следующий номер: 1, 2, 3 без пропусков.
         </p>
       </form>
+        </div>
 
       <ParticipantList participants={participants} tournamentOpened={tournamentOpened} setupSaving={setupSaving} onReplace={replaceParticipant} onRemove={removeParticipant}/>
+      </div>
 
       <p className="rounded-3xl bg-slate-900 px-4 py-4 text-sm font-bold text-slate-200">
         Секторов на водоёме потребуется: <span className="tabular-nums text-cyan-200">{sectorCount}</span>
@@ -360,8 +364,8 @@ function StartQrCard() {
     </div>);
 }
 function ParticipantList({ participants, tournamentOpened, setupSaving, onReplace, onRemove, }) {
-    return (<div id="starter-list" className="rounded-3xl border border-white/10 bg-white/5 px-4 py-4">
-      <div className="flex items-baseline justify-between gap-3">
+    return (<div id="starter-list" className="flex min-h-0 flex-col rounded-3xl border border-white/10 bg-white/5 px-4 py-4 lg:sticky lg:top-4 lg:max-h-[calc(100dvh-2rem)]">
+      <div className="flex shrink-0 items-baseline justify-between gap-3">
         <div>
           <h3 className="text-sm font-bold tracking-wide text-cyan-100/80 uppercase">Стартовый лист</h3>
           <p className="mt-1 text-xs text-slate-400">
@@ -370,7 +374,7 @@ function ParticipantList({ participants, tournamentOpened, setupSaving, onReplac
         </div>
         <p className="text-sm font-semibold text-slate-300">{participants.length}</p>
       </div>
-      {participants.length === 0 ? (<p className="mt-3 text-sm text-slate-400">Пока никого нет. Создайте номера или введите имя.</p>) : (<ol className="mt-3 grid gap-2">
+      {participants.length === 0 ? (<p className="mt-3 text-sm text-slate-400">Пока никого нет. Создайте номера или введите имя.</p>) : (<ol className="mt-3 grid min-h-0 gap-2 lg:overflow-y-auto lg:pr-1">
           {participants.map((participant) => (<ParticipantRow key={participant.slotId} participant={participant} tournamentOpened={tournamentOpened} setupSaving={setupSaving} onReplace={onReplace} onRemove={onRemove}/>))}
         </ol>)}
     </div>);
@@ -407,7 +411,8 @@ function ParticipantRow({ participant, tournamentOpened, setupSaving, onReplace,
             toast("err", useMatchStore.getState().setupError ?? "Не удалось удалить участника");
     }
     return (<li className={`rounded-2xl px-3 py-3 ${participant.ghost ? "bg-slate-950 ring-1 ring-amber-300/30" : "bg-slate-900"}`}>
-      <div className="flex items-center gap-3">
+      <div className={`flex gap-3 ${editing ? "flex-col" : "flex-col lg:flex-row lg:items-center"}`}>
+      <div className="flex min-w-0 flex-1 items-center gap-3">
         <span className="w-10 shrink-0 text-lg font-black tabular-nums text-cyan-200">{participant.bibNumber}</span>
         <span className="min-w-0 flex-1">
           <span className={`block truncate font-semibold ${participant.ghost ? "text-amber-100" : ""}`}>
@@ -418,36 +423,37 @@ function ParticipantRow({ participant, tournamentOpened, setupSaving, onReplace,
             </span>)}
         </span>
       </div>
-      {editing && !setupSaving ? (<form className="mt-3" onSubmit={(event) => void saveReplacement(event)}>
+      {editing && !setupSaving ? (<form className="w-full min-w-0" onSubmit={(event) => void saveReplacement(event)}>
           <p className="mb-2 text-xs font-semibold text-slate-400">
             Номер {participant.bibNumber} остаётся в сетке Бергера. Меняется только имя.
           </p>
           <div className="flex gap-2">
-          <input className="h-10 min-w-0 flex-1 rounded-xl border border-white/10 bg-slate-950 px-3 text-sm text-white outline-none placeholder:text-slate-500 focus:border-cyan-300" value={draft} aria-label={`Новое имя вместо ${participant.displayName}`} disabled={saving} autoFocus onChange={(event) => setDraft(event.target.value)}/>
-          <button type="submit" className="h-10 shrink-0 rounded-xl bg-cyan-300 px-3 text-xs font-black text-slate-950 disabled:bg-slate-700 disabled:text-slate-400" disabled={saving || draft.trim().length === 0}>
+          <input className="h-12 min-w-0 flex-1 rounded-xl border border-white/10 bg-slate-950 px-3 text-base text-white outline-none placeholder:text-slate-500 focus:border-cyan-300" value={draft} aria-label={`Новое имя вместо ${participant.displayName}`} disabled={saving} autoFocus onChange={(event) => setDraft(event.target.value)}/>
+          <button type="submit" className="h-12 shrink-0 rounded-xl bg-cyan-300 px-3 text-xs font-black text-slate-950 disabled:bg-slate-700 disabled:text-slate-400" disabled={saving || draft.trim().length === 0}>
             Сохранить
           </button>
-          <button type="button" className="h-10 shrink-0 rounded-xl border border-white/10 px-3 text-xs font-bold text-slate-300" disabled={saving} onClick={() => {
+          <button type="button" className="h-12 shrink-0 rounded-xl border border-white/10 px-3 text-xs font-bold text-slate-300" disabled={saving} onClick={() => {
                 setDraft(participant.displayName);
                 setEditing(false);
             }}>
             Отмена
           </button>
           </div>
-        </form>) : (<div className="mt-3 grid grid-cols-3 gap-2">
-          <button type="button" className="h-10 rounded-xl border border-cyan-300/40 bg-cyan-300/10 text-xs font-bold text-cyan-100 disabled:opacity-40" disabled={setupSaving || saving || (tournamentOpened && participant.ghost)} onClick={() => {
+        </form>) : (<div className="grid w-full grid-cols-3 gap-2 lg:w-72 lg:shrink-0">
+          <button type="button" className="h-11 w-full rounded-xl border border-cyan-300/40 bg-cyan-300/10 text-xs font-bold text-cyan-100 disabled:opacity-40" disabled={setupSaving || saving || (tournamentOpened && participant.ghost)} onClick={() => {
                 setDraft(participant.displayName);
                 setEditing(true);
             }}>
             Заменить
           </button>
-          <button type="button" className="h-10 rounded-xl border border-amber-300/40 bg-amber-300/10 text-xs font-bold text-amber-100 disabled:opacity-40" disabled title="До открытия турнира пустой слот не ставится. Лишний номер удалите.">
+          <button type="button" className="h-11 w-full rounded-xl border border-amber-300/40 bg-amber-300/10 text-xs font-bold text-amber-100 disabled:opacity-40" disabled title="До открытия турнира пустой слот не ставится. Лишний номер удалите.">
             Не пришел
           </button>
-          <button type="button" className="h-10 rounded-xl border border-rose-300/40 bg-rose-400/10 text-xs font-bold text-rose-100 disabled:opacity-40" disabled={tournamentOpened || setupSaving || saving} onClick={() => void remove()}>
+          <button type="button" className="h-11 w-full rounded-xl border border-rose-300/40 bg-rose-400/10 text-xs font-bold text-rose-100 disabled:opacity-40" disabled={tournamentOpened || setupSaving || saving} onClick={() => void remove()}>
             Удалить
           </button>
         </div>)}
+      </div>
     </li>);
 }
 function PeriodPlan({ participants, grid, periodsCount, }) {
@@ -467,7 +473,7 @@ function PeriodPlan({ participants, grid, periodsCount, }) {
             </button>);
         })}
       </div>
-      {participants.length === 0 ? (<p className="mt-3 text-sm text-slate-400">Пары появятся, когда в листе будет хотя бы один участник.</p>) : sectors.length === 0 ? (<p className="mt-3 text-sm text-slate-400">В периоде {active} нет рассадки.</p>) : (<ul className="mt-3 grid gap-2">
+      {participants.length === 0 ? (<p className="mt-3 text-sm text-slate-400">Пары появятся, когда в листе будет хотя бы один участник.</p>) : sectors.length === 0 ? (<p className="mt-3 text-sm text-slate-400">В периоде {active} нет рассадки.</p>) : (<ul className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
           {sectors.map((sector) => (<li key={sector.sectorId} className="rounded-2xl bg-slate-900 px-3 py-3 text-sm">
               <p className="font-black text-cyan-200">Сектор {sector.sectorId}</p>
               <SectorLine sector={sector} byId={byId}/>

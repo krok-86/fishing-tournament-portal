@@ -1,0 +1,1709 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.tournamentCalculator = exports.emptyPlayoffProjection = exports.GHOST_ID = void 0;
+exports.scoreDuel = scoreDuel;
+exports.pointsAgainst = pointsAgainst;
+exports.scorePlayoffDuel = scorePlayoffDuel;
+exports.calculateDuels = calculateDuels;
+exports.generateLeaderboard = generateLeaderboard;
+exports.isGhostOpponent = isGhostOpponent;
+exports.bankSide = bankSide;
+exports.comparisonNeighborId = comparisonNeighborId;
+exports.comparisonNeighborFromGrid = comparisonNeighborFromGrid;
+exports.generateTournamentGrid = generateTournamentGrid;
+exports.readTransitionGrid = readTransitionGrid;
+exports.seedsFromRanking = seedsFromRanking;
+exports.buildQuarterfinals = buildQuarterfinals;
+exports.playoffMatches = playoffMatches;
+exports.projectPlayoff = projectPlayoff;
+exports.previewPlayoffScore = previewPlayoffScore;
+exports.calculateLoneResult = calculateLoneResult;
+exports.withPlayoffDuel = withPlayoffDuel;
+exports.withPlayoffReport = withPlayoffReport;
+const types_js_1 = require("./types.js");
+/**
+ * Очки одного спортсмена:
+ * 0 рыб → 0; больше соперника → 4; поровну и оба поймали → 2; меньше, но рыба есть → 1.
+ */
+function scoreDuel(fishA, fishB) {
+    const a = normalizeFish(fishA);
+    const b = normalizeFish(fishB);
+    if (a === 0 && b === 0) {
+        return { outcome: "blank", a: { fish: 0, points: 0 }, b: { fish: 0, points: 0 } };
+    }
+    if (a === b) {
+        return { outcome: "draw", fish: a, a: { points: 2 }, b: { points: 2 } };
+    }
+    if (a > b) {
+        return {
+            outcome: "win",
+            winner: "a",
+            winnerFish: a,
+            loserFish: b,
+            winnerPoints: 4,
+            loserPoints: b > 0 ? 1 : 0,
+        };
+    }
+    return {
+        outcome: "win",
+        winner: "b",
+        winnerFish: b,
+        loserFish: a,
+        winnerPoints: 4,
+        loserPoints: a > 0 ? 1 : 0,
+    };
+}
+/** Очки спортсмена против соперника. 4 победа, 2 ничья, 1 поражение с рыбой, 0 ноль поимок. */
+function pointsAgainst(ownFish, opponentFish) {
+    return sidePoints(scoreDuel(ownFish, opponentFish), "a");
+}
+/**
+ * Кубковая дуэль PAL Trout 2026.
+ * 1. Больше рыб в основное время.
+ * 2. Ничья основного времени — доп. 5 минут.
+ * 3. Ничья доп. времени — «Золотая рыба»: больше рыб, либо кто поймал первым при равном ненулевом счёте.
+ * 4. Только 0:0 в золотой рыбе отдаёт победу более высокому месту группы (меньший place, затем меньший seed).
+ */
+function scorePlayoffDuel(input) {
+    const fishA = normalizeFish(input.fishA);
+    const fishB = normalizeFish(input.fishB);
+    const blank = {
+        winner: null,
+        fishA,
+        fishB,
+        extraFishA: null,
+        extraFishB: null,
+        goldenFishA: null,
+        goldenFishB: null,
+        goldenFirst: null,
+        decidedBy: null,
+    };
+    if (fishA !== fishB) {
+        return { ...blank, winner: fishA > fishB ? "a" : "b", decidedBy: "regulation" };
+    }
+    const extraFishA = normalizeFish(input.extraFishA ?? 0);
+    const extraFishB = normalizeFish(input.extraFishB ?? 0);
+    const afterExtra = { ...blank, extraFishA, extraFishB };
+    if (extraFishA !== extraFishB) {
+        return { ...afterExtra, winner: extraFishA > extraFishB ? "a" : "b", decidedBy: "extraTime" };
+    }
+    const goldenFishA = normalizeFish(input.goldenFishA ?? 0);
+    const goldenFishB = normalizeFish(input.goldenFishB ?? 0);
+    const afterGolden = {
+        ...afterExtra,
+        goldenFishA,
+        goldenFishB,
+        goldenFirst: input.goldenFirst === "a" || input.goldenFirst === "b" ? input.goldenFirst : null,
+    };
+    if (goldenFishA !== goldenFishB) {
+        const winner = goldenFishA > goldenFishB ? "a" : "b";
+        return { ...afterGolden, winner, goldenFirst: winner, decidedBy: "goldenFish" };
+    }
+    if (goldenFishA > 0) {
+        if (afterGolden.goldenFirst) {
+            return { ...afterGolden, winner: afterGolden.goldenFirst, decidedBy: "goldenFish" };
+        }
+        return { ...afterGolden, winner: null, goldenFirst: null, decidedBy: null };
+    }
+    return {
+        ...afterGolden,
+        goldenFirst: null,
+        winner: betterQualifier(input.placeA, input.seedA, input.placeB, input.seedB),
+        decidedBy: "qualifyingPlace",
+    };
+}
+function calculateDuels(events) {
+    const state = reduceEvents(events);
+    return assignmentsOf(state)
+        .filter((assignment) => assignment.kind === "pair" || assignment.neighborSlotId !== null)
+        .map((assignment) => toDuelResult(state, assignment))
+        .sort(compareDuels);
+}
+function generateLeaderboard(events) {
+    const state = reduceEvents(events);
+    const duels = calculateDuels(events);
+    const lastRound = state.lastRound;
+    const rows = [...state.slots.values()].map((slot) => {
+        let points = 0;
+        let opponentFishCount = 0;
+        for (const duel of duels) {
+            if (duel.kind === "pair") {
+                if (duel.a.slotId === slot.slotId) {
+                    points += duel.a.points;
+                    opponentFishCount += duel.b.fish;
+                }
+                else if (duel.b.slotId === slot.slotId) {
+                    points += duel.b.points;
+                    opponentFishCount += duel.a.fish;
+                }
+            }
+            else if (duel.lone.slotId === slot.slotId) {
+                points += duel.lone.points;
+                opponentFishCount += duel.neighborFish;
+            }
+        }
+        return {
+            place: 0,
+            slotId: slot.slotId,
+            bibNumber: slot.bibNumber,
+            groupId: slot.groupId,
+            displayName: slot.displayName,
+            points,
+            fishCount: totalFish(state, slot.slotId),
+            opponentFishCount,
+            lastRoundFish: fishInRound(state, slot.slotId, lastRound),
+            periods: periodResults(state, slot.slotId, duels),
+        };
+    });
+    rows.sort((left, right) => {
+        if (right.points !== left.points)
+            return right.points - left.points;
+        if (right.fishCount !== left.fishCount)
+            return right.fishCount - left.fishCount;
+        return left.bibNumber - right.bibNumber || left.slotId.localeCompare(right.slotId);
+    });
+    for (let index = 0; index < rows.length; index += 1) {
+        const previous = rows[index - 1];
+        const current = rows[index];
+        if (!current)
+            continue;
+        const tied = previous !== undefined &&
+            previous.points === current.points &&
+            previous.fishCount === current.fishCount;
+        current.place = tied ? previous.place : index + 1;
+    }
+    return rows;
+}
+const SCHEDULE_PERIODS = types_js_1.QUALIFYING_PERIODS;
+/** Виртуальный соперник нечётного состава. В сетку слотом не сажается: живой в этом туре один. */
+exports.GHOST_ID = "GHOST";
+function isGhostOpponent(slotId) {
+    return slotId == null || slotId === exports.GHOST_ID;
+}
+/**
+ * Стартовый борт и чередование, если других сведений нет.
+ * Период 1: нечётный номер слева, чётный справа. Дальше борт меняется каждый период.
+ * В сетке борт пары и одиночки берётся из их собственной истории, а не только из этой формулы.
+ */
+function bankSide(bibNumber, periodNumber) {
+    const oddBib = Math.abs(bibNumber) % 2 === 1;
+    let side = oddBib ? "left" : "right";
+    const period = Number.isInteger(periodNumber) && periodNumber > 1 ? periodNumber : 1;
+    for (let current = 1; current < period; current += 1) {
+        side = side === "left" ? "right" : "left";
+    }
+    return side;
+}
+/**
+ * Сосед для сравнения одиночки по карте секторов этого периода.
+ * Сначала сектор в сторону пустого борта, из него — место, которое смотрит на одиночку.
+ */
+function comparisonNeighborId(seats, loneSlotId) {
+    const ordered = [...seats].sort((left, right) => left.order - right.order || left.sectorId.localeCompare(right.sectorId, undefined, { numeric: true }));
+    const sectorIndex = ordered.findIndex((seat) => seat.leftSlotId === loneSlotId || seat.rightSlotId === loneSlotId);
+    if (sectorIndex < 0)
+        return null;
+    const loneOnLeft = ordered[sectorIndex]?.leftSlotId === loneSlotId;
+    const nearestFirst = loneOnLeft ? [sectorIndex + 1, sectorIndex - 1] : [sectorIndex - 1, sectorIndex + 1];
+    for (const index of nearestFirst) {
+        const adjacent = ordered[index];
+        if (!adjacent)
+            continue;
+        const towardLone = index > sectorIndex
+            ? [adjacent.leftSlotId, adjacent.rightSlotId]
+            : [adjacent.rightSlotId, adjacent.leftSlotId];
+        for (const candidate of towardLone) {
+            if (candidate && candidate !== loneSlotId && candidate !== exports.GHOST_ID)
+                return candidate;
+        }
+    }
+    return null;
+}
+/** Сосед одиночки из уже построенной сетки. Борт берётся из слота жеребьёвки. */
+function comparisonNeighborFromGrid(grid, loneSlotId, period, round = 1, skipSlotIds) {
+    const seats = new Map();
+    for (const slot of grid) {
+        if (slot.round !== round || slot.period !== period)
+            continue;
+        if (slot.slotId === exports.GHOST_ID || skipSlotIds?.has(slot.slotId))
+            continue;
+        const parsed = Number(slot.sectorId);
+        const seat = seats.get(slot.sectorId) ?? {
+            sectorId: slot.sectorId,
+            order: Number.isFinite(parsed) ? parsed : 0,
+            leftSlotId: null,
+            rightSlotId: null,
+        };
+        if (slot.side === "right")
+            seat.rightSlotId = slot.slotId;
+        else
+            seat.leftSlotId = slot.slotId;
+        seats.set(slot.sectorId, seat);
+    }
+    return comparisonNeighborId([...seats.values()], loneSlotId);
+}
+/**
+ * Сетка отбора.
+ * `participantIds` идут в порядке жеребьёвки. Номер — позиция в этом списке, если `bibNumbers` не переданы.
+ * Нечётный состав дополняется одним GHOST: кому он выпал, тот в периоде один.
+ * Период 1 — только чётный с нечётным, пары и сектора перемешаны, а не 1 со 2 в секторе 1.
+ * Со 2-го периода чётный может встретить чётного, нечётный — нечётного.
+ * Сначала закрываются новые пары. Повтор меняет борта местами и садится в другой сектор.
+ * Один и тот же сектор два периода подряд не берётся. Возврат позже возможен, но реже, и тогда борт меняется относительно прошлого визита.
+ * Борт каждого номера по возможности меняется каждый период. Повтор борта допустим, длинная серия на одной стороне — нет.
+ * Одинаковые номера не дают один и тот же лист: расклад зависит и от id участников. Один и тот же список при этом не прыгает.
+ */
+function generateTournamentGrid(participantIds, periodsCount, bibNumbers) {
+    const ids = uniqueIds(participantIds);
+    if (ids.length === 0 || !Number.isInteger(periodsCount) || periodsCount < 1)
+        return [];
+    const periods = Math.min(SCHEDULE_PERIODS.length, periodsCount);
+    const athletes = ids.map((slotId, index) => ({
+        slotId,
+        bibNumber: bibNumbers && bibNumbers.length === ids.length ? (bibNumbers[index] ?? index + 1) : index + 1,
+    }));
+    const bibOf = new Map(athletes.map((athlete) => [athlete.slotId, athlete.bibNumber]));
+    const field = athletes.map((athlete) => athlete.slotId);
+    if (field.length % 2 === 1)
+        field.push(exports.GHOST_ID);
+    const seed = mixSeed(athletes.flatMap((athlete) => [athlete.bibNumber, athlete.slotId]));
+    const meetings = new Map();
+    const sectorVisits = new Map();
+    const lastSector = new Map();
+    const sectorSides = new Map();
+    const byeCount = new Map();
+    const banks = new Map();
+    const slots = [];
+    for (let offset = 0; offset < periods; offset += 1) {
+        const period = SCHEDULE_PERIODS[offset] ?? 1;
+        const crossOnly = period === 1;
+        const pairs = bestFieldMatching(field, bibOf, meetings, byeCount, banks, lastSector, sectorSides, seed, period, crossOnly);
+        const chosen = pairs.length > 0 ? pairs : bestFieldMatching(field, bibOf, meetings, byeCount, banks, lastSector, sectorSides, seed, period, false);
+        const meets = chosen.map(([leftId, rightId]) => ({
+            leftId,
+            rightId,
+            rematchSectors: new Set((meetings.get(pairKey(leftId, rightId)) ?? []).map((meeting) => meeting.sector)),
+        }));
+        const sectors = assignMeetSectors(meets, bibOf, sectorVisits, lastSector, sectorSides, banks, seed, period);
+        meets.forEach((meet, index) => {
+            const sector = sectors[index] ?? index;
+            const sectorId = String(sector + 1);
+            const ghostMeet = meet.leftId === exports.GHOST_ID || meet.rightId === exports.GHOST_ID;
+            if (ghostMeet) {
+                const loneId = meet.leftId === exports.GHOST_ID ? meet.rightId : meet.leftId;
+                const loneSide = sectorBank(loneId, sector, sectorSides) ?? preferredBank(banks.get(loneId), bibOf.get(loneId) ?? 0);
+                slots.push(gridPlace(loneId, exports.GHOST_ID, loneSide, period, sectorId, bibOf));
+                rememberBank(banks, loneId, loneSide);
+                rememberSector(sectorVisits, lastSector, loneId, sector);
+                rememberSectorSide(sectorSides, loneId, sector, loneSide);
+                byeCount.set(loneId, (byeCount.get(loneId) ?? 0) + 1);
+                return;
+            }
+            const memory = meetings.get(pairKey(meet.leftId, meet.rightId)) ?? [];
+            const oriented = orientPair(meet.leftId, meet.rightId, memory, bibOf, banks, sectorSides, sector, seed, period);
+            slots.push(gridPlace(oriented.leftId, oriented.rightId, "left", period, sectorId, bibOf));
+            slots.push(gridPlace(oriented.rightId, oriented.leftId, "right", period, sectorId, bibOf));
+            rememberBank(banks, oriented.leftId, "left");
+            rememberBank(banks, oriented.rightId, "right");
+            rememberSectorSide(sectorSides, oriented.leftId, sector, "left");
+            rememberSectorSide(sectorSides, oriented.rightId, sector, "right");
+            const nextMemory = meetings.get(pairKey(meet.leftId, meet.rightId)) ?? [];
+            nextMemory.push({ period, sector, leftId: oriented.leftId, rightId: oriented.rightId });
+            meetings.set(pairKey(meet.leftId, meet.rightId), nextMemory);
+            rememberSector(sectorVisits, lastSector, meet.leftId, sector);
+            rememberSector(sectorVisits, lastSector, meet.rightId, sector);
+        });
+    }
+    return slots.sort(compareGridSlots);
+}
+function readTransitionGrid(events) {
+    const state = reduceEvents(events);
+    const slots = [];
+    for (const duel of state.matrix) {
+        if (duel.kind === "pair") {
+            slots.push(gridSlot(state, duel, duel.leftSlotId, duel.rightSlotId));
+            slots.push(gridSlot(state, duel, duel.rightSlotId, duel.leftSlotId));
+        }
+        else {
+            slots.push(gridSlot(state, duel, duel.loneSlotId, null));
+        }
+    }
+    return slots.sort(compareGridSlots);
+}
+const QUARTERFINAL_SEEDS = [
+    [1, 8],
+    [2, 7],
+    [3, 6],
+    [4, 5],
+];
+/** Полуфинал: победитель 1–8 с победителем 4–5, победитель 2–7 с победителем 3–6. */
+const SEMIFINAL_SOURCES = [
+    [0, 3],
+    [1, 2],
+];
+exports.emptyPlayoffProjection = {
+    formed: false,
+    seeds: [],
+    quarterfinals: [],
+    semifinals: [],
+    final: null,
+    thirdPlace: null,
+};
+/** Первые восемь строк таблицы. seed — порядок, place — место отбора. */
+function seedsFromRanking(entries) {
+    if (entries.length < 8)
+        return null;
+    const top = entries.slice(0, 8);
+    if (new Set(top.map((entry) => entry.slotId)).size !== 8)
+        return null;
+    return top.map((entry, index) => ({
+        slotId: entry.slotId,
+        place: entry.place,
+        seed: index + 1,
+    }));
+}
+/** 1vs8, 2vs7, 3vs6, 4vs5. На стороне A — более высокий посев. */
+function buildQuarterfinals(seeds) {
+    if (seeds.length !== 8)
+        return null;
+    const bySeed = new Map(seeds.map((seed) => [seed.seed, seed]));
+    const pairs = [];
+    for (let order = 0; order < QUARTERFINAL_SEEDS.length; order += 1) {
+        const [seedA, seedB] = QUARTERFINAL_SEEDS[order] ?? [0, 0];
+        const a = bySeed.get(seedA);
+        const b = bySeed.get(seedB);
+        if (!a || !b)
+            return null;
+        pairs.push({
+            matchId: `qf-${order}`,
+            stage: "quarterfinal",
+            order,
+            slotIdA: a.slotId,
+            slotIdB: b.slotId,
+            seedA: a.seed,
+            seedB: b.seed,
+            placeA: a.place,
+            placeB: b.place,
+        });
+    }
+    return pairs;
+}
+function playoffMatches(projection) {
+    if (!projection.formed || !projection.final || !projection.thirdPlace)
+        return [];
+    return [...projection.quarterfinals, ...projection.semifinals, projection.final, projection.thirdPlace];
+}
+/** Сетка кубка. Очки отбора не меняет: события плей-офф в таблицу не входят. */
+function projectPlayoff(events) {
+    const ordered = [...events]
+        .filter((event, index, list) => list.findIndex((item) => item.id === event.id) === index)
+        .sort((left, right) => left.timestamp - right.timestamp || left.id.localeCompare(right.id));
+    let formed = null;
+    const scores = new Map();
+    const sides = new Map();
+    for (const event of ordered) {
+        if (event.type === "FORM_PLAYOFF")
+            formed = event;
+        if (event.type === "PLAYOFF_DUEL_SCORED") {
+            sides.delete(event.payload.matchId);
+            scores.set(event.payload.matchId, duelScoreFromEvent(event.payload));
+        }
+        if (event.type === "PLAYOFF_SIDE_REPORTED") {
+            const score = scores.get(event.payload.matchId);
+            if (score &&
+                score.fishA !== null &&
+                score.fishB !== null &&
+                (event.payload.slotId === score.slotIdA || event.payload.slotId === score.slotIdB)) {
+                scores.set(event.payload.matchId, {
+                    ...score,
+                    fishA: event.payload.slotId === score.slotIdA ? event.payload.fish : score.fishA,
+                    fishB: event.payload.slotId === score.slotIdB ? event.payload.fish : score.fishB,
+                });
+            }
+            else {
+                const bucket = new Map(sides.get(event.payload.matchId) ?? []);
+                bucket.set(event.payload.slotId, event.payload.fish);
+                sides.set(event.payload.matchId, bucket);
+            }
+        }
+    }
+    if (!formed || formed.payload.quarterfinals.length !== 4 || formed.payload.seeds.length !== 8) {
+        return exports.emptyPlayoffProjection;
+    }
+    return assemblePlayoff(formed.payload.seeds, formed.payload.quarterfinals, resolvePlayoffScore(scores, sides));
+}
+/**
+ * Черновик поимок поверх уже собранной сетки.
+ * Победитель, финал и матч за 3-е место считаются тем же регламентом, что и при записи дуэли.
+ * Счёт следующего раунда сохраняется, только если в паре остались те же спортсмены.
+ */
+function previewPlayoffScore(projection, matchId, lines) {
+    if (!projection.formed || !projection.final || !projection.thirdPlace)
+        return projection;
+    const pairings = projection.quarterfinals.map(matchToPairing);
+    if (pairings.some((pairing) => pairing === null))
+        return projection;
+    const target = playoffMatches(projection).find((match) => match.matchId === matchId);
+    if (!target?.slotIdA || !target.slotIdB)
+        return projection;
+    const scores = scoresFromProjection(projection);
+    scores.set(matchId, {
+        matchId,
+        slotIdA: target.slotIdA,
+        slotIdB: target.slotIdB,
+        fishA: lines.fishA,
+        fishB: lines.fishB,
+        extraFishA: normalizeFish(lines.extraFishA ?? 0),
+        extraFishB: normalizeFish(lines.extraFishB ?? 0),
+        goldenFishA: normalizeFish(lines.goldenFishA ?? 0),
+        goldenFishB: normalizeFish(lines.goldenFishB ?? 0),
+        goldenFirst: lines.goldenFirst === "a" || lines.goldenFirst === "b" ? lines.goldenFirst : null,
+    });
+    return assemblePlayoff(projection.seeds, pairings.filter((pairing) => pairing !== null), resolvePlayoffScore(scores, new Map()));
+}
+function calculateLoneResult(events, loneId, neighbor) {
+    const state = reduceEvents(events);
+    const neighborId = resolveNeighborId(loneId, neighbor);
+    const period = resolveLonePeriod(state, loneId, neighbor);
+    const loneFish = countedFish(state, loneId, period.round, period.period);
+    const neighborFish = countedFish(state, neighborId, period.round, period.period);
+    const comparison = scoreDuel(loneFish, neighborFish);
+    return {
+        loneId,
+        neighborId,
+        loneFish,
+        neighborFish,
+        lonePoints: sidePoints(comparison, "a"),
+        comparison,
+        awardedToNeighbor: false,
+        neighborTransitionViolation: transitionViolation(state, neighborId, period.round, period.period),
+    };
+}
+exports.tournamentCalculator = {
+    scoreDuel,
+    calculateDuels,
+    generateLeaderboard,
+    readTransitionGrid,
+    scorePlayoffDuel,
+    projectPlayoff,
+    calculateLoneResult,
+};
+function reduceEvents(events) {
+    const state = {
+        slots: new Map(),
+        matrix: [],
+        assignments: new Map(),
+        comparisons: new Map(),
+        fish: new Map(),
+        yellow: new Set(),
+        red: new Set(),
+        protocols: new Map(),
+        transitions: [],
+        lastRound: 1,
+    };
+    const ordered = [...events]
+        .filter((event, index, list) => list.findIndex((item) => item.id === event.id) === index)
+        .sort((left, right) => left.timestamp - right.timestamp || left.id.localeCompare(right.id));
+    for (const event of ordered) {
+        switch (event.type) {
+            case "TOURNAMENT_OPENED":
+                state.lastRound = event.payload.rounds;
+                break;
+            case "PARTICIPANT_REGISTERED":
+                state.slots.set(event.payload.slotId, {
+                    slotId: event.payload.slotId,
+                    bibNumber: event.payload.bibNumber,
+                    groupId: event.payload.groupId,
+                    displayName: event.payload.displayName,
+                    ghost: false,
+                });
+                break;
+            case "DRAW_SEEDED":
+                state.slots.clear();
+                for (const slot of event.payload.slots) {
+                    state.slots.set(slot.slotId, {
+                        slotId: slot.slotId,
+                        bibNumber: slot.bibNumber,
+                        groupId: slot.groupId,
+                        displayName: slot.displayName,
+                        ghost: slot.ghost === true,
+                    });
+                }
+                state.matrix = [...event.payload.matrix];
+                rebuildMatrixAssignments(state);
+                break;
+            case "DUEL_ASSIGNED":
+                if (event.payload.kind === "pair") {
+                    ensureSlot(state, event.payload.slotIdA);
+                    ensureSlot(state, event.payload.slotIdB);
+                    putAssignment(state, {
+                        kind: "pair",
+                        source: "manual",
+                        round: event.payload.round,
+                        period: event.payload.period,
+                        sectorId: event.payload.sectorId,
+                        slotIdA: event.payload.slotIdA,
+                        slotIdB: event.payload.slotIdB,
+                    });
+                }
+                else {
+                    ensureSlot(state, event.payload.loneSlotId);
+                    ensureSlot(state, event.payload.neighborSlotId);
+                    putAssignment(state, {
+                        kind: "lone",
+                        source: "manual",
+                        round: event.payload.round,
+                        period: event.payload.period,
+                        sectorId: event.payload.sectorId,
+                        loneSlotId: event.payload.loneSlotId,
+                        neighborSlotId: event.payload.neighborSlotId,
+                    });
+                }
+                break;
+            case "LONE_COMPARED":
+                ensureSlot(state, event.payload.loneSlotId);
+                ensureSlot(state, event.payload.neighborSlotId);
+                state.comparisons.set(comparisonKey(event.payload.round, event.payload.period, event.payload.loneSlotId), event.payload.neighborSlotId);
+                attachComparison(state, event.payload.round, event.payload.period, event.payload.loneSlotId);
+                break;
+            case "PARTICIPANT_REPLACED": {
+                ensureSlot(state, event.payload.slotId);
+                const replaced = state.slots.get(event.payload.slotId);
+                replaced.displayName = event.payload.displayName;
+                replaced.ghost = false;
+                break;
+            }
+            case "PARTICIPANT_SET_GHOST": {
+                ensureSlot(state, event.payload.slotId);
+                const ghosted = state.slots.get(event.payload.slotId);
+                ghosted.displayName = event.payload.displayName;
+                ghosted.ghost = true;
+                break;
+            }
+            case "PARTICIPANT_REMOVED":
+                state.slots.delete(event.payload.slotId);
+                break;
+            case "CATCH_RECORDED": {
+                ensureSlot(state, event.payload.slotId);
+                const key = fishKey(event.payload.slotId, event.payload.round, event.payload.period);
+                const ledger = state.fish.get(key) ?? blankLedger();
+                if (ledger.sealed) {
+                    ledger.segment = 0;
+                    ledger.sealed = false;
+                }
+                ledger.segment += event.payload.delta;
+                ledger.open = true;
+                state.fish.set(key, ledger);
+                break;
+            }
+            case "TRANSITION_DECIDED":
+                state.transitions.push(event.payload);
+                break;
+            case "CARD_ISSUED":
+                if (event.payload.card === "yellow") {
+                    state.yellow.add(fishKey(event.payload.slotId, event.payload.round, event.payload.period));
+                }
+                else {
+                    state.red.add(`${event.payload.slotId}:${event.payload.round}`);
+                }
+                break;
+            case "FORM_PLAYOFF":
+            case "PLAYOFF_DUEL_SCORED":
+            case "PLAYOFF_SIDE_REPORTED":
+            case "PERIOD_SIGNAL":
+                break;
+            case "PERIOD_COMPLETED": {
+                const key = `${event.payload.round}:${event.payload.period}`;
+                const covered = new Set();
+                for (const protocol of event.payload.protocols) {
+                    covered.add(protocol.slotIdA);
+                    if (protocol.slotIdB)
+                        covered.add(protocol.slotIdB);
+                    sealFish(state, protocol.slotIdA, event.payload.round, event.payload.period);
+                    if (protocol.slotIdB)
+                        sealFish(state, protocol.slotIdB, event.payload.round, event.payload.period);
+                }
+                const previous = state.protocols.get(key) ?? [];
+                const kept = previous.filter((protocol) => !covered.has(protocol.slotIdA) && (protocol.slotIdB === null || !covered.has(protocol.slotIdB)));
+                state.protocols.set(key, [...kept, ...event.payload.protocols]);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+    return state;
+}
+/**
+ * Ближайший сосед одиночки в этом периоде по карте секторов.
+ * Очки этой виртуальной дуэли соседу не начисляются.
+ */
+function nearestSectorNeighbor(state, round, period, loneSlotId) {
+    const seats = [];
+    for (const duel of state.matrix) {
+        if (duel.round !== round || duel.period !== period)
+            continue;
+        const parsed = Number(duel.sectorId);
+        const seat = {
+            sectorId: duel.sectorId,
+            order: Number.isFinite(parsed) ? parsed : 0,
+            leftSlotId: null,
+            rightSlotId: null,
+        };
+        if (duel.kind === "pair") {
+            seat.leftSlotId = duel.leftSlotId;
+            seat.rightSlotId = duel.rightSlotId;
+        }
+        else if (matrixBank(state, duel.loneSlotId, duel.round, duel.period) === "right") {
+            seat.rightSlotId = duel.loneSlotId;
+        }
+        else {
+            seat.leftSlotId = duel.loneSlotId;
+        }
+        seats.push(seat);
+    }
+    return comparisonNeighborId(seats, loneSlotId);
+}
+function rebuildMatrixAssignments(state) {
+    for (const [key, assignment] of state.assignments) {
+        if (assignment.source === "matrix")
+            state.assignments.delete(key);
+    }
+    for (const duel of state.matrix) {
+        if (duel.kind === "pair") {
+            putAssignment(state, {
+                kind: "pair",
+                source: "matrix",
+                round: duel.round,
+                period: duel.period,
+                sectorId: duel.sectorId,
+                slotIdA: duel.leftSlotId,
+                slotIdB: duel.rightSlotId,
+            });
+        }
+        else {
+            const pinned = state.comparisons.get(comparisonKey(duel.round, duel.period, duel.loneSlotId));
+            putAssignment(state, {
+                kind: "lone",
+                source: "matrix",
+                round: duel.round,
+                period: duel.period,
+                sectorId: duel.sectorId,
+                loneSlotId: duel.loneSlotId,
+                neighborSlotId: pinned ?? nearestSectorNeighbor(state, duel.round, duel.period, duel.loneSlotId),
+            });
+        }
+    }
+}
+function putAssignment(state, assignment) {
+    const slotIds = assignment.kind === "pair" ? [assignment.slotIdA, assignment.slotIdB] : [assignment.loneSlotId];
+    for (const slotId of slotIds) {
+        const existingKey = assignmentKey(assignment.round, assignment.period, slotId);
+        const existing = state.assignments.get(existingKey);
+        if (!existing)
+            continue;
+        if (existing.kind === "pair") {
+            state.assignments.delete(assignmentKey(existing.round, existing.period, existing.slotIdA));
+            state.assignments.delete(assignmentKey(existing.round, existing.period, existing.slotIdB));
+        }
+        else {
+            state.assignments.delete(assignmentKey(existing.round, existing.period, existing.loneSlotId));
+        }
+    }
+    if (assignment.kind === "pair") {
+        state.assignments.set(assignmentKey(assignment.round, assignment.period, assignment.slotIdA), assignment);
+        state.assignments.set(assignmentKey(assignment.round, assignment.period, assignment.slotIdB), assignment);
+        return;
+    }
+    state.assignments.set(assignmentKey(assignment.round, assignment.period, assignment.loneSlotId), assignment);
+}
+function attachComparison(state, round, period, loneSlotId) {
+    const key = assignmentKey(round, period, loneSlotId);
+    const existing = state.assignments.get(key);
+    const neighborSlotId = state.comparisons.get(comparisonKey(round, period, loneSlotId)) ?? null;
+    if (existing?.kind === "lone" && existing.loneSlotId === loneSlotId) {
+        existing.neighborSlotId = neighborSlotId;
+        return;
+    }
+    if (!existing) {
+        putAssignment(state, {
+            kind: "lone",
+            source: "matrix",
+            round,
+            period,
+            sectorId: null,
+            loneSlotId,
+            neighborSlotId,
+        });
+    }
+}
+function assignmentsOf(state) {
+    const unique = new Set();
+    for (const assignment of state.assignments.values())
+        unique.add(assignment);
+    return [...unique];
+}
+function toDuelResult(state, assignment) {
+    if (assignment.kind === "pair") {
+        const fishA = countedFish(state, assignment.slotIdA, assignment.round, assignment.period);
+        const fishB = countedFish(state, assignment.slotIdB, assignment.round, assignment.period);
+        const points = scoreDuel(fishA, fishB);
+        return {
+            kind: "pair",
+            round: assignment.round,
+            period: assignment.period,
+            sectorId: assignment.sectorId,
+            source: assignment.source,
+            a: scoredAthlete(state, assignment.slotIdA, fishA, sidePoints(points, "a")),
+            b: scoredAthlete(state, assignment.slotIdB, fishB, sidePoints(points, "b")),
+            points,
+        };
+    }
+    const neighborId = assignment.neighborSlotId ?? "";
+    const loneFish = countedFish(state, assignment.loneSlotId, assignment.round, assignment.period);
+    const neighborFish = countedFish(state, neighborId, assignment.round, assignment.period);
+    const comparison = scoreDuel(loneFish, neighborFish);
+    return {
+        kind: "lone",
+        round: assignment.round,
+        period: assignment.period,
+        sectorId: assignment.sectorId,
+        source: assignment.source,
+        lone: scoredAthlete(state, assignment.loneSlotId, loneFish, sidePoints(comparison, "a")),
+        neighborId,
+        neighborFish,
+        awardedToNeighbor: false,
+        neighborTransitionViolation: transitionViolation(state, neighborId, assignment.round, assignment.period),
+    };
+}
+function blankLedger() {
+    return { committed: 0, segment: 0, sealed: false, open: false };
+}
+function sealFish(state, slotId, round, period) {
+    const key = fishKey(slotId, round, period);
+    const ledger = state.fish.get(key) ?? blankLedger();
+    ledger.committed = ledger.segment;
+    ledger.sealed = true;
+    ledger.open = false;
+    ledger.segment = 0;
+    state.fish.set(key, ledger);
+}
+function ledgerFish(ledger) {
+    if (!ledger)
+        return 0;
+    return ledger.sealed ? ledger.committed : ledger.segment;
+}
+function periodPlayed(ledger) {
+    if (!ledger)
+        return false;
+    return ledger.sealed || ledger.open;
+}
+function countedFish(state, slotId, round, period) {
+    if (state.red.has(`${slotId}:${round}`))
+        return 0;
+    const key = fishKey(slotId, round, period);
+    if (state.yellow.has(key))
+        return 0;
+    if (isUnsigned(state, slotId, round, period))
+        return 0;
+    return normalizeFish(ledgerFish(state.fish.get(key)));
+}
+function periodResults(state, slotId, duels) {
+    return SCHEDULE_PERIODS.map((period) => {
+        const ledger = state.fish.get(fishKey(slotId, 1, period));
+        const played = periodPlayed(ledger);
+        const fish = countedFish(state, slotId, 1, period);
+        return {
+            period,
+            played,
+            points: played ? periodPoints(duels, slotId, period) : 0,
+            fish: played ? fish : 0,
+            opponentFish: played ? opponentFishInPeriod(duels, slotId, period) : 0,
+        };
+    });
+}
+function opponentFishInPeriod(duels, slotId, period) {
+    for (const duel of duels) {
+        if (duel.round !== 1 || duel.period !== period)
+            continue;
+        if (duel.kind === "pair") {
+            if (duel.a.slotId === slotId)
+                return duel.b.fish;
+            if (duel.b.slotId === slotId)
+                return duel.a.fish;
+        }
+        else if (duel.lone.slotId === slotId) {
+            return duel.neighborFish;
+        }
+    }
+    return 0;
+}
+function periodPoints(duels, slotId, period) {
+    for (const duel of duels) {
+        if (duel.round !== 1 || duel.period !== period)
+            continue;
+        if (duel.kind === "pair") {
+            if (duel.a.slotId === slotId)
+                return duel.a.points;
+            if (duel.b.slotId === slotId)
+                return duel.b.points;
+        }
+        else if (duel.lone.slotId === slotId) {
+            return duel.lone.points;
+        }
+    }
+    return 0;
+}
+function totalFish(state, slotId) {
+    let total = 0;
+    for (const round of [1, 2]) {
+        total += fishInRound(state, slotId, round);
+    }
+    return total;
+}
+function fishInRound(state, slotId, round) {
+    let total = 0;
+    for (const period of SCHEDULE_PERIODS) {
+        total += countedFish(state, slotId, round, period);
+    }
+    return total;
+}
+function betterQualifier(placeA, seedA, placeB, seedB) {
+    if (placeA !== placeB)
+        return placeA < placeB ? "a" : "b";
+    if (seedA !== seedB)
+        return seedA < seedB ? "a" : "b";
+    return "a";
+}
+const UNSCORED_LINES = {
+    fishA: null,
+    fishB: null,
+    extraFishA: null,
+    extraFishB: null,
+    goldenFishA: null,
+    goldenFishB: null,
+    goldenFirst: null,
+    winnerSlotId: null,
+    decidedBy: null,
+};
+function duelScoreFromEvent(payload) {
+    return {
+        matchId: payload.matchId,
+        slotIdA: payload.slotIdA,
+        slotIdB: payload.slotIdB,
+        fishA: payload.fishA,
+        fishB: payload.fishB,
+        extraFishA: normalizeFish(payload.extraFishA ?? 0),
+        extraFishB: normalizeFish(payload.extraFishB ?? 0),
+        goldenFishA: normalizeFish(payload.goldenFishA ?? 0),
+        goldenFishB: normalizeFish(payload.goldenFishB ?? 0),
+        goldenFirst: payload.goldenFirst === "a" || payload.goldenFirst === "b" ? payload.goldenFirst : null,
+    };
+}
+function resolvePlayoffScore(scores, sides) {
+    return (matchId, slotIdA, slotIdB) => {
+        const stored = scores.get(matchId);
+        if (stored && stored.slotIdA === slotIdA && stored.slotIdB === slotIdB && stored.fishA !== null && stored.fishB !== null) {
+            return stored;
+        }
+        const reported = sides.get(matchId);
+        const fishA = reported?.get(slotIdA);
+        const fishB = reported?.get(slotIdB);
+        if (fishA === undefined && fishB === undefined) {
+            if (stored && stored.slotIdA === slotIdA && stored.slotIdB === slotIdB)
+                return stored;
+            return undefined;
+        }
+        return {
+            matchId,
+            slotIdA,
+            slotIdB,
+            fishA: fishA ?? null,
+            fishB: fishB ?? null,
+            extraFishA: 0,
+            extraFishB: 0,
+            goldenFishA: 0,
+            goldenFishB: 0,
+            goldenFirst: null,
+        };
+    };
+}
+function pairingToMatch(pairing) {
+    return {
+        matchId: pairing.matchId,
+        stage: pairing.stage,
+        order: pairing.order,
+        slotIdA: pairing.slotIdA,
+        slotIdB: pairing.slotIdB,
+        seedA: pairing.seedA,
+        seedB: pairing.seedB,
+        placeA: pairing.placeA,
+        placeB: pairing.placeB,
+        ...UNSCORED_LINES,
+    };
+}
+function blankPlayoffMatch(matchId, stage, order) {
+    return {
+        matchId,
+        stage,
+        order,
+        slotIdA: null,
+        slotIdB: null,
+        seedA: null,
+        seedB: null,
+        placeA: null,
+        placeB: null,
+        ...UNSCORED_LINES,
+    };
+}
+function applyPlayoffScore(match, score) {
+    if (!score || !match.slotIdA || !match.slotIdB)
+        return match;
+    if (score.slotIdA !== match.slotIdA || score.slotIdB !== match.slotIdB)
+        return match;
+    if (match.placeA === null || match.placeB === null || match.seedA === null || match.seedB === null)
+        return match;
+    if (score.fishA === null || score.fishB === null) {
+        return {
+            ...match,
+            ...UNSCORED_LINES,
+            fishA: score.fishA,
+            fishB: score.fishB,
+        };
+    }
+    const decision = scorePlayoffDuel({
+        fishA: score.fishA,
+        fishB: score.fishB,
+        extraFishA: score.extraFishA,
+        extraFishB: score.extraFishB,
+        goldenFishA: score.goldenFishA,
+        goldenFishB: score.goldenFishB,
+        goldenFirst: score.goldenFirst,
+        placeA: match.placeA,
+        seedA: match.seedA,
+        placeB: match.placeB,
+        seedB: match.seedB,
+    });
+    return {
+        ...match,
+        fishA: decision.fishA,
+        fishB: decision.fishB,
+        extraFishA: decision.extraFishA,
+        extraFishB: decision.extraFishB,
+        goldenFishA: decision.goldenFishA,
+        goldenFishB: decision.goldenFishB,
+        goldenFirst: decision.goldenFirst,
+        winnerSlotId: decision.winner === "a" ? match.slotIdA : decision.winner === "b" ? match.slotIdB : null,
+        decidedBy: decision.decidedBy,
+    };
+}
+function assemblePlayoff(seeds, quarterPairings, lookup) {
+    if (quarterPairings.length !== 4 || seeds.length !== 8)
+        return exports.emptyPlayoffProjection;
+    const quarterfinals = quarterPairings.map((pairing) => applyPlayoffScore(pairingToMatch(pairing), lookup(pairing.matchId, pairing.slotIdA, pairing.slotIdB)));
+    const semifinals = SEMIFINAL_SOURCES.map((sources, order) => advancePlayoff(`sf-${order}`, "semifinal", order, [quarterfinals[sources[0]], quarterfinals[sources[1]]], lookup, "winner"));
+    const finalMatch = advancePlayoff("final", "final", 0, [semifinals[0], semifinals[1]], lookup, "winner");
+    const thirdPlace = advancePlayoff("third", "third", 0, [semifinals[0], semifinals[1]], lookup, "loser");
+    return {
+        formed: true,
+        seeds,
+        quarterfinals,
+        semifinals,
+        final: finalMatch,
+        thirdPlace,
+    };
+}
+function scoresFromProjection(projection) {
+    const scores = new Map();
+    if (!projection.final || !projection.thirdPlace)
+        return scores;
+    for (const match of playoffMatches(projection)) {
+        if (!match.slotIdA || !match.slotIdB || (match.fishA === null && match.fishB === null))
+            continue;
+        scores.set(match.matchId, {
+            matchId: match.matchId,
+            slotIdA: match.slotIdA,
+            slotIdB: match.slotIdB,
+            fishA: match.fishA,
+            fishB: match.fishB,
+            extraFishA: match.extraFishA ?? 0,
+            extraFishB: match.extraFishB ?? 0,
+            goldenFishA: match.goldenFishA ?? 0,
+            goldenFishB: match.goldenFishB ?? 0,
+            goldenFirst: match.goldenFirst,
+        });
+    }
+    return scores;
+}
+function matchToPairing(match) {
+    if (match.stage !== "quarterfinal" ||
+        !match.slotIdA ||
+        !match.slotIdB ||
+        match.seedA === null ||
+        match.seedB === null ||
+        match.placeA === null ||
+        match.placeB === null) {
+        return null;
+    }
+    return {
+        matchId: match.matchId,
+        stage: "quarterfinal",
+        order: match.order,
+        slotIdA: match.slotIdA,
+        slotIdB: match.slotIdB,
+        seedA: match.seedA,
+        seedB: match.seedB,
+        placeA: match.placeA,
+        placeB: match.placeB,
+    };
+}
+function advancePlayoff(matchId, stage, order, sources, lookup, pick) {
+    const ranked = sources
+        .map((match) => (pick === "loser" ? playoffLoser(match) : playoffWinner(match)))
+        .filter((athlete) => athlete !== null)
+        .sort((left, right) => left.seed - right.seed || left.place - right.place || left.slotId.localeCompare(right.slotId));
+    const higherSeed = ranked[0];
+    const lowerSeed = ranked[1];
+    if (!higherSeed)
+        return blankPlayoffMatch(matchId, stage, order);
+    const match = {
+        matchId,
+        stage,
+        order,
+        slotIdA: higherSeed.slotId,
+        slotIdB: lowerSeed?.slotId ?? null,
+        seedA: higherSeed.seed,
+        seedB: lowerSeed?.seed ?? null,
+        placeA: higherSeed.place,
+        placeB: lowerSeed?.place ?? null,
+        ...UNSCORED_LINES,
+    };
+    if (!lowerSeed)
+        return match;
+    return applyPlayoffScore(match, lookup(matchId, higherSeed.slotId, lowerSeed.slotId));
+}
+function playoffWinner(match) {
+    if (!match?.winnerSlotId || match.slotIdA === null || match.slotIdB === null)
+        return null;
+    if (match.seedA === null || match.seedB === null || match.placeA === null || match.placeB === null)
+        return null;
+    if (match.winnerSlotId === match.slotIdA)
+        return { slotId: match.slotIdA, seed: match.seedA, place: match.placeA };
+    if (match.winnerSlotId === match.slotIdB)
+        return { slotId: match.slotIdB, seed: match.seedB, place: match.placeB };
+    return null;
+}
+function playoffLoser(match) {
+    const winner = playoffWinner(match);
+    if (!winner || !match?.slotIdA || !match.slotIdB)
+        return null;
+    if (match.seedA === null || match.seedB === null || match.placeA === null || match.placeB === null)
+        return null;
+    if (winner.slotId === match.slotIdA)
+        return { slotId: match.slotIdB, seed: match.seedB, place: match.placeB };
+    if (winner.slotId === match.slotIdB)
+        return { slotId: match.slotIdA, seed: match.seedA, place: match.placeA };
+    return null;
+}
+/**
+ * Полный счёт пары, как при ручном подтверждении.
+ * Ничья разбирается внутри projectPlayoff: доп. 5 минут, золотая рыба, затем рейтинг группы.
+ */
+function withPlayoffDuel(events, duel) {
+    const next = events.filter((event) => !coversPlayoffMatch(event, duel.payload.matchId));
+    return dropStalePlayoffScores([...next, duel]);
+}
+/**
+ * Одна сторона пары. Вторая уже известная сторона сохраняется.
+ * Когда известны обе, пишется PLAYOFF_DUEL_SCORED. QR несёт только основное время: уже введённый овертайм сохраняется.
+ * Если пару записать нельзя, возвращается тот же массив.
+ */
+function withPlayoffReport(events, report) {
+    const projection = projectPlayoff(events);
+    const match = playoffMatches(projection).find((item) => item.matchId === report.matchId);
+    if (!match?.slotIdA || !match.slotIdB)
+        return events;
+    if (report.slotId !== match.slotIdA && report.slotId !== match.slotIdB)
+        return events;
+    const otherFish = report.slotId === match.slotIdA ? match.fishB : match.fishA;
+    const withoutThisSide = events.filter((event) => !isSideReport(event, report.matchId, report.slotId));
+    const fish = normalizeFish(report.fish);
+    const drafted = otherFish === null
+        ? [
+            ...withoutThisSide,
+            {
+                id: report.id,
+                tournamentId: report.tournamentId,
+                type: "PLAYOFF_SIDE_REPORTED",
+                timestamp: report.timestamp,
+                payload: { matchId: report.matchId, slotId: report.slotId, fish },
+            },
+        ]
+        : [
+            ...withoutThisSide.filter((event) => !coversPlayoffMatch(event, report.matchId)),
+            {
+                id: report.id,
+                tournamentId: report.tournamentId,
+                type: "PLAYOFF_DUEL_SCORED",
+                timestamp: report.timestamp,
+                payload: {
+                    matchId: report.matchId,
+                    slotIdA: match.slotIdA,
+                    slotIdB: match.slotIdB,
+                    fishA: report.slotId === match.slotIdA ? fish : otherFish,
+                    fishB: report.slotId === match.slotIdB ? fish : otherFish,
+                    extraFishA: match.extraFishA ?? 0,
+                    extraFishB: match.extraFishB ?? 0,
+                    goldenFishA: match.goldenFishA ?? 0,
+                    goldenFishB: match.goldenFishB ?? 0,
+                    goldenFirst: match.goldenFirst,
+                },
+            },
+        ];
+    return dropStalePlayoffScores(drafted);
+}
+function coversPlayoffMatch(event, matchId) {
+    return ((event.type === "PLAYOFF_DUEL_SCORED" || event.type === "PLAYOFF_SIDE_REPORTED") && event.payload.matchId === matchId);
+}
+function isSideReport(event, matchId, slotId) {
+    return event.type === "PLAYOFF_SIDE_REPORTED" && event.payload.matchId === matchId && event.payload.slotId === slotId;
+}
+function dropStalePlayoffScores(events) {
+    const projection = projectPlayoff(events);
+    if (!projection.formed)
+        return events;
+    const live = new Map(playoffMatches(projection)
+        .filter((match) => match.slotIdA && match.slotIdB)
+        .map((match) => [match.matchId, { slotIdA: match.slotIdA, slotIdB: match.slotIdB }]));
+    return events.filter((event) => {
+        if (event.type === "PLAYOFF_DUEL_SCORED") {
+            const pair = live.get(event.payload.matchId);
+            return pair?.slotIdA === event.payload.slotIdA && pair.slotIdB === event.payload.slotIdB;
+        }
+        if (event.type === "PLAYOFF_SIDE_REPORTED") {
+            const pair = live.get(event.payload.matchId);
+            return event.payload.slotId === pair?.slotIdA || event.payload.slotId === pair?.slotIdB;
+        }
+        return true;
+    });
+}
+function isUnsigned(state, slotId, round, period) {
+    const protocols = state.protocols.get(`${round}:${period}`) ?? [];
+    return protocols.some((protocol) => !protocol.signed && (protocol.slotIdA === slotId || protocol.slotIdB === slotId));
+}
+function sidePoints(points, side) {
+    if (points.outcome === "blank")
+        return 0;
+    if (points.outcome === "draw")
+        return 2;
+    const isWinner = points.winner === side;
+    return isWinner ? 4 : points.loserPoints;
+}
+function scoredAthlete(state, slotId, fish, points) {
+    return {
+        slotId,
+        bibNumber: state.slots.get(slotId)?.bibNumber ?? 0,
+        fish,
+        points,
+    };
+}
+function gridSlot(state, duel, slotId, opponentSlotId) {
+    const side = duel.kind === "pair"
+        ? slotId === duel.leftSlotId
+            ? "left"
+            : "right"
+        : matrixBank(state, slotId, duel.round, duel.period);
+    return {
+        round: duel.round,
+        period: duel.period,
+        groupId: duel.groupId,
+        zoneId: duel.zoneId,
+        sectorId: duel.sectorId,
+        slotId,
+        bibNumber: state.slots.get(slotId)?.bibNumber ?? 0,
+        side,
+        opponentSlotId,
+    };
+}
+function resolveNeighborId(loneId, neighbor) {
+    if (neighbor.mode === "manual") {
+        if (!neighbor.neighborId)
+            throw new Error("Не передан ID соседа");
+        return neighbor.neighborId;
+    }
+    if (neighbor.sectors.length === 0)
+        throw new Error("Секторы для выбора соседа не заданы");
+    const neighborId = neighbor.resolve(loneId, neighbor.sectors);
+    if (!neighborId)
+        throw new Error("Резолвер соседа не вернул ID");
+    return neighborId;
+}
+function resolveLonePeriod(state, loneId, neighbor) {
+    if (neighbor.mode === "sectors") {
+        const sector = neighbor.sectors.find((item) => item.slotIds.includes(loneId)) ?? neighbor.sectors[0];
+        if (sector)
+            return { round: sector.round, period: sector.period };
+    }
+    const loneAssignments = assignmentsOf(state)
+        .filter((assignment) => assignment.kind === "lone" && assignment.loneSlotId === loneId)
+        .sort((left, right) => left.round - right.round || left.period - right.period);
+    const latest = loneAssignments.at(-1);
+    if (latest)
+        return { round: latest.round, period: latest.period };
+    return { round: 1, period: 1 };
+}
+function transitionViolation(state, neighborId, round, period) {
+    const relevant = state.transitions.filter((item) => item.round === round && item.period === period);
+    const byNeighbor = [...relevant].reverse().find((item) => item.requestedBySlotId === neighborId);
+    if (byNeighbor)
+        return byNeighbor.requested;
+    return relevant.some((item) => item.requested && item.requestedBySlotId === null && neighborInSector(state, neighborId, item.sectorId, round, period));
+}
+function neighborInSector(state, neighborId, sectorId, round, period) {
+    return assignmentsOf(state).some((assignment) => {
+        if (assignment.round !== round || assignment.period !== period || assignment.sectorId !== sectorId)
+            return false;
+        if (assignment.kind === "pair")
+            return assignment.slotIdA === neighborId || assignment.slotIdB === neighborId;
+        return assignment.loneSlotId === neighborId || assignment.neighborSlotId === neighborId;
+    });
+}
+function ensureSlot(state, slotId) {
+    if (state.slots.has(slotId))
+        return;
+    state.slots.set(slotId, { slotId, bibNumber: 0, groupId: "A", displayName: slotId, ghost: false });
+}
+function normalizeFish(value) {
+    if (!Number.isFinite(value))
+        return 0;
+    return Math.max(0, Math.trunc(value));
+}
+function assignmentKey(round, period, slotId) {
+    return `${round}:${period}:${slotId}`;
+}
+function comparisonKey(round, period, loneSlotId) {
+    return `${round}:${period}:${loneSlotId}`;
+}
+function fishKey(slotId, round, period) {
+    return `${slotId}:${round}:${period}`;
+}
+function compareDuels(left, right) {
+    return left.round - right.round || left.period - right.period || (left.sectorId ?? "").localeCompare(right.sectorId ?? "");
+}
+function compareGridSlots(left, right) {
+    return (left.round - right.round ||
+        left.period - right.period ||
+        left.sectorId.localeCompare(right.sectorId, undefined, { numeric: true }) ||
+        left.bibNumber - right.bibNumber);
+}
+function uniqueIds(participantIds) {
+    const ids = [];
+    const seen = new Set();
+    for (const id of participantIds) {
+        if (!id || seen.has(id))
+            continue;
+        seen.add(id);
+        ids.push(id);
+    }
+    return ids;
+}
+function bestFieldMatching(field, bibOf, meetings, byeCount, banks, lastSector, sectorSides, seed, period, crossOnly) {
+    const ordered = [...field].sort((left, right) => (bibOf.get(left) ?? 0) - (bibOf.get(right) ?? 0) || left.localeCompare(right));
+    const oddCount = ordered.filter((id) => id !== exports.GHOST_ID && Math.abs(bibOf.get(id) ?? 0) % 2 === 1).length;
+    const evenCount = ordered.filter((id) => id !== exports.GHOST_ID && Math.abs(bibOf.get(id) ?? 0) % 2 === 0).length;
+    let bestCost = Number.POSITIVE_INFINITY;
+    let best = [];
+    const current = [];
+    const edgeCost = (leftId, rightId) => {
+        const prior = meetings.get(pairKey(leftId, rightId)) ?? [];
+        let cost = prior.length * 1_000_000;
+        if (prior.length > 0 && prior[prior.length - 1]?.period === period - 1)
+            cost += 100_000;
+        if (leftId === exports.GHOST_ID || rightId === exports.GHOST_ID) {
+            const realId = leftId === exports.GHOST_ID ? rightId : leftId;
+            cost += (byeCount.get(realId) ?? 0) * 10_000;
+            if (period === 1) {
+                const realOdd = Math.abs(bibOf.get(realId) ?? 0) % 2 === 1;
+                if (oddCount > evenCount && !realOdd)
+                    cost += 50_000;
+                if (evenCount > oddCount && realOdd)
+                    cost += 50_000;
+            }
+        }
+        else if (period === 1 && sameParity(leftId, rightId, bibOf)) {
+            cost += 1_000_000_000;
+        }
+        if (leftId !== exports.GHOST_ID && rightId !== exports.GHOST_ID && wantedBank(banks.get(leftId), bibOf.get(leftId) ?? 0) === wantedBank(banks.get(rightId), bibOf.get(rightId) ?? 0)) {
+            cost += 400 + bankPressure(banks.get(leftId)) + bankPressure(banks.get(rightId));
+        }
+        if (leftId !== exports.GHOST_ID && rightId !== exports.GHOST_ID) {
+            const open = openSideSectors(leftId, rightId, ordered.length / 2, lastSector, sectorSides);
+            if (open === 0)
+                cost += 3_000;
+            else if (open === 1)
+                cost += 200;
+        }
+        return cost + (mixRank(seed, bibOf.get(leftId) ?? 0, bibOf.get(rightId) ?? 0, period) % 100);
+    };
+    const visit = (remaining, cost) => {
+        if (cost >= bestCost)
+            return;
+        const anchor = remaining[0];
+        if (!anchor) {
+            bestCost = cost;
+            best = current.map((pair) => [pair[0], pair[1]]);
+            return;
+        }
+        const partners = remaining.slice(1).sort((left, right) => edgeCost(anchor, left) - edgeCost(anchor, right) || (bibOf.get(left) ?? 0) - (bibOf.get(right) ?? 0));
+        for (const partner of partners) {
+            if (crossOnly && !crossOrBye(anchor, partner, bibOf))
+                continue;
+            current.push([anchor, partner]);
+            visit(remaining.filter((id) => id !== anchor && id !== partner), cost + edgeCost(anchor, partner));
+            current.pop();
+        }
+    };
+    if (ordered.length > 12)
+        return greedyFieldMatching(ordered, bibOf, edgeCost, crossOnly);
+    visit(ordered, 0);
+    return best;
+}
+function greedyFieldMatching(ordered, bibOf, edgeCost, crossOnly) {
+    const remaining = new Set(ordered);
+    const pairs = [];
+    const constrained = [...ordered].sort((left, right) => {
+        const leftOptions = ordered.filter((id) => id !== left && (!crossOnly || crossOrBye(left, id, bibOf))).length;
+        const rightOptions = ordered.filter((id) => id !== right && (!crossOnly || crossOrBye(right, id, bibOf))).length;
+        return leftOptions - rightOptions || (bibOf.get(left) ?? 0) - (bibOf.get(right) ?? 0);
+    });
+    for (const anchor of constrained) {
+        if (!remaining.has(anchor))
+            continue;
+        let partner = "";
+        let cheapest = Number.POSITIVE_INFINITY;
+        for (const candidate of remaining) {
+            if (candidate === anchor)
+                continue;
+            if (crossOnly && !crossOrBye(anchor, candidate, bibOf))
+                continue;
+            const cost = edgeCost(anchor, candidate);
+            if (cost < cheapest || (cost === cheapest && (bibOf.get(candidate) ?? 0) < (bibOf.get(partner) ?? 0))) {
+                cheapest = cost;
+                partner = candidate;
+            }
+        }
+        if (!partner)
+            return [];
+        pairs.push([anchor, partner]);
+        remaining.delete(anchor);
+        remaining.delete(partner);
+    }
+    return pairs;
+}
+function assignMeetSectors(meets, bibOf, sectorVisits, lastSector, sectorSides, banks, seed, period) {
+    const sectorCount = meets.length;
+    if (sectorCount === 0)
+        return [];
+    const attempts = [
+        [true, true],
+        [false, true],
+        [true, false],
+        [false, false],
+    ];
+    for (const [blockRematchSector, blockConsecutiveSector] of attempts) {
+        const placed = placeSectors(meets, bibOf, sectorVisits, lastSector, sectorSides, banks, seed, period, blockRematchSector, blockConsecutiveSector);
+        if (placed)
+            return placed;
+    }
+    return meets.map((_, index) => index);
+}
+function placeSectors(meets, bibOf, sectorVisits, lastSector, sectorSides, banks, seed, period, blockRematchSector, blockConsecutiveSector) {
+    const sectorCount = meets.length;
+    let bestCost = Number.POSITIVE_INFINITY;
+    let best = null;
+    const used = new Array(sectorCount).fill(false);
+    const current = new Array(sectorCount).fill(-1);
+    const sectorCost = (meet, sector) => {
+        const anglers = [meet.leftId, meet.rightId].filter((id) => id !== exports.GHOST_ID);
+        let cost = anglers.reduce((sum, id) => sum + repeatWeight(visitCount(sectorVisits, id, sector)), 0);
+        cost += anglers.reduce((sum, id) => sum + returnSidePenalty(id, sector, sectorSides, banks, bibOf), 0);
+        if (anglers.some((id) => lastSector.get(id) === sector))
+            cost += 50_000;
+        if (meet.rematchSectors.has(sector))
+            cost += 5_000;
+        if (sectorSideClash(meet, sector, sectorSides))
+            cost += 800;
+        cost += forcedStreakCost(meet, sector, sectorSides, banks);
+        return cost + (mixRank(seed, bibOf.get(meet.leftId) ?? 0, bibOf.get(meet.rightId) ?? 0, sector, period) % 17);
+    };
+    const visit = (index, cost) => {
+        if (cost >= bestCost)
+            return;
+        if (index === meets.length) {
+            bestCost = cost;
+            best = [...current];
+            return;
+        }
+        const meet = meets[index];
+        if (!meet)
+            return;
+        const order = Array.from({ length: sectorCount }, (_, sector) => sector).sort((left, right) => sectorCost(meet, left) - sectorCost(meet, right));
+        for (const sector of order) {
+            if (used[sector])
+                continue;
+            if (blockConsecutiveSector && consecutiveSector(meet, sector, lastSector))
+                continue;
+            if (blockRematchSector && meet.rematchSectors.has(sector) && sectorCount > meet.rematchSectors.size)
+                continue;
+            used[sector] = true;
+            current[index] = sector;
+            visit(index + 1, cost + sectorCost(meet, sector));
+            used[sector] = false;
+        }
+    };
+    if (sectorCount > 8)
+        return greedySectors(meets, sectorCost, blockRematchSector, blockConsecutiveSector, lastSector);
+    visit(0, 0);
+    return best;
+}
+function greedySectors(meets, sectorCost, blockRematchSector, blockConsecutiveSector, lastSector) {
+    const sectorCount = meets.length;
+    const used = new Array(sectorCount).fill(false);
+    const placed = new Array(sectorCount).fill(-1);
+    const order = meets
+        .map((meet, index) => ({ meet, index }))
+        .sort((left, right) => right.meet.rematchSectors.size - left.meet.rematchSectors.size);
+    for (const item of order) {
+        let chosen = -1;
+        let cheapest = Number.POSITIVE_INFINITY;
+        for (let sector = 0; sector < sectorCount; sector += 1) {
+            if (used[sector])
+                continue;
+            if (blockConsecutiveSector && consecutiveSector(item.meet, sector, lastSector))
+                continue;
+            if (blockRematchSector && item.meet.rematchSectors.has(sector) && sectorCount > item.meet.rematchSectors.size)
+                continue;
+            const cost = sectorCost(item.meet, sector);
+            if (cost < cheapest) {
+                cheapest = cost;
+                chosen = sector;
+            }
+        }
+        if (chosen < 0)
+            return null;
+        used[chosen] = true;
+        placed[item.index] = chosen;
+    }
+    return placed;
+}
+function orientPair(leftId, rightId, memory, bibOf, banks, sectorSides, sector, seed, period) {
+    const last = memory[memory.length - 1];
+    const options = [
+        { leftId, rightId },
+        { leftId: rightId, rightId: leftId },
+    ];
+    const costOf = (option) => {
+        let cost = seatCost(option.leftId, "left", bibOf, banks) + seatCost(option.rightId, "right", bibOf, banks);
+        cost += sectorSideCost(option.leftId, "left", sector, sectorSides);
+        cost += sectorSideCost(option.rightId, "right", sector, sectorSides);
+        if (last && option.leftId === last.rightId && option.rightId === last.leftId)
+            cost -= 5;
+        return cost + (mixRank(seed, bibOf.get(option.leftId) ?? 0, bibOf.get(option.rightId) ?? 0, period) % 7);
+    };
+    options.sort((left, right) => costOf(left) - costOf(right));
+    return options[0] ?? { leftId, rightId };
+}
+function seatCost(slotId, side, bibOf, banks) {
+    const ledger = banks.get(slotId);
+    if (side === wantedBank(ledger, bibOf.get(slotId) ?? 0))
+        return 0;
+    const streak = ledger?.streak ?? 0;
+    const left = ledger?.left ?? 0;
+    const right = ledger?.right ?? 0;
+    const surplus = side === "left" ? left - right : right - left;
+    return 100 + streak * 50 + Math.max(0, surplus) * 20;
+}
+function wantedBank(ledger, bibNumber) {
+    if (!ledger?.last)
+        return Math.abs(bibNumber) % 2 === 1 ? "left" : "right";
+    return ledger.last === "left" ? "right" : "left";
+}
+function preferredBank(ledger, bibNumber) {
+    return wantedBank(ledger, bibNumber);
+}
+function bankPressure(ledger) {
+    return (ledger?.streak ?? 0) * 10;
+}
+function rememberBank(banks, slotId, side) {
+    const ledger = banks.get(slotId) ?? { last: null, left: 0, right: 0, streak: 0 };
+    ledger.streak = ledger.last === side ? ledger.streak + 1 : 1;
+    if (side === "left")
+        ledger.left += 1;
+    else
+        ledger.right += 1;
+    ledger.last = side;
+    banks.set(slotId, ledger);
+}
+function matrixBank(state, slotId, round, period) {
+    const bib = state.slots.get(slotId)?.bibNumber ?? 0;
+    let side = Math.abs(bib) % 2 === 1 ? "left" : "right";
+    const sectorSide = new Map();
+    for (let current = 1; current <= period; current += 1) {
+        const duel = state.matrix.find((item) => {
+            if (item.round !== round || item.period !== current)
+                return false;
+            if (item.kind === "pair")
+                return item.leftSlotId === slotId || item.rightSlotId === slotId;
+            return item.loneSlotId === slotId;
+        });
+        if (!duel)
+            continue;
+        if (duel.kind === "pair")
+            side = duel.leftSlotId === slotId ? "left" : "right";
+        else if (current > 1) {
+            const previous = sectorSide.get(duel.sectorId);
+            side = previous ? oppositeSide(previous) : oppositeSide(side);
+        }
+        sectorSide.set(duel.sectorId, side);
+    }
+    return side;
+}
+function repeatWeight(count) {
+    if (count <= 0)
+        return 0;
+    if (count === 1)
+        return 100;
+    if (count === 2)
+        return 280;
+    return 2_000 + count * 100;
+}
+function returnSidePenalty(slotId, sector, sectorSides, banks, bibOf) {
+    const previous = sectorSides.get(slotId)?.get(sector);
+    if (!previous)
+        return 0;
+    const required = oppositeSide(previous);
+    const wanted = wantedBank(banks.get(slotId), bibOf.get(slotId) ?? 0);
+    return required === wanted ? 0 : 70;
+}
+function openSideSectors(leftId, rightId, sectorCount, lastSector, sectorSides) {
+    let open = 0;
+    for (let sector = 0; sector < sectorCount; sector += 1) {
+        if (lastSector.get(leftId) === sector || lastSector.get(rightId) === sector)
+            continue;
+        const left = sectorSides.get(leftId)?.get(sector);
+        const right = sectorSides.get(rightId)?.get(sector);
+        if (left && right && left === right)
+            continue;
+        open += 1;
+    }
+    return open;
+}
+function forcedStreakCost(meet, sector, sectorSides, banks) {
+    const anglers = [meet.leftId, meet.rightId].filter((id) => id !== exports.GHOST_ID);
+    if (anglers.length < 2)
+        return 0;
+    const required = anglers.map((id) => {
+        const previous = sectorSides.get(id)?.get(sector);
+        return previous ? oppositeSide(previous) : null;
+    });
+    const [firstSide, secondSide] = required;
+    const [firstId, secondId] = anglers;
+    if (!firstId || !secondId)
+        return 0;
+    if (firstSide && secondSide) {
+        if (firstSide === secondSide)
+            return 0;
+        return streakExtension(firstId, firstSide, banks) + streakExtension(secondId, secondSide, banks);
+    }
+    if (firstSide)
+        return streakExtension(secondId, oppositeSide(firstSide), banks);
+    if (secondSide)
+        return streakExtension(firstId, oppositeSide(secondSide), banks);
+    return 0;
+}
+function streakExtension(slotId, side, banks) {
+    const ledger = banks.get(slotId);
+    if (!ledger?.last || ledger.last !== side)
+        return 0;
+    if (ledger.streak >= 3)
+        return 1_200;
+    if (ledger.streak === 2)
+        return 450;
+    return 0;
+}
+function sectorSideClash(meet, sector, sectorSides) {
+    const left = sectorSides.get(meet.leftId)?.get(sector);
+    const right = sectorSides.get(meet.rightId)?.get(sector);
+    return left !== undefined && right !== undefined && left === right;
+}
+function consecutiveSector(meet, sector, lastSector) {
+    return [meet.leftId, meet.rightId].some((id) => id !== exports.GHOST_ID && lastSector.get(id) === sector);
+}
+function sectorBank(slotId, sector, sectorSides) {
+    const previous = sectorSides.get(slotId)?.get(sector);
+    return previous ? oppositeSide(previous) : null;
+}
+function sectorSideCost(slotId, side, sector, sectorSides) {
+    const previous = sectorSides.get(slotId)?.get(sector);
+    return previous && previous === side ? 2_000 : 0;
+}
+function oppositeSide(side) {
+    return side === "left" ? "right" : "left";
+}
+function rememberSectorSide(sectorSides, slotId, sector, side) {
+    const visits = sectorSides.get(slotId) ?? new Map();
+    visits.set(sector, side);
+    sectorSides.set(slotId, visits);
+}
+function rememberSector(sectorVisits, lastSector, slotId, sector) {
+    const visits = sectorVisits.get(slotId) ?? [];
+    visits.push(sector);
+    sectorVisits.set(slotId, visits);
+    lastSector.set(slotId, sector);
+}
+function visitCount(sectorVisits, slotId, sector) {
+    return (sectorVisits.get(slotId) ?? []).filter((item) => item === sector).length;
+}
+function crossOrBye(leftId, rightId, bibOf) {
+    if (leftId === exports.GHOST_ID || rightId === exports.GHOST_ID)
+        return true;
+    return !sameParity(leftId, rightId, bibOf);
+}
+function sameParity(leftId, rightId, bibOf) {
+    return Math.abs(bibOf.get(leftId) ?? 0) % 2 === Math.abs(bibOf.get(rightId) ?? 0) % 2;
+}
+function pairKey(leftId, rightId) {
+    return leftId < rightId ? `${leftId}\0${rightId}` : `${rightId}\0${leftId}`;
+}
+function mixSeed(parts) {
+    let seed = 0x9e3779b9;
+    for (const part of parts) {
+        if (typeof part === "number") {
+            seed = Math.imul(seed ^ (part | 0), 0x85ebca6b);
+            continue;
+        }
+        for (let index = 0; index < part.length; index += 1) {
+            seed = Math.imul(seed ^ part.charCodeAt(index), 0x85ebca6b);
+        }
+    }
+    return seed >>> 0;
+}
+function mixRank(seed, ...parts) {
+    let value = seed >>> 0;
+    for (const part of parts)
+        value = Math.imul(value ^ part, 0x45d9f3b);
+    return value >>> 0;
+}
+function gridPlace(slotId, opponentSlotId, side, period, sectorId, bibOf) {
+    return {
+        round: 1,
+        period,
+        groupId: "A",
+        zoneId: "blue",
+        sectorId,
+        slotId,
+        bibNumber: bibOf.get(slotId) ?? 0,
+        side,
+        opponentSlotId,
+    };
+}

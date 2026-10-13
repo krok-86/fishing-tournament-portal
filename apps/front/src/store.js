@@ -978,8 +978,10 @@ export const useMatchStore = create((set, get) => ({
                 };
             }
             const stored = rows.map((row) => row.event);
-            if (!closedQualifyingPeriods(stored, slotId).has(QUALIFYING_PERIOD_COUNT)) {
-                return { ok: false, error: "QR отбора собирается после 8-го периода" };
+            const closed = closedQualifyingPeriods(stored, slotId);
+            if (!allQualifyingPeriodsClosed(closed)) {
+                const saved = QUALIFYING_PERIODS.filter((period) => closed.has(period)).length;
+                return { ok: false, error: `Сначала подтвердите все 8 периодов. Уже сохранено: ${saved} из 8.` };
             }
             const entry = tournamentCalculator.generateLeaderboard(stored).find((item) => item.slotId === slotId);
             const cells = QUALIFYING_PERIODS.map((period) => ({
@@ -1104,7 +1106,7 @@ export const useMatchStore = create((set, get) => ({
             }
             const closed = closedQualifyingPeriods(rows.map((row) => row.event), slotId);
             set({
-                qualifyingHandoffReady: closed.has(QUALIFYING_PERIOD_COUNT),
+                qualifyingHandoffReady: allQualifyingPeriodsClosed(closed),
                 qualifyingSavedCount: QUALIFYING_PERIODS.filter((period) => closed.has(period)).length,
                 cupHandoffReady: false,
             });
@@ -2028,6 +2030,9 @@ async function replacePeriodCatches(tournamentId, round, period, slotIds, events
 }
 function isQualifyingPeriod(period) {
     return QUALIFYING_PERIODS.includes(period);
+}
+function allQualifyingPeriodsClosed(closed) {
+    return QUALIFYING_PERIODS.every((period) => closed.has(period));
 }
 function closedQualifyingPeriods(events, slotId) {
     const closed = new Set();

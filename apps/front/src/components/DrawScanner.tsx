@@ -20,11 +20,13 @@ export function DrawScanner({
   hint,
   onCode,
   onClose,
+  placeholder = "FTPS1.…",
 }: {
   title: string;
   hint: string;
   onCode: (raw: string) => Promise<string | null>;
   onClose: () => void;
+  placeholder?: string;
 }) {
   const [draft, setDraft] = useState("");
   const [cameraNote, setCameraNote] = useState("Нажмите «Включить камеру». Запрос должен идти от кнопки, иначе телефон её не отдаёт.");
@@ -184,7 +186,7 @@ export function DrawScanner({
           id="draw-qr-paste"
           className="mt-2 min-h-20 w-full resize-none rounded-xl border border-white/10 bg-slate-950 px-3 py-2 font-mono text-xs text-white outline-none placeholder:text-slate-500 focus:border-cyan-300"
           value={draft}
-          placeholder="FTPS1.…"
+          placeholder={placeholder}
           onChange={(event) => setDraft(event.target.value)}
         />
         <button

@@ -25,6 +25,7 @@ import {
   type PeriodPhase,
   type PlayoffBracketMatch,
   type PlayoffProjection,
+  type PlayoffSeed,
   type RoundIndex,
   type Side,
   type TournamentEvent,
@@ -37,6 +38,7 @@ import { postMatchReport, type SyncMatch } from "./matchSync.ts";
 import {
   decodeCatchSnapshot,
   decodePeriodSignal,
+  decodePlayoffGrid,
   decodeStartSnapshot,
   encodeCatchSnapshot,
   isTournamentDate,
@@ -151,6 +153,13 @@ interface MatchStore extends SectorView {
     { ok: true; fresh: boolean; label: string } | { ok: false; error: string }
   >;
   /**
+   * Телефон финалиста принимает стартовый QR кубка.
+   * Пишет топ-8 и пары 1/4 в IndexedDB и открывает кубковые матчи.
+   */
+  acceptPlayoffGrid: (payload: string) => Promise<
+    { ok: true; fresh: boolean; label: string } | { ok: false; error: string }
+  >;
+  /**
    * Подтверждение периода игрока или дуэли.
    * `asOrganizer` — ввод поимок в сетке кубка: ФИО на этом телефоне не требуется.
    */
@@ -237,8 +246,75 @@ const emptySector: SectorView = {
   neighborLabel: "",
 };
 
+const TOURNAMENT_ID_KEY = "fishing-portal.tournamentId";
+
+function readStoredTournamentId(): string | null {
+  try {
+    const stored = localStorage.getItem(TOURNAMENT_ID_KEY)?.trim() ?? "";
+    if (stored.length > 0 && stored.length <= 80) return stored;
+  } catch {
+    /* приватный режим или серверный импорт модуля */
+  }
+  return null;
+}
+
+function rememberTournamentId(tournamentId: string): void {
+  try {
+    localStorage.setItem(TOURNAMENT_ID_KEY, tournamentId);
+  } catch {
+    /* приватный режим: идентификатор живёт до перезагрузки */
+  }
+}
+
+function initialTournamentId(): string {
+  return readStoredTournamentId() ?? "local-session";
+}
+
+/** Журнал на телефоне важнее пустого ключа: после перезагрузки остаётся то же соревнование. */
+async function resolveTournamentId(preferred: string): Promise<string> {
+  const preferredCount = await db.events.where("tournamentId").equals(preferred).count();
+  if (preferredCount > 0) return preferred;
+  const latest = await db.events.orderBy("timestamp").reverse().first();
+  const recovered = latest?.tournamentId;
+  if (recovered && recovered !== preferred) {
+    rememberTournamentId(recovered);
+    return recovered;
+  }
+  return preferred;
+}
+
+/**
+ * Раньше все соревнования сидели на одном ключе `local-session`.
+ * Живой журнал переезжает на свой id, чтобы новая архивация не затирала уже сданный отчёт.
+ */
+let placeholderMigration: Promise<string> | null = null;
+
+function separatePlaceholderTournament(): Promise<string> {
+  if (!placeholderMigration) placeholderMigration = movePlaceholderTournament();
+  return placeholderMigration;
+}
+
+async function movePlaceholderTournament(): Promise<string> {
+  const rows = await db.events.where("tournamentId").equals("local-session").toArray();
+  const nextId = crypto.randomUUID();
+  if (rows.length > 0) {
+    await db.transaction("rw", db.events, async () => {
+      await Promise.all(
+        rows.map((row) =>
+          db.events.update(row.id, {
+            tournamentId: nextId,
+            event: { ...row.event, tournamentId: nextId },
+          }),
+        ),
+      );
+    });
+  }
+  rememberTournamentId(nextId);
+  return nextId;
+}
+
 export const useMatchStore = create<MatchStore>((set, get) => ({
-  tournamentId: "local-session",
+  tournamentId: initialTournamentId(),
   ...emptySector,
   playerNamedSlotIds: [],
   round: 1,
@@ -412,6 +488,7 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
 
   async acceptOrganizerCode(payload) {
     const text = payload.trim();
+    if (text.replace(/\s+/g, "").startsWith("FTPC1")) return importPlayoffGrid(get, set, text);
     if (text.startsWith("FTPP1")) {
       const decoded = decodePeriodSignal(text);
       if (!decoded.ok) return decoded;
@@ -427,6 +504,12 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
       return { ok: false, error: "Это код результатов игрока, а не жеребьёвка организатора" };
     }
     return { ok: false, error: "Это не код организатора" };
+  },
+
+  async acceptPlayoffGrid(payload) {
+    const compact = payload.trim().replace(/\s+/g, "");
+    if (!compact.startsWith("FTPC1")) return { ok: false, error: "Это не стартовый код плей-офф" };
+    return importPlayoffGrid(get, set, payload.trim());
   },
 
   async confirmPeriod(asOrganizer) {
@@ -522,7 +605,9 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
   },
 
   async hydrate() {
-    const tournamentId = get().tournamentId;
+    let tournamentId = await resolveTournamentId(get().tournamentId);
+    if (tournamentId === "local-session") tournamentId = await separatePlaceholderTournament();
+    if (tournamentId !== get().tournamentId) set({ tournamentId });
     try {
       const rows = await db.events.where("tournamentId").equals(tournamentId).sortBy("timestamp");
       const stored = rows.map((row) => row.event);
@@ -783,7 +868,10 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
       await db.events.clear();
       await db.outboxQueue.clear();
       await db.duelConflicts.clear();
+      const tournamentId = crypto.randomUUID();
+      rememberTournamentId(tournamentId);
       set({
+        tournamentId,
         ...emptySector,
         round: 1,
         period: 1,
@@ -1055,7 +1143,7 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
         events,
       });
       if (!snapshot) return { ok: false, error: "Сначала завершите финал и матч за 3-е место" };
-      return await postTournamentArchive(snapshot);
+      return await postTournamentArchive(snapshot, state.tournamentId);
     } catch (error) {
       return {
         ok: false,
@@ -1177,19 +1265,17 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
       if (state.playoff.formed) {
         const playoffCells = playoffSnapshot(state, rows, slotId);
         if (playoffCells.length === 0) return { ok: false, error: "Сначала сохраните кубковый матч" };
-      const mark = currentPeriodMark(state);
-      const athleteName = state.playerNamedSlotIds.includes(participant.slotId) ? participant.displayName : null;
-      return {
-        ok: true,
-        packet: {
-          payload: encodePlayoffSnapshot(participant.bibNumber, playoffCells, mark, athleteName),
+        const athleteName = state.playerNamedSlotIds.includes(participant.slotId) ? participant.displayName : null;
+        return {
+          ok: true,
+          packet: {
+            payload: encodePlayoffSnapshot(participant.bibNumber, playoffCells, null, athleteName),
             bibNumber: participant.bibNumber,
             displayName: participant.displayName,
             fish: totalFish(playoffCells),
             periods: playoffCells.length,
             cells: [],
             playoffCells,
-            markLabel: periodStatusLabel(mark.period, mark.phase),
           },
         };
       }
@@ -1231,6 +1317,9 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
 
   async importAthleteResults(payload) {
     const trimmed = payload.trim();
+    if (trimmed.replace(/\s+/g, "").startsWith("FTPC1")) {
+      return { ok: false, error: "Это стартовый код сетки плей-офф. Его сканирует телефон финалиста." };
+    }
     if (trimmed.startsWith("FTPS1") || trimmed.startsWith("FTPP1")) {
       return { ok: false, error: "Это код жеребьёвки или сигнала периода. Его сканирует телефон игрока." };
     }
@@ -3015,6 +3104,143 @@ function publishedPeriod(events: readonly TournamentEvent[]): {
   );
   if (!officiallyStarted) return { period: 1, phase: "waiting", officiallyStarted: false };
   return { ...readPeriodSignal(events), officiallyStarted: true };
+}
+
+async function importPlayoffGrid(
+  get: () => MatchStore,
+  set: (partial: Partial<MatchStore>) => void,
+  payload: string,
+): Promise<{ ok: true; fresh: boolean; label: string } | { ok: false; error: string }> {
+  const decoded = await decodePlayoffGrid(payload);
+  if (!decoded.ok) return decoded;
+  const state = get();
+  if (!state.tournamentOpened) return { ok: false, error: "Сначала сканируйте стартовый QR с жеребьёвкой" };
+  if (state.saving || state.setupSaving || state.signalSaving) return { ok: false, error: "Журнал сейчас занят" };
+
+  const identity = state.playoff.formed ? state.selfSlotId || state.athleteSlotId : state.athleteSlotId;
+  if (!state.playoff.formed) {
+    if (!identity) return { ok: false, error: "Сначала выберите свой номер и закройте 8 периодов" };
+    const rows = await db.events.where("tournamentId").equals(state.tournamentId).sortBy("timestamp");
+    const closed = closedQualifyingPeriods(
+      rows.map((row) => row.event),
+      identity,
+    );
+    if (!allQualifyingPeriodsClosed(closed)) {
+      return { ok: false, error: "Сначала подтвердите все 8 периодов отбора" };
+    }
+  }
+
+  const byBib = new Map(state.participants.map((person) => [person.bibNumber, person]));
+  const seeds: PlayoffSeed[] = [];
+  for (const player of [...decoded.snapshot.players].sort((left, right) => left.seed - right.seed)) {
+    const local = byBib.get(player.bibNumber);
+    if (!local) return { ok: false, error: `Игрока №${player.bibNumber} нет на этом телефоне. Сначала отсканируйте жеребьёвку.` };
+    if (local.ghost) return { ok: false, error: `Игрок №${player.bibNumber} отмечен как не пришедший` };
+    seeds.push({ slotId: local.slotId, place: player.place, seed: player.seed });
+  }
+  const quarterfinals = buildQuarterfinals(seeds);
+  if (!quarterfinals) return { ok: false, error: "Не удалось собрать пары 1/4 из кода сетки" };
+
+  const bibOf = (slotId: string) => state.participants.find((person) => person.slotId === slotId)?.bibNumber;
+  const incomingKey = playoffSeedKey(seeds, bibOf);
+  const existingKey = state.playoff.formed ? playoffSeedKey(state.playoff.seeds, bibOf) : null;
+  if (state.playoff.formed && incomingKey !== null && incomingKey === existingKey) {
+    focusCupMatch(get, set, seeds, identity);
+    return { ok: true, fresh: false, label: "Сетка плей-офф уже на телефоне" };
+  }
+
+  const rows = await db.events.where("tournamentId").equals(state.tournamentId).sortBy("timestamp");
+  const stored = rows.map((row) => row.event);
+  const scored = stored.some((event) => event.type === "PLAYOFF_DUEL_SCORED" || event.type === "PLAYOFF_SIDE_REPORTED");
+  if (state.playoff.formed && scored) {
+    return { ok: false, error: "На телефоне уже другая сетка, в ней есть результаты" };
+  }
+
+  const timestamp = Date.now();
+  const events: TournamentEvent[] = [];
+  let participants = state.participants.map((person) => ({ ...person }));
+  for (const player of decoded.snapshot.players) {
+    const local = participants.find((person) => person.bibNumber === player.bibNumber);
+    if (!local) continue;
+    if (isRealAthleteName(local.displayName, local.bibNumber) || !isRealAthleteName(player.displayName, player.bibNumber)) continue;
+    if (local.displayName === player.displayName) continue;
+    events.push({
+      id: crypto.randomUUID(),
+      tournamentId: state.tournamentId,
+      type: "PARTICIPANT_REPLACED",
+      timestamp: timestamp + events.length,
+      payload: { slotId: local.slotId, displayName: player.displayName },
+    });
+    participants = participants.map((person) =>
+      person.slotId === local.slotId ? { ...person, displayName: player.displayName } : person,
+    );
+  }
+  events.push({
+    id: crypto.randomUUID(),
+    tournamentId: state.tournamentId,
+    type: "FORM_PLAYOFF",
+    timestamp: timestamp + events.length,
+    payload: { seeds, quarterfinals },
+  });
+
+  set({ setupSaving: true, setupError: null, error: null });
+  try {
+    const previousForms = rows.filter((row) => row.event.type === "FORM_PLAYOFF").map((row) => row.id);
+    await db.transaction("rw", db.events, async () => {
+      if (previousForms.length > 0) await db.events.bulkDelete(previousForms);
+      await db.events.bulkAdd(events.map(toRecord));
+    });
+    const playoff = projectPlayoff([...stored.filter((event) => event.type !== "FORM_PLAYOFF"), ...events]);
+    set({
+      setupSaving: false,
+      participants,
+      playoff,
+      playoffError: null,
+      playoffEntryOpen: false,
+    });
+    focusCupMatch(get, set, seeds, identity);
+    await get().loadLeaderboard();
+    await get().refreshHandoff();
+    return { ok: true, fresh: false, label: "Сетка плей-офф записана" };
+  } catch (error) {
+    set({
+      setupSaving: false,
+      error: error instanceof Error ? error.message : "Не удалось записать сетку плей-офф",
+    });
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : "Не удалось записать сетку плей-офф",
+    };
+  }
+}
+
+function playoffSeedKey(
+  seeds: readonly { slotId: string; place: number; seed: number }[],
+  bibOf: (slotId: string) => number | undefined,
+): string | null {
+  const parts: string[] = [];
+  for (const seed of [...seeds].sort((left, right) => left.seed - right.seed)) {
+    const bib = bibOf(seed.slotId);
+    if (!bib) return null;
+    parts.push(`${seed.seed}:${bib}:${seed.place}`);
+  }
+  return parts.join(",");
+}
+
+function focusCupMatch(
+  get: () => MatchStore,
+  set: (partial: Partial<MatchStore>) => void,
+  seeds: readonly { slotId: string }[],
+  identity: string,
+): void {
+  const inCup = identity.length > 0 && seeds.some((seed) => seed.slotId === identity);
+  if (inCup) set({ selfSlotId: identity });
+  const playoff = get().playoff;
+  const mine = inCup
+    ? playoff.quarterfinals.find((match) => match.slotIdA === identity || match.slotIdB === identity)
+    : undefined;
+  const opening = mine ?? playoff.quarterfinals[0];
+  if (opening) get().selectPlayoffMatch(opening.matchId);
 }
 
 async function importStartDraw(

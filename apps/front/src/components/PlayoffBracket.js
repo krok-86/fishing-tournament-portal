@@ -113,7 +113,9 @@ export function PlayoffBracket({ snapshot = null, onArchive, archiving = false, 
 
       {podium}
 
-      <div className="overflow-x-auto rounded-3xl border border-white/10 bg-slate-950/80 p-3 shadow-xl shadow-black/30 sm:p-6">
+      <MobilePlayoffRounds quarter={quarter} semi={semi} finalMatch={playoff.final} thirdPlace={playoff.thirdPlace} nameOf={nameOf} activeMatchId={activeMatchId} openMatch={openMatch}/>
+
+      <div className="scrollbar-thin hidden overflow-x-auto rounded-3xl border border-white/10 bg-slate-950/80 p-3 shadow-xl shadow-black/30 sm:p-6 lg:block">
         <div className="flex w-max items-center gap-x-8 pb-16">
           <div className="relative flex flex-col gap-8">
             <BracketHalf left={[quarter[0], quarter[3]]} right={semi[0]} nameOf={nameOf} activeMatchId={activeMatchId} openMatch={openMatch}/>
@@ -150,6 +152,32 @@ export function PlayoffBracket({ snapshot = null, onArchive, archiving = false, 
           Подиум, итоговая таблица и кнопка «Завершить и архивировать турнир» появятся, когда будут сыграны финал и матч за 3-е место.
         </p>)}
     </section>);
+}
+function MobilePlayoffRounds({ quarter, semi, finalMatch, thirdPlace, nameOf, activeMatchId, openMatch, }) {
+    const rounds = [
+        { id: "quarterfinal", label: "1/4 Финала", matches: quarter },
+        { id: "semifinal", label: "1/2 Финала", matches: semi },
+        { id: "final", label: "Финал", matches: [finalMatch] },
+    ];
+    const [round, setRound] = useState("quarterfinal");
+    const selected = rounds.find((item) => item.id === round) ?? rounds[0];
+    return (<div className="lg:hidden">
+      <div className="grid grid-cols-3 gap-1 rounded-2xl bg-slate-900 p-1" role="tablist" aria-label="Стадии плей-офф">
+        {rounds.map((item) => {
+            const active = item.id === selected.id;
+            return (<button key={item.id} type="button" role="tab" aria-selected={active} className={`min-h-12 rounded-xl px-1 text-[11px] leading-tight font-black sm:text-xs ${active ? "bg-cyan-300 text-slate-950" : "text-slate-300"}`} onClick={() => setRound(item.id)}>
+              {item.label}
+            </button>);
+        })}
+      </div>
+      <div className="mt-3 grid gap-3" role="tabpanel">
+        {selected.matches.map((match) => (<MatchCard key={match.matchId} match={match} nameOf={nameOf} featured={match.stage === "final"} active={activeMatchId === match.matchId} onOpen={openMatch(match)}/>))}
+        {selected.id === "final" && (<div className="grid gap-2">
+            <p className="text-center text-[11px] font-black tracking-[0.2em] text-amber-200 uppercase">Матч за 3-е место</p>
+            <MatchCard match={thirdPlace} nameOf={nameOf} bronze active={activeMatchId === thirdPlace.matchId} onOpen={openMatch(thirdPlace)}/>
+          </div>)}
+      </div>
+    </div>);
 }
 const NAME_REQUIRED = "Выберите номер и введите ФИО";
 export function PlayoffEntryDialog({ organizer = false } = {}) {
@@ -225,7 +253,7 @@ export function PlayoffEntryDialog({ organizer = false } = {}) {
     const visibleError = organizer && error === NAME_REQUIRED ? null : error;
     const markRegulation = () => setRegulationReadyId(match.matchId);
     return (<div className="pointer-events-none fixed inset-x-0 bottom-0 z-50 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
-      <section role="dialog" aria-labelledby="playoff-entry-title" className="pointer-events-auto mx-auto max-h-[min(92dvh,44rem)] w-full max-w-lg overflow-y-auto rounded-3xl border border-cyan-300/40 bg-slate-900 p-4 shadow-2xl shadow-black/60">
+      <section role="dialog" aria-labelledby="playoff-entry-title" className={`pointer-events-auto mx-auto max-h-[min(92dvh,44rem)] w-full overflow-y-auto rounded-3xl border border-cyan-300/40 bg-slate-900 p-4 shadow-2xl shadow-black/60 ${organizer ? "lg:max-w-3xl" : "max-w-lg"}`}>
         <div className="flex items-start justify-between gap-3">
           <div>
             <p className="text-[11px] font-bold tracking-[0.16em] text-cyan-200 uppercase">Поимки этапа</p>
@@ -240,14 +268,14 @@ export function PlayoffEntryDialog({ organizer = false } = {}) {
 
         <p className="mt-2 text-xs font-semibold tracking-wide text-slate-400 uppercase">Основное время</p>
         <div className="mt-2 grid gap-2">
-          <CatchRow slotId={match.slotIdA} bibNumber={athlete?.bibNumber ?? 0} displayName={athlete?.displayName ?? athleteTitle} place={match.placeA} count={athleteFish} disabled={saving} canRename={organizer && athlete !== undefined} onPlus={() => {
+          <CatchRow slotId={match.slotIdA} bibNumber={athlete?.bibNumber ?? 0} displayName={athlete?.displayName ?? athleteTitle} place={match.placeA} count={athleteFish} disabled={saving} roomy={organizer} canRename={organizer && athlete !== undefined} onPlus={() => {
             markRegulation();
             adjustFish("athlete", 1);
         }} onMinus={() => {
             markRegulation();
             adjustFish("athlete", -1);
         }}/>
-          <CatchRow slotId={match.slotIdB} bibNumber={opponent?.bibNumber ?? 0} displayName={opponent?.displayName ?? opponentTitle} place={match.placeB} count={opponentFish} disabled={saving} canRename={organizer && opponent !== undefined} onPlus={() => {
+          <CatchRow slotId={match.slotIdB} bibNumber={opponent?.bibNumber ?? 0} displayName={opponent?.displayName ?? opponentTitle} place={match.placeB} count={opponentFish} disabled={saving} roomy={organizer} canRename={organizer && opponent !== undefined} onPlus={() => {
             markRegulation();
             adjustFish("opponent", 1);
         }} onMinus={() => {
@@ -268,8 +296,8 @@ export function PlayoffEntryDialog({ organizer = false } = {}) {
           <div className="rounded-2xl border border-amber-300/30 bg-amber-300/10 p-3">
             <p className="text-sm font-semibold text-amber-50">Равный счет. Введите результат дополнительной 5-минутки</p>
             <div className="mt-2 grid gap-2">
-              <CatchRow slotId={match.slotIdA} bibNumber={athlete?.bibNumber ?? 0} displayName={athletePerson} place={match.placeA} count={athleteExtraFish} disabled={saving} canRename={false} onPlus={() => adjustPlayoffLine("extra", "athlete", 1)} onMinus={() => adjustPlayoffLine("extra", "athlete", -1)}/>
-              <CatchRow slotId={match.slotIdB} bibNumber={opponent?.bibNumber ?? 0} displayName={opponentPerson} place={match.placeB} count={opponentExtraFish} disabled={saving} canRename={false} onPlus={() => adjustPlayoffLine("extra", "opponent", 1)} onMinus={() => adjustPlayoffLine("extra", "opponent", -1)}/>
+              <CatchRow slotId={match.slotIdA} bibNumber={athlete?.bibNumber ?? 0} displayName={athletePerson} place={match.placeA} count={athleteExtraFish} disabled={saving} roomy={organizer} canRename={false} onPlus={() => adjustPlayoffLine("extra", "athlete", 1)} onMinus={() => adjustPlayoffLine("extra", "athlete", -1)}/>
+              <CatchRow slotId={match.slotIdB} bibNumber={opponent?.bibNumber ?? 0} displayName={opponentPerson} place={match.placeB} count={opponentExtraFish} disabled={saving} roomy={organizer} canRename={false} onPlus={() => adjustPlayoffLine("extra", "opponent", 1)} onMinus={() => adjustPlayoffLine("extra", "opponent", -1)}/>
             </div>
             {!extraTied && winnerName && (<p className="mt-2 text-sm font-semibold text-amber-50">Дальше проходит {winnerName}: победа в доп. время.</p>)}
           </div>
@@ -279,14 +307,14 @@ export function PlayoffEntryDialog({ organizer = false } = {}) {
           <div className="rounded-2xl border border-yellow-200/40 bg-yellow-200/10 p-3">
             <p className="text-sm font-semibold text-yellow-50">Ничья в овертайме. Введите результат игры "Золотая рыба"</p>
             <div className="mt-2 grid gap-2">
-              <CatchRow slotId={match.slotIdA} bibNumber={athlete?.bibNumber ?? 0} displayName={athletePerson} place={match.placeA} count={athleteGoldenFish} disabled={saving} canRename={false} onPlus={() => adjustPlayoffLine("golden", "athlete", 1)} onMinus={() => adjustPlayoffLine("golden", "athlete", -1)}/>
-              <CatchRow slotId={match.slotIdB} bibNumber={opponent?.bibNumber ?? 0} displayName={opponentPerson} place={match.placeB} count={opponentGoldenFish} disabled={saving} canRename={false} onPlus={() => adjustPlayoffLine("golden", "opponent", 1)} onMinus={() => adjustPlayoffLine("golden", "opponent", -1)}/>
+              <CatchRow slotId={match.slotIdA} bibNumber={athlete?.bibNumber ?? 0} displayName={athletePerson} place={match.placeA} count={athleteGoldenFish} disabled={saving} roomy={organizer} canRename={false} onPlus={() => adjustPlayoffLine("golden", "athlete", 1)} onMinus={() => adjustPlayoffLine("golden", "athlete", -1)}/>
+              <CatchRow slotId={match.slotIdB} bibNumber={opponent?.bibNumber ?? 0} displayName={opponentPerson} place={match.placeB} count={opponentGoldenFish} disabled={saving} roomy={organizer} canRename={false} onPlus={() => adjustPlayoffLine("golden", "opponent", 1)} onMinus={() => adjustPlayoffLine("golden", "opponent", -1)}/>
             </div>
-            {goldenTied && athleteGoldenFish > 0 && (<div className="mt-2 grid grid-cols-2 gap-2">
-                <button type="button" className={`rounded-xl px-2 py-2 text-sm font-bold ${goldenFirst === "a" ? "bg-yellow-200 text-slate-950" : "bg-slate-950 text-yellow-50"}`} aria-pressed={goldenFirst === "a"} onClick={() => setGoldenFirst("a")}>
+            {goldenTied && athleteGoldenFish > 0 && (<div className={`mt-2 grid gap-2 ${organizer ? "grid-cols-1 sm:grid-cols-2" : "grid-cols-2"}`}>
+                <button type="button" className={`w-full rounded-xl px-2 text-sm font-bold ${organizer ? "min-h-14 py-3" : "py-2"} ${goldenFirst === "a" ? "bg-yellow-200 text-slate-950" : "bg-slate-950 text-yellow-50"}`} aria-pressed={goldenFirst === "a"} onClick={() => setGoldenFirst("a")}>
                   Первым поймал {athletePerson}
                 </button>
-                <button type="button" className={`rounded-xl px-2 py-2 text-sm font-bold ${goldenFirst === "b" ? "bg-yellow-200 text-slate-950" : "bg-slate-950 text-yellow-50"}`} aria-pressed={goldenFirst === "b"} onClick={() => setGoldenFirst("b")}>
+                <button type="button" className={`w-full rounded-xl px-2 text-sm font-bold ${organizer ? "min-h-14 py-3" : "py-2"} ${goldenFirst === "b" ? "bg-yellow-200 text-slate-950" : "bg-slate-950 text-yellow-50"}`} aria-pressed={goldenFirst === "b"} onClick={() => setGoldenFirst("b")}>
                   Первым поймал {opponentPerson}
                 </button>
               </div>)}
@@ -389,7 +417,7 @@ function MatchSide({ name, place, fish, winner, waiting, goldenTie = false, trop
       </span>
     </div>);
 }
-function CatchRow({ slotId, bibNumber, displayName, place, count, disabled, canRename, onPlus, onMinus, }) {
+function CatchRow({ slotId, bibNumber, displayName, place, count, disabled, roomy = false, canRename, onPlus, onMinus, }) {
     const replaceParticipant = useMatchStore((state) => state.replaceParticipant);
     const [editing, setEditing] = useState(false);
     const [draft, setDraft] = useState(displayName);
@@ -418,7 +446,7 @@ function CatchRow({ slotId, bibNumber, displayName, place, count, disabled, canR
         setEditing(false);
         toast("ok", "ФИО сохранено");
     }
-    return (<div className="flex items-center gap-2 rounded-2xl bg-slate-950 px-3 py-2">
+    return (<div className={`flex w-full items-center gap-2 rounded-2xl bg-slate-950 px-3 ${roomy ? "py-3" : "py-2"}`}>
       <div className="min-w-0 flex-1">
         {editing ? (<form className="flex items-center gap-1" onSubmit={(event) => void saveName(event)}>
             <span className="shrink-0 text-sm font-black tabular-nums text-cyan-100">{bibNumber}.</span>
@@ -439,11 +467,11 @@ function CatchRow({ slotId, bibNumber, displayName, place, count, disabled, canR
           </div>)}
         <p className="text-[11px] font-semibold text-slate-400">Место отбора {place}</p>
       </div>
-      <button type="button" className="h-11 w-11 rounded-xl bg-rose-500 text-lg font-black text-white disabled:opacity-40" disabled={disabled || editing || count === 0} onClick={onMinus} aria-label={`Минус, ${title}`}>
+      <button type="button" className={`${roomy ? "h-14 w-14 shrink-0 rounded-2xl text-2xl" : "h-11 w-11 rounded-xl text-lg"} bg-rose-500 font-black text-white disabled:opacity-40`} disabled={disabled || editing || count === 0} onClick={onMinus} aria-label={`Минус, ${title}`}>
         −
       </button>
-      <p className="w-8 text-center text-2xl font-black tabular-nums">{count}</p>
-      <button type="button" className="h-11 w-11 rounded-xl bg-emerald-400 text-lg font-black text-slate-950 disabled:opacity-40" disabled={disabled || editing} onClick={onPlus} aria-label={`Плюс, ${title}`}>
+      <p className={`${roomy ? "w-12 text-3xl" : "w-8 text-2xl"} text-center font-black tabular-nums`}>{count}</p>
+      <button type="button" className={`${roomy ? "h-14 w-14 shrink-0 rounded-2xl text-2xl" : "h-11 w-11 rounded-xl text-lg"} bg-emerald-400 font-black text-slate-950 disabled:opacity-40`} disabled={disabled || editing} onClick={onPlus} aria-label={`Плюс, ${title}`}>
         +
       </button>
     </div>);

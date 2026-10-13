@@ -6,6 +6,7 @@ import { Leaderboard } from "./components/Leaderboard.tsx";
 import { PlayoffEntryDialog, playoffStageTitle } from "./components/PlayoffBracket.tsx";
 import { QrIntake } from "./components/QrIntake.tsx";
 import { Toaster } from "./components/Toaster.tsx";
+import { TournamentHistory } from "./components/TournamentHistory.tsx";
 import { TournamentInit } from "./components/TournamentInit.tsx";
 import { registerOnline } from "./onlineRoster.ts";
 import { fetchMatchSync } from "./matchSync.ts";
@@ -20,7 +21,7 @@ const OUTBOX_FLUSH_MS = 45_000;
 const MATCH_SYNC_MS = 30_000;
 
 type Surface = "player" | "organizer";
-type OrganizerTab = "setup" | "scan" | "table";
+type OrganizerTab = "setup" | "scan" | "table" | "history";
 
 /** Игрок открывает `/` или `#/`. Организатор — путь или хэш `admin-secret-setup`, чтобы офлайн-PWA не зависела от сервера. */
 function readSurface(location: Pick<Location, "pathname" | "hash">): Surface {
@@ -107,6 +108,16 @@ function App() {
   );
 }
 
+async function takePlayoffGrid(raw: string): Promise<string | null> {
+  const result = await useMatchStore.getState().acceptPlayoffGrid(raw);
+  if (!result.ok) {
+    toast("err", result.error);
+    return result.error;
+  }
+  toast("ok", result.label);
+  return null;
+}
+
 async function takeOrganizerCode(raw: string): Promise<string | null> {
   const result = await useMatchStore.getState().acceptOrganizerCode(raw);
   if (!result.ok) {
@@ -117,10 +128,20 @@ async function takeOrganizerCode(raw: string): Promise<string | null> {
   return null;
 }
 
+function AdminBanner() {
+  return (
+    <header className="rounded-3xl bg-gradient-to-br from-[#4a0c16] to-[#8f1d2c] px-4 py-6 text-center shadow-lg ring-1 ring-red-200/25">
+      <h1 className="text-3xl leading-tight font-black tracking-wide text-white uppercase sm:text-4xl">
+        Панель администратора
+      </h1>
+    </header>
+  );
+}
+
 function OrganizerScreen() {
   const [tab, setTab] = useState<OrganizerTab>("setup");
   const tournamentOpened = useMatchStore((state) => state.tournamentOpened);
-  const wide = tab === "table";
+  const wide = tab === "setup" || tab === "table" || tab === "history";
 
   useEffect(() => {
     if (!tournamentOpened) return;
@@ -143,7 +164,8 @@ function OrganizerScreen() {
     <main
       className={`mx-auto flex min-h-dvh w-full flex-col bg-slate-950 px-3 pt-[max(0.75rem,env(safe-area-inset-top))] pb-[max(0.75rem,env(safe-area-inset-bottom))] text-white sm:px-6 ${wide ? "max-w-[90rem]" : "max-w-lg"}`}
     >
-      <div className="grid grid-cols-3 gap-1 rounded-2xl bg-slate-900 p-1" role="tablist" aria-label="Организатор">
+      <AdminBanner />
+      <div className="mt-4 grid grid-cols-2 gap-1 rounded-2xl bg-slate-900 p-1 sm:grid-cols-4" role="tablist" aria-label="Организатор">
         <TabButton active={tab === "setup"} onClick={() => setTab("setup")}>
           Настройка турнира
         </TabButton>
@@ -159,6 +181,9 @@ function OrganizerScreen() {
         <TabButton active={tab === "table"} onClick={() => setTab("table")}>
           Таблица лидеров
         </TabButton>
+        <TabButton active={tab === "history"} onClick={() => setTab("history")}>
+          История турниров
+        </TabButton>
       </div>
       {tab === "setup" ? (
         <TournamentInit />
@@ -166,14 +191,16 @@ function OrganizerScreen() {
         <section className="mt-4 flex flex-1 flex-col">
           <h2 className="text-lg font-black tracking-tight sm:text-2xl">Сканировать QR</h2>
           <p className="mt-1 text-xs text-slate-400 sm:text-sm">
-            После 8-го периода игрок сдаёт один код за весь отбор. Кубковый матч приходит отдельным кодом сразу после дуэли.
+            После 8-го периода игрок сдаёт один код за весь отбор. Кубковый матч приходит строкой FTP1|номер|QF|пара=рыбы, а также SF и F: поимка сразу встаёт в сетку, и победитель проходит дальше.
           </p>
           <div className="mt-4">
             <QrIntake />
           </div>
         </section>
-      ) : (
+      ) : tab === "table" ? (
         <Leaderboard />
+      ) : (
+        <TournamentHistory canDelete />
       )}
       <PlayoffEntryDialog organizer />
     </main>
@@ -197,14 +224,29 @@ function PlayerScreen() {
   const tournamentOpened = useMatchStore((state) => state.tournamentOpened);
   const adjustFish = useMatchStore((state) => state.adjustFish);
   const confirmPeriod = useMatchStore((state) => state.confirmPeriod);
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   return (
     <main className="mx-auto flex min-h-dvh w-full max-w-lg flex-col bg-slate-950 px-3 pt-[max(0.75rem,env(safe-area-inset-top))] pb-[max(0.75rem,env(safe-area-inset-bottom))] text-white sm:px-6">
-      {hydrated && tournamentOpened && <ConnectedTournament />}
-      <p className="px-1 text-xs font-bold tracking-[0.2em] text-cyan-200/80 uppercase">Игрок</p>
-      {!hydrated ? (
+      <header className="rounded-3xl border border-emerald-400/25 bg-gradient-to-br from-slate-900 via-slate-950 to-emerald-950 px-4 py-5 text-center shadow-lg">
+        <h1 className="text-2xl leading-tight font-black tracking-wide text-emerald-200 uppercase sm:text-3xl">
+          Карточка участника
+        </h1>
+        <button
+          type="button"
+          className="mt-3 rounded-full border border-emerald-300/30 px-3 py-2 text-xs font-black text-emerald-100"
+          onClick={() => setHistoryOpen((open) => !open)}
+        >
+          {historyOpen ? "К турниру" : "История турниров"}
+        </button>
+      </header>
+      {historyOpen ? (
+        <TournamentHistory canDelete={false} />
+      ) : !hydrated ? (
         <p className="mt-4 text-sm text-slate-400">Читаем журнал…</p>
       ) : tournamentOpened ? (
+        <>
+        <ConnectedTournament />
         <JudgeScreen
           sectorLabel={sectorLabel}
           sideLabel={sideLabel}
@@ -222,6 +264,7 @@ function PlayerScreen() {
           adjustFish={adjustFish}
           confirmPeriod={confirmPeriod}
         />
+        </>
       ) : (
         <AwaitingDraw />
       )}
@@ -411,6 +454,8 @@ function JudgeScreen({
   const playoffEntryOpen = useMatchStore((state) => state.playoffEntryOpen);
   const openPlayoffEntry = useMatchStore((state) => state.openPlayoffEntry);
   const closePlayoffEntry = useMatchStore((state) => state.closePlayoffEntry);
+  const qualifyingHandoffReady = useMatchStore((state) => state.qualifyingHandoffReady);
+  const [cupScan, setCupScan] = useState(false);
   const playoffFormed = playoff.formed;
   const playerNamedSlotIds = useMatchStore((state) => state.playerNamedSlotIds);
   const identitySlotId = playoffFormed ? selfSlotId : athleteSlotId;
@@ -454,6 +499,36 @@ function JudgeScreen({
       )}
 
       <PeriodStatus playoffFormed={playoffFormed} period={period} />
+
+      {!playoffFormed && qualifyingHandoffReady && (
+        <div className="mt-4">
+          {cupScan ? (
+            <DrawScanner
+              title="Сетка Плей-офф"
+              hint="Наведите камеру на стартовый QR плей-офф с ноутбука организатора."
+              placeholder="FTPC1.…"
+              onCode={takePlayoffGrid}
+              onClose={() => setCupScan(false)}
+            />
+          ) : (
+            <>
+              <button
+                type="button"
+                className="h-16 w-full rounded-2xl bg-cyan-300 text-lg font-black text-slate-950"
+                onClick={() => {
+                  primeScanBeep();
+                  setCupScan(true);
+                }}
+              >
+                Сканировать сетку Плей-офф
+              </button>
+              <p className="mt-2 text-center text-sm leading-relaxed text-slate-300">
+                8 периодов отбора закрыты. Код с ноутбука орга запишет топ-8 и пары 1/4 в этот телефон.
+              </p>
+            </>
+          )}
+        </div>
+      )}
 
       {playoffFormed && (
         <>

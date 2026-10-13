@@ -35,15 +35,21 @@ export function buildParticipantCards(participants, grid, leaderboard) {
         displayName: participant.displayName,
         periods: QUALIFYING_PERIODS.map((period) => {
             const seat = periodSeat(grid, participants, participant.slotId, period);
+            const drawn = grid.find((slot) => slot.round === 1 && slot.period === period && slot.slotId === participant.slotId);
             const bergerId = seat?.bergerOpponentSlotId ?? null;
             const scoringId = seat?.opponentSlotId ?? null;
             const fish = facingFish(leaderboard, participant.slotId, period, scoringId);
-            const opponentBib = bergerId && !isGhostOpponent(bergerId) ? (bibOf.get(bergerId) ?? null) : null;
+            const berger = bergerId ? participants.find((person) => person.slotId === bergerId) : undefined;
+            const opponentMissing = !berger || berger.ghost || isGhostOpponent(bergerId);
+            const opponentBib = !opponentMissing && berger ? berger.bibNumber : null;
+            const compareBib = opponentMissing && scoringId && !isGhostOpponent(scoringId) ? (bibOf.get(scoringId) ?? null) : null;
             return {
                 period,
                 sectorId: seat?.sectorId ?? "",
+                bank: drawn?.side === "left" ? "л" : drawn?.side === "right" ? "п" : null,
                 opponentSlotId: bergerId,
                 opponentBib,
+                compareBib,
                 ownFish: fish.ownFish,
                 opponentFish: fish.opponentFish,
                 points: fish.points,
@@ -83,7 +89,7 @@ export function prepareTournamentGridXlsx(cards) {
         rows,
     };
 }
-export function ProtocolExportButtons({ grid, middle }) {
+export function ProtocolExportButtons({ grid, middle, }) {
     const participants = useMatchStore((state) => state.participants);
     const leaderboard = useMatchStore((state) => state.leaderboard);
     const storeGrid = useMatchStore((state) => state.grid);

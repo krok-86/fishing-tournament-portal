@@ -19,6 +19,7 @@ import { QUALIFYING_PERIOD_COUNT } from "../../../packages/shared/src/types.ts";
  *
  * Стартовый код орга: FTPS1.<сжатая сетка Бергера и стартовый лист>
  * Сигнал периода: FTPP1|<период>|<W|F|C>
+ * Стартовый код кубка: FTPC1.<сжатый топ-8 и пары 1/4>. Номер жеребьёвки, не slotId.
  */
 const PREFIX = "FTP1";
 const MAX_FISH = 9999;
@@ -682,6 +683,173 @@ function base64UrlToBytes(value: string): Uint8Array {
   const bytes = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
   return bytes;
+}
+
+/** Пары 1/4: 1–8, 2–7, 3–6, 4–5. Совпадает с сеткой, которую пишет «Сформировать Плей-офф». */
+const CUP_PAIR_SEEDS: readonly (readonly [number, number])[] = [
+  [1, 8],
+  [2, 7],
+  [3, 6],
+  [4, 5],
+];
+
+export interface PlayoffGridPlayer {
+  bibNumber: number;
+  displayName: string;
+  place: number;
+  seed: number;
+}
+
+export interface PlayoffGridPair {
+  /** Номер четвертьфинала с 1. */
+  pair: number;
+  bibA: number;
+  bibB: number;
+}
+
+export interface PlayoffGridSnapshot {
+  players: readonly PlayoffGridPlayer[];
+  pairs: readonly PlayoffGridPair[];
+}
+
+export type PlayoffGridDecodeResult = { ok: true; snapshot: PlayoffGridSnapshot } | { ok: false; error: string };
+
+const CUP_PREFIX = "FTPC1.";
+
+export function playoffGridFromSeeds(
+  participants: readonly { slotId: string; bibNumber: number; displayName: string }[],
+  seeds: readonly { slotId: string; place: number; seed: number }[],
+  quarterfinals: readonly { order: number; slotIdA: string | null; slotIdB: string | null }[],
+): PlayoffGridSnapshot | null {
+  if (seeds.length !== 8 || quarterfinals.length !== 4) return null;
+  const bySlot = new Map(participants.map((person) => [person.slotId, person]));
+  const players: PlayoffGridPlayer[] = [];
+  for (const seed of seeds) {
+    const person = bySlot.get(seed.slotId);
+    const name = person?.displayName.trim().replace(/\s+/g, " ") ?? "";
+    if (!person || !isBib(person.bibNumber) || !isCupPlace(seed.place) || !isCupSeed(seed.seed) || name.length === 0) {
+      return null;
+    }
+    players.push({ bibNumber: person.bibNumber, displayName: name, place: seed.place, seed: seed.seed });
+  }
+  if (new Set(players.map((player) => player.bibNumber)).size !== 8) return null;
+  if (new Set(players.map((player) => player.seed)).size !== 8) return null;
+
+  const bySeed = new Map(players.map((player) => [player.seed, player]));
+  const pairs: PlayoffGridPair[] = [];
+  for (let index = 0; index < CUP_PAIR_SEEDS.length; index += 1) {
+    const match = quarterfinals.find((item) => item.order === index);
+    const [seedA, seedB] = CUP_PAIR_SEEDS[index] ?? [0, 0];
+    const left = bySeed.get(seedA);
+    const right = bySeed.get(seedB);
+    const slotA = match?.slotIdA ? bySlot.get(match.slotIdA) : undefined;
+    const slotB = match?.slotIdB ? bySlot.get(match.slotIdB) : undefined;
+    if (!left || !right || !slotA || !slotB) return null;
+    if (slotA.bibNumber !== left.bibNumber || slotB.bibNumber !== right.bibNumber) return null;
+    pairs.push({ pair: index + 1, bibA: left.bibNumber, bibB: right.bibNumber });
+  }
+  return { players, pairs };
+}
+
+export function serializePlayoffGrid(snapshot: PlayoffGridSnapshot): string {
+  const people = [...snapshot.players]
+    .sort((left, right) => left.seed - right.seed)
+    .map(
+      (player) =>
+        `${player.bibNumber}\t${escapeField(player.displayName)}\t${player.place}\t${player.seed}`,
+    );
+  const pairs = [...snapshot.pairs]
+    .sort((left, right) => left.pair - right.pair)
+    .map((pair) => `${pair.pair}=${pair.bibA}/${pair.bibB}`);
+  return ["1", ...people, "#", ...pairs].join("\n");
+}
+
+export async function encodePlayoffGrid(snapshot: PlayoffGridSnapshot): Promise<string> {
+  const plain = serializePlayoffGrid(snapshot);
+  if (typeof CompressionStream === "undefined") return `FTPC1|${plain}`;
+  return `${CUP_PREFIX}${await deflateBase64Url(plain)}`;
+}
+
+export async function decodePlayoffGrid(raw: string): Promise<PlayoffGridDecodeResult> {
+  const text = raw.trim().replace(/^["']|["']$/g, "");
+  const compact = text.replace(/\s+/g, "");
+  if (compact.startsWith(CUP_PREFIX)) {
+    try {
+      return parsePlayoffGrid(await inflateBase64Url(compact.slice(CUP_PREFIX.length)));
+    } catch {
+      return { ok: false, error: "Код сетки плей-офф не раскрылся. Покажите QR ещё раз." };
+    }
+  }
+  if (text.startsWith("FTPC1|")) return parsePlayoffGrid(text.slice("FTPC1|".length));
+  return { ok: false, error: "Это не стартовый код плей-офф" };
+}
+
+export function parsePlayoffGrid(plain: string): PlayoffGridDecodeResult {
+  const lines = plain
+    .split("\n")
+    .map((line) => line.replace(/\r$/, ""))
+    .filter((line) => line.length > 0);
+  const splitAt = lines.indexOf("#");
+  if (lines[0] !== "1" || splitAt < 9) return { ok: false, error: "Код сетки плей-офф повреждён" };
+
+  const players: PlayoffGridPlayer[] = [];
+  const seenBibs = new Set<number>();
+  const seenSeeds = new Set<number>();
+  for (const line of lines.slice(1, splitAt)) {
+    const [bibText, nameText, placeText, seedText] = line.split("\t");
+    const bibNumber = Number(bibText);
+    const place = Number(placeText);
+    const seed = Number(seedText);
+    const displayName = unescapeField(nameText ?? "").trim().replace(/\s+/g, " ");
+    if (!isBib(bibNumber) || !isCupPlace(place) || !isCupSeed(seed) || displayName.length === 0 || displayName.length > 120) {
+      return { ok: false, error: "В коде сетки повреждён участник" };
+    }
+    if (seenBibs.has(bibNumber)) return { ok: false, error: "В коде сетки повторяется номер" };
+    if (seenSeeds.has(seed)) return { ok: false, error: "В коде сетки повторяется посев" };
+    seenBibs.add(bibNumber);
+    seenSeeds.add(seed);
+    players.push({ bibNumber, displayName, place, seed });
+  }
+  if (players.length !== 8 || seenSeeds.size !== 8) return { ok: false, error: "В коде сетки должны быть 8 финалистов" };
+
+  const bySeed = new Map(players.map((player) => [player.seed, player]));
+  const pairs: PlayoffGridPair[] = [];
+  const seenPairs = new Set<number>();
+  const seenInPairs = new Set<number>();
+  for (const line of lines.slice(splitAt + 1)) {
+    const match = /^([1-4])=(\d+)\/(\d+)$/.exec(line);
+    if (!match) return { ok: false, error: "В коде сетки повреждена пара 1/4" };
+    const pair = Number(match[1]);
+    const bibA = Number(match[2]);
+    const bibB = Number(match[3]);
+    if (seenPairs.has(pair)) return { ok: false, error: "В коде сетки повторяется пара" };
+    const [seedA, seedB] = CUP_PAIR_SEEDS[pair - 1] ?? [0, 0];
+    const left = bySeed.get(seedA);
+    const right = bySeed.get(seedB);
+    if (!left || !right || left.bibNumber !== bibA || right.bibNumber !== bibB) {
+      return { ok: false, error: "Пары 1/4 не совпадают с посевом 1–8, 2–7, 3–6, 4–5" };
+    }
+    if (seenInPairs.has(bibA) || seenInPairs.has(bibB)) return { ok: false, error: "В парах 1/4 номер стоит дважды" };
+    seenPairs.add(pair);
+    seenInPairs.add(bibA);
+    seenInPairs.add(bibB);
+    pairs.push({ pair, bibA, bibB });
+  }
+  if (pairs.length !== 4) return { ok: false, error: "В коде сетки должны быть 4 пары 1/4" };
+
+  return { ok: true, snapshot: { players, pairs } };
+}
+
+function isBib(value: number): boolean {
+  return Number.isInteger(value) && value >= 1 && value <= MAX_FISH;
+}
+
+function isCupSeed(value: number): boolean {
+  return Number.isInteger(value) && value >= 1 && value <= 8;
+}
+
+function isCupPlace(value: number): boolean {
+  return Number.isInteger(value) && value >= 1 && value <= 99;
 }
 
 function periodKey(round: RoundIndex, period: PeriodIndex): string {

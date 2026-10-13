@@ -1,3 +1,4 @@
+import { type ReactNode } from "react";
 import { type GridSlot, type LeaderboardEntry, type PeriodIndex, type PeriodPoints } from "../../../packages/shared/src/types.ts";
 import { type RegisteredParticipant } from "./store.ts";
 /** «[№3] Бакладоров К.» — номер жеребьёвки и ФИО. */
@@ -63,7 +64,7 @@ export declare function facingFish(leaderboard: readonly LeaderboardEntry[], slo
 export declare function buildParticipantCards(participants: readonly RegisteredParticipant[], grid: readonly GridSlot[], leaderboard: readonly LeaderboardEntry[]): ParticipantCard[];
 export declare function prepareParticipantCardsPdf(cards: readonly ParticipantCard[]): PdfCardStub;
 export declare function prepareTournamentGridXlsx(cards: readonly ParticipantCard[]): XlsxGridStub;
-export declare function ProtocolExportButtons({ grid, middle }: {
+export declare function ProtocolExportButtons({ grid, middle, }: {
     grid?: readonly GridSlot[];
-    middle?: import("react").ReactNode;
+    middle?: ReactNode;
 }): import("react").JSX.Element;

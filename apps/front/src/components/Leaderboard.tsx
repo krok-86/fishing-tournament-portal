@@ -45,8 +45,9 @@ function nextPeriodAction(
 
 const PLAYOFF_PLACES = 8;
 const PERIODS: readonly PeriodIndex[] = QUALIFYING_PERIODS;
-const COLUMN_COUNT = 4 + PERIODS.length;
+const COLUMN_COUNT = 1 + PERIODS.length + 2;
 const FISH_CAP = 9999;
+const STICKY_NAME = "sticky left-0 z-10 border-r border-slate-700 bg-slate-900";
 
 export function Leaderboard() {
   const rows = useMatchStore((state) => state.leaderboard);
@@ -143,7 +144,7 @@ export function Leaderboard() {
         <div>
           <h2 className="text-lg font-black tracking-tight sm:text-2xl">Таблица лидеров</h2>
           <p className="text-xs text-slate-400 sm:text-sm">
-            Ячейка периода: свои рыбы : рыбы соперника (очки). Имя открывает карточку, ячейка — правку поимок. Оранжевая ячейка — расхождение в дуэли.
+            На телефоне видны номер, имя, рыбы и очки. Периоды П1–П8 листаются на экране шире: номер и ФИО остаются слева. Имя открывает карточку, ячейка — правку поимок. Оранжевая ячейка — расхождение в дуэли.
           </p>
         </div>
         <p className="rounded-full border border-amber-300/40 bg-amber-300/10 px-3 py-1 text-[11px] font-bold tracking-wide text-amber-100 uppercase">
@@ -169,16 +170,15 @@ export function Leaderboard() {
       )}
       {error && <p className="mb-3 text-sm text-rose-300">{error}</p>}
 
-      <div className="overflow-x-auto rounded-2xl border border-white/10 bg-slate-950 shadow-xl shadow-black/30 lg:rounded-3xl">
-        <table className="w-full min-w-[1040px] border-collapse text-left">
+      <div className="overflow-x-auto scrollbar-thin rounded-2xl border border-white/10 bg-slate-950 shadow-xl shadow-black/30 lg:rounded-3xl">
+        <table className="w-full border-separate border-spacing-0 text-left md:min-w-[1040px]">
           <thead className="bg-slate-900 text-[10px] tracking-wide text-slate-400 uppercase sm:text-xs">
             <tr>
-              <th className="hidden w-14 px-2 py-3 font-semibold md:table-cell md:w-20">Место</th>
-              <th className="px-3 py-3 font-semibold">Имя</th>
+              <th className={`${STICKY_NAME} min-w-[9.5rem] px-3 py-3 font-semibold md:min-w-72`}>№ / Имя</th>
               {PERIODS.map((period) => (
                 <th
                   key={period}
-                  className={`px-1 py-3 text-center font-semibold whitespace-nowrap ${
+                  className={`hidden px-1 py-3 text-center font-semibold whitespace-nowrap md:table-cell ${
                     period === activePeriod ? "text-cyan-200" : ""
                   }`}
                 >
@@ -186,20 +186,26 @@ export function Leaderboard() {
                 </th>
               ))}
               <th className="w-16 px-2 py-3 text-right font-semibold whitespace-nowrap md:w-24">Всего рыб</th>
-              <th className="w-14 px-3 py-3 text-right font-semibold md:w-20">Очки</th>
+              <th className="w-14 px-3 py-3 text-right font-semibold whitespace-nowrap md:w-20">Очки</th>
             </tr>
           </thead>
           <tbody>
             {!ready && (
               <tr>
-                <td className="px-4 py-6 text-sm text-slate-400" colSpan={COLUMN_COUNT}>
+                <td className="px-4 py-6 text-sm text-slate-400 md:hidden" colSpan={3}>
+                  Считаем места…
+                </td>
+                <td className="hidden px-4 py-6 text-sm text-slate-400 md:table-cell" colSpan={COLUMN_COUNT}>
                   Считаем места…
                 </td>
               </tr>
             )}
             {ready && !error && rows.length === 0 && (
               <tr>
-                <td className="px-4 py-6 text-sm text-slate-400" colSpan={COLUMN_COUNT}>
+                <td className="px-4 py-6 text-sm text-slate-400 md:hidden" colSpan={3}>
+                  В логе событий пока нет участников.
+                </td>
+                <td className="hidden px-4 py-6 text-sm text-slate-400 md:table-cell" colSpan={COLUMN_COUNT}>
                   В логе событий пока нет участников.
                 </td>
               </tr>
@@ -310,21 +316,20 @@ function LeaderboardRow({
   const playoff = entry.place <= PLAYOFF_PLACES;
 
   return (
-    <tr className={`${rowTone(entry.place)} ${blank ? "opacity-45" : ""}`}>
-      <td className="hidden px-2 py-3 md:table-cell">
-        <span className="inline-flex items-center gap-1 text-base font-black tabular-nums sm:text-lg">
-          {playoff && <Trophy place={entry.place} />}
-          {entry.place}
-        </span>
-      </td>
-      <td className="min-w-0 px-3 py-3">
+    <tr className={rowTone(entry.place)}>
+      <td className={`${STICKY_NAME} min-w-[9.5rem] px-3 py-3 md:min-w-72 ${nameRail(entry.place)}`}>
         <button
           type="button"
-          className="block max-w-full truncate text-left font-medium text-inherit sm:text-base"
+          className={`flex w-full min-w-0 items-center gap-2 text-left ${blank ? "opacity-45" : ""}`}
           onClick={onOpenCard}
         >
-          <span className="md:hidden">{entry.place}. </span>
-          {formatDrawName(entry.bibNumber, entry.displayName)}
+          <span className="inline-flex shrink-0 items-center gap-1 text-base font-black tabular-nums sm:text-lg">
+            {playoff && <Trophy place={entry.place} />}
+            {entry.place}
+          </span>
+          <span className="min-w-0 truncate font-medium sm:text-base">
+            {formatDrawName(entry.bibNumber, entry.displayName)}
+          </span>
         </button>
       </td>
       {PERIODS.map((period) => {
@@ -333,7 +338,7 @@ function LeaderboardRow({
         return (
           <td
             key={period}
-            className={`px-1 py-2 text-center text-xs font-semibold tabular-nums whitespace-nowrap ${
+            className={`hidden px-1 py-2 text-center text-xs font-semibold tabular-nums whitespace-nowrap md:table-cell ${blank ? "opacity-45" : ""} ${
               conflict
                 ? "bg-red-700/90 text-white shadow-[inset_0_0_0_2px_#fb923c]"
                 : period === activePeriod
@@ -358,8 +363,8 @@ function LeaderboardRow({
           </td>
         );
       })}
-      <td className="px-2 py-3 text-right font-semibold tabular-nums sm:text-base">{entry.fishCount}</td>
-      <td className="px-3 py-3 text-right text-lg font-black tabular-nums sm:text-xl">{entry.points}</td>
+      <td className={`px-2 py-3 text-right font-semibold tabular-nums sm:text-base ${blank ? "opacity-45" : ""}`}>{entry.fishCount}</td>
+      <td className={`px-3 py-3 text-right text-lg font-black tabular-nums sm:text-xl ${blank ? "opacity-45" : ""}`}>{entry.points}</td>
     </tr>
   );
 }
@@ -414,7 +419,7 @@ function PeriodScoreDialog({
         role="dialog"
         aria-modal="true"
         aria-labelledby="period-score-title"
-        className="w-full max-w-md rounded-3xl bg-slate-900 p-4 shadow-2xl"
+        className="w-full rounded-3xl bg-slate-900 p-4 shadow-2xl sm:p-6 lg:max-w-2xl"
       >
         <p className="text-[11px] font-bold tracking-[0.16em] text-cyan-200 uppercase">
           Период {period}
@@ -454,7 +459,7 @@ function PeriodScoreDialog({
         <div className="mt-4 grid grid-cols-2 gap-2">
           <button
             type="button"
-            className="h-14 rounded-2xl bg-slate-800 text-sm font-black text-white"
+            className="h-14 w-full rounded-2xl bg-slate-800 text-sm font-black text-white"
             disabled={saving}
             onClick={onClose}
           >
@@ -462,7 +467,7 @@ function PeriodScoreDialog({
           </button>
           <button
             type="button"
-            className="h-14 rounded-2xl bg-amber-400 text-sm font-black text-slate-950 disabled:opacity-40"
+            className="h-14 w-full rounded-2xl bg-amber-400 text-sm font-black text-slate-950 disabled:opacity-40"
             disabled={saving}
             onClick={() => void save()}
           >
@@ -529,7 +534,7 @@ function ParticipantCardDialog({
         role="dialog"
         aria-modal="true"
         aria-labelledby="participant-card-title"
-        className="flex max-h-[92dvh] w-full max-w-3xl flex-col rounded-3xl bg-slate-900 p-4 shadow-2xl"
+        className="flex max-h-[92dvh] w-full flex-col rounded-3xl bg-slate-900 p-4 shadow-2xl sm:p-6 lg:max-w-3xl"
         onClick={(event) => event.stopPropagation()}
       >
         <p className="text-[11px] font-bold tracking-[0.16em] text-cyan-200 uppercase">Карточка участника</p>
@@ -539,7 +544,7 @@ function ParticipantCardDialog({
           </h2>
           <button
             type="button"
-            className="h-11 shrink-0 rounded-xl bg-slate-800 px-4 text-sm font-black text-white"
+            className="h-12 shrink-0 rounded-xl bg-slate-800 px-4 text-sm font-black text-white"
             onClick={onClose}
           >
             Закрыть
@@ -587,14 +592,14 @@ function ParticipantCardDialog({
                     }
                   />
                 </div>
-                <div className="mt-3 flex items-center justify-between gap-2">
+                <div className="mt-3 grid gap-2 sm:flex sm:items-center sm:justify-between">
                   <p className="text-sm font-bold text-slate-200">
                     Баллы: <span className="text-lg font-black tabular-nums">{points === null ? "—" : points}</span>
                     {!stored.played && <span className="ml-2 text-xs font-semibold text-slate-400">период ещё не сыгран</span>}
                   </p>
                   <button
                     type="button"
-                    className="h-11 rounded-xl bg-amber-400 px-4 text-sm font-black text-slate-950 disabled:bg-slate-800 disabled:text-slate-500"
+                    className="h-14 w-full rounded-2xl bg-amber-400 px-4 text-sm font-black text-slate-950 disabled:bg-slate-800 disabled:text-slate-500 sm:w-auto sm:min-w-36"
                     disabled={!editable || !dirty || savingPeriod !== null}
                     onClick={() => void savePeriod(period)}
                   >
@@ -643,10 +648,10 @@ function FishStepper({
   return (
     <div>
       <p className="mb-1 text-[11px] font-bold tracking-[0.14em] text-slate-400 uppercase">{label}</p>
-      <div className={`grid items-center gap-2 ${tall ? "grid-cols-[4.5rem_1fr_4.5rem]" : "grid-cols-[3rem_1fr_3rem]"}`}>
+      <div className={`grid w-full items-center gap-2 ${tall ? "grid-cols-[4.5rem_1fr_4.5rem]" : "grid-cols-[3.5rem_1fr_3.5rem]"}`}>
         <button
           type="button"
-          className={`${tall ? "h-16 text-lg" : "h-12 text-base"} rounded-2xl bg-rose-500 font-black text-white disabled:opacity-40`}
+          className={`${tall ? "h-16 text-2xl" : "h-14 text-xl"} w-full rounded-2xl bg-rose-500 font-black text-white disabled:opacity-40`}
           disabled={disabled || value === 0}
           aria-label={`${label}: меньше`}
           onClick={() => onChange(Math.max(0, value - 1))}
@@ -654,7 +659,7 @@ function FishStepper({
           −
         </button>
         <input
-          className={`${tall ? "h-16 text-3xl" : "h-12 text-xl"} w-full rounded-2xl border border-white/10 bg-slate-950 text-center font-black text-white outline-none focus:border-cyan-300 disabled:opacity-60`}
+          className={`${tall ? "h-16 text-3xl" : "h-14 text-2xl"} w-full rounded-2xl border border-white/10 bg-slate-950 text-center font-black text-white outline-none focus:border-cyan-300 disabled:opacity-60`}
           inputMode="numeric"
           aria-label={label}
           value={String(value)}
@@ -666,7 +671,7 @@ function FishStepper({
         />
         <button
           type="button"
-          className={`${tall ? "h-16 text-lg" : "h-12 text-base"} rounded-2xl bg-emerald-400 font-black text-slate-950 disabled:opacity-40`}
+          className={`${tall ? "h-16 text-2xl" : "h-14 text-xl"} w-full rounded-2xl bg-emerald-400 font-black text-slate-950 disabled:opacity-40`}
           disabled={disabled || value >= FISH_CAP}
           aria-label={`${label}: больше`}
           onClick={() => onChange(Math.min(FISH_CAP, value + 1))}
@@ -714,6 +719,14 @@ function Trophy({ place }: { place: number }) {
       <path fill={color} d="M3.2 2.2H1.5c.2 1.8 1.2 3 2.6 3.4-.3-.7-.5-1.4-.6-2.2h-.3V2.2Zm9.6 0h1.7c-.2 1.8-1.2 3-2.6 3.4.3-.7.5-1.4.6-2.2h.3V2.2ZM6 12.2h4v1.1H6v-1.1Zm-1 1.6h6v1.1H5v-1.1Z" />
     </svg>
   );
+}
+
+function nameRail(place: number): string {
+  if (place === 1) return "shadow-[inset_3px_0_0_#fcd34d]";
+  if (place === 2) return "shadow-[inset_3px_0_0_#e2e8f0]";
+  if (place === 3) return "shadow-[inset_3px_0_0_#fdba74]";
+  if (place <= PLAYOFF_PLACES) return "shadow-[inset_3px_0_0_#67e8f9]";
+  return "";
 }
 
 function rowTone(place: number): string {

@@ -1,8 +1,10 @@
-import { useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { QRCodeSVG } from "qrcode.react";
 import type { TournamentArchiveSnapshot } from "../../../../packages/shared/src/archive.ts";
 import { playoffMatches, previewPlayoffScore, scorePlayoffDuel } from "../../../../packages/shared/src/calculator.ts";
 import { buildFinalStandings } from "../../../../packages/shared/src/finalStandings.ts";
 import type { PlayoffBracketMatch, PlayoffStage, PlayoffTieBreak } from "../../../../packages/shared/src/types.ts";
+import { encodePlayoffGrid, playoffGridFromSeeds } from "../qrSync.ts";
 import { useMatchStore } from "../store.ts";
 import { confirmAndToast, toast } from "../toast.ts";
 import { FinalStandingsTable } from "./FinalStandingsTable.tsx";
@@ -134,7 +136,19 @@ export function PlayoffBracket({
 
       {podium}
 
-      <div className="overflow-x-auto rounded-3xl border border-white/10 bg-slate-950/80 p-3 shadow-xl shadow-black/30 sm:p-6">
+      {!snapshot && <PlayoffStartQr />}
+
+      <MobilePlayoffRounds
+        quarter={quarter}
+        semi={semi}
+        finalMatch={playoff.final}
+        thirdPlace={playoff.thirdPlace}
+        nameOf={nameOf}
+        activeMatchId={activeMatchId}
+        openMatch={openMatch}
+      />
+
+      <div className="scrollbar-thin hidden overflow-x-auto rounded-3xl border border-white/10 bg-slate-950/80 p-3 shadow-xl shadow-black/30 sm:p-6 lg:block">
         <div className="flex w-max items-center gap-x-8 pb-16">
           <div className="relative flex flex-col gap-8">
             <BracketHalf
@@ -208,6 +222,163 @@ export function PlayoffBracket({
         </p>
       )}
     </section>
+  );
+}
+
+function PlayoffStartQr() {
+  const playoff = useMatchStore((state) => state.playoff);
+  const participants = useMatchStore((state) => state.participants);
+  const grid = useMemo(
+    () => (playoff.formed ? playoffGridFromSeeds(participants, playoff.seeds, playoff.quarterfinals) : null),
+    [participants, playoff],
+  );
+  const plain = grid ? JSON.stringify(grid) : "";
+  const [packet, setPacket] = useState<{ key: string; payload: string } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const payload = packet?.key === plain ? packet.payload : null;
+
+  useEffect(() => {
+    if (!grid) return;
+    let cancelled = false;
+    void encodePlayoffGrid(grid)
+      .then((value) => {
+        if (!cancelled) {
+          setPacket({ key: plain, payload: value });
+          setError(null);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setError("Не удалось сжать сетку плей-офф в QR");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [grid, plain]);
+
+  if (!grid) return null;
+  const tooWide = payload !== null && payload.length > 1800;
+  const nameOf = (slotId: string | null) => {
+    if (!slotId) return "—";
+    const person = participants.find((item) => item.slotId === slotId);
+    return person ? `${person.bibNumber}. ${person.displayName}` : "—";
+  };
+
+  return (
+    <div id="playoff-start-qr" className="mb-6 rounded-3xl border border-cyan-300/40 bg-slate-900 px-4 py-5 sm:px-6">
+      <h3 className="text-xl font-black tracking-tight sm:text-2xl">Стартовый QR-код Плей-офф</h3>
+      <p className="mt-2 text-sm leading-relaxed text-slate-300">
+        В коде сжатый топ-8: номер, ФИО и пары 1/4 финала. Финалист сканирует его один раз — телефон записывает сетку и открывает кубковые матчи.
+      </p>
+      {error && <p className="mt-3 text-sm text-rose-300">{error}</p>}
+      {!payload && !error && <p className="mt-3 text-sm text-slate-400">Собираем код…</p>}
+      {payload && tooWide && (
+        <p className="mt-3 text-sm text-amber-200">Сетка не помещается в один QR. Передайте строку ниже вручную.</p>
+      )}
+      {payload && !tooWide && (
+        <div className="mx-auto mt-4 w-fit rounded-3xl bg-white p-4">
+          <QRCodeSVG
+            value={payload}
+            size={320}
+            level="M"
+            marginSize={4}
+            bgColor="#ffffff"
+            fgColor="#020617"
+            title="Стартовый QR-код Плей-офф"
+          />
+        </div>
+      )}
+      <ul className="mt-4 grid gap-1 text-sm font-semibold text-cyan-50">
+        {playoff.quarterfinals.map((match) => (
+          <li key={match.matchId}>
+            1/4, пара {match.order + 1}: {nameOf(match.slotIdA)} — {nameOf(match.slotIdB)}
+          </li>
+        ))}
+      </ul>
+      {payload && (
+        <textarea
+          className="mt-4 w-full resize-none rounded-xl border border-white/10 bg-slate-950 px-3 py-2 font-mono text-[11px] text-cyan-100 outline-none"
+          readOnly
+          rows={3}
+          value={payload}
+          aria-label="Сжатая строка стартового QR плей-офф"
+          onFocus={(event) => event.currentTarget.select()}
+        />
+      )}
+    </div>
+  );
+}
+
+function MobilePlayoffRounds({
+  quarter,
+  semi,
+  finalMatch,
+  thirdPlace,
+  nameOf,
+  activeMatchId,
+  openMatch,
+}: {
+  quarter: readonly PlayoffBracketMatch[];
+  semi: readonly PlayoffBracketMatch[];
+  finalMatch: PlayoffBracketMatch;
+  thirdPlace: PlayoffBracketMatch;
+  nameOf: (slotId: string | null, stage: PlayoffStage) => string;
+  activeMatchId: string;
+  openMatch: (match: PlayoffBracketMatch) => (() => void) | undefined;
+}) {
+  const rounds = [
+    { id: "quarterfinal", label: "1/4 Финала", matches: quarter },
+    { id: "semifinal", label: "1/2 Финала", matches: semi },
+    { id: "final", label: "Финал", matches: [finalMatch] },
+  ] as const;
+  const [round, setRound] = useState<(typeof rounds)[number]["id"]>("quarterfinal");
+  const selected = rounds.find((item) => item.id === round) ?? rounds[0];
+
+  return (
+    <div className="lg:hidden">
+      <div className="grid grid-cols-3 gap-1 rounded-2xl bg-slate-900 p-1" role="tablist" aria-label="Стадии плей-офф">
+        {rounds.map((item) => {
+          const active = item.id === selected.id;
+          return (
+            <button
+              key={item.id}
+              type="button"
+              role="tab"
+              aria-selected={active}
+              className={`min-h-12 rounded-xl px-1 text-[11px] leading-tight font-black sm:text-xs ${
+                active ? "bg-cyan-300 text-slate-950" : "text-slate-300"
+              }`}
+              onClick={() => setRound(item.id)}
+            >
+              {item.label}
+            </button>
+          );
+        })}
+      </div>
+      <div className="mt-3 grid gap-3" role="tabpanel">
+        {selected.matches.map((match) => (
+          <MatchCard
+            key={match.matchId}
+            match={match}
+            nameOf={nameOf}
+            featured={match.stage === "final"}
+            active={activeMatchId === match.matchId}
+            onOpen={openMatch(match)}
+          />
+        ))}
+        {selected.id === "final" && (
+          <div className="grid gap-2">
+            <p className="text-center text-[11px] font-black tracking-[0.2em] text-amber-200 uppercase">Матч за 3-е место</p>
+            <MatchCard
+              match={thirdPlace}
+              nameOf={nameOf}
+              bronze
+              active={activeMatchId === thirdPlace.matchId}
+              onOpen={openMatch(thirdPlace)}
+            />
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -292,7 +463,9 @@ export function PlayoffEntryDialog({ organizer = false }: { organizer?: boolean 
       <section
         role="dialog"
         aria-labelledby="playoff-entry-title"
-        className="pointer-events-auto mx-auto max-h-[min(92dvh,44rem)] w-full max-w-lg overflow-y-auto rounded-3xl border border-cyan-300/40 bg-slate-900 p-4 shadow-2xl shadow-black/60"
+        className={`pointer-events-auto mx-auto max-h-[min(92dvh,44rem)] w-full overflow-y-auto rounded-3xl border border-cyan-300/40 bg-slate-900 p-4 shadow-2xl shadow-black/60 ${
+          organizer ? "lg:max-w-3xl" : "max-w-lg"
+        }`}
       >
         <div className="flex items-start justify-between gap-3">
           <div>
@@ -320,6 +493,7 @@ export function PlayoffEntryDialog({ organizer = false }: { organizer?: boolean 
             place={match.placeA}
             count={athleteFish}
             disabled={saving}
+            roomy={organizer}
             canRename={organizer && athlete !== undefined}
             onPlus={() => {
               markRegulation();
@@ -337,6 +511,7 @@ export function PlayoffEntryDialog({ organizer = false }: { organizer?: boolean 
             place={match.placeB}
             count={opponentFish}
             disabled={saving}
+            roomy={organizer}
             canRename={organizer && opponent !== undefined}
             onPlus={() => {
               markRegulation();
@@ -376,6 +551,7 @@ export function PlayoffEntryDialog({ organizer = false }: { organizer?: boolean 
                 place={match.placeA}
                 count={athleteExtraFish}
                 disabled={saving}
+                roomy={organizer}
                 canRename={false}
                 onPlus={() => adjustPlayoffLine("extra", "athlete", 1)}
                 onMinus={() => adjustPlayoffLine("extra", "athlete", -1)}
@@ -387,6 +563,7 @@ export function PlayoffEntryDialog({ organizer = false }: { organizer?: boolean 
                 place={match.placeB}
                 count={opponentExtraFish}
                 disabled={saving}
+                roomy={organizer}
                 canRename={false}
                 onPlus={() => adjustPlayoffLine("extra", "opponent", 1)}
                 onMinus={() => adjustPlayoffLine("extra", "opponent", -1)}
@@ -409,6 +586,7 @@ export function PlayoffEntryDialog({ organizer = false }: { organizer?: boolean 
                 place={match.placeA}
                 count={athleteGoldenFish}
                 disabled={saving}
+                roomy={organizer}
                 canRename={false}
                 onPlus={() => adjustPlayoffLine("golden", "athlete", 1)}
                 onMinus={() => adjustPlayoffLine("golden", "athlete", -1)}
@@ -420,16 +598,17 @@ export function PlayoffEntryDialog({ organizer = false }: { organizer?: boolean 
                 place={match.placeB}
                 count={opponentGoldenFish}
                 disabled={saving}
+                roomy={organizer}
                 canRename={false}
                 onPlus={() => adjustPlayoffLine("golden", "opponent", 1)}
                 onMinus={() => adjustPlayoffLine("golden", "opponent", -1)}
               />
             </div>
             {goldenTied && athleteGoldenFish > 0 && (
-              <div className="mt-2 grid grid-cols-2 gap-2">
+              <div className={`mt-2 grid gap-2 ${organizer ? "grid-cols-1 sm:grid-cols-2" : "grid-cols-2"}`}>
                 <button
                   type="button"
-                  className={`rounded-xl px-2 py-2 text-sm font-bold ${goldenFirst === "a" ? "bg-yellow-200 text-slate-950" : "bg-slate-950 text-yellow-50"}`}
+                  className={`w-full rounded-xl px-2 text-sm font-bold ${organizer ? "min-h-14 py-3" : "py-2"} ${goldenFirst === "a" ? "bg-yellow-200 text-slate-950" : "bg-slate-950 text-yellow-50"}`}
                   aria-pressed={goldenFirst === "a"}
                   onClick={() => setGoldenFirst("a")}
                 >
@@ -437,7 +616,7 @@ export function PlayoffEntryDialog({ organizer = false }: { organizer?: boolean 
                 </button>
                 <button
                   type="button"
-                  className={`rounded-xl px-2 py-2 text-sm font-bold ${goldenFirst === "b" ? "bg-yellow-200 text-slate-950" : "bg-slate-950 text-yellow-50"}`}
+                  className={`w-full rounded-xl px-2 text-sm font-bold ${organizer ? "min-h-14 py-3" : "py-2"} ${goldenFirst === "b" ? "bg-yellow-200 text-slate-950" : "bg-slate-950 text-yellow-50"}`}
                   aria-pressed={goldenFirst === "b"}
                   onClick={() => setGoldenFirst("b")}
                 >
@@ -668,6 +847,7 @@ function CatchRow({
   place,
   count,
   disabled,
+  roomy = false,
   canRename,
   onPlus,
   onMinus,
@@ -678,6 +858,7 @@ function CatchRow({
   place: number;
   count: number;
   disabled: boolean;
+  roomy?: boolean;
   canRename: boolean;
   onPlus: () => void;
   onMinus: () => void;
@@ -713,7 +894,7 @@ function CatchRow({
   }
 
   return (
-    <div className="flex items-center gap-2 rounded-2xl bg-slate-950 px-3 py-2">
+    <div className={`flex w-full items-center gap-2 rounded-2xl bg-slate-950 px-3 ${roomy ? "py-3" : "py-2"}`}>
       <div className="min-w-0 flex-1">
         {editing ? (
           <form className="flex items-center gap-1" onSubmit={(event) => void saveName(event)}>
@@ -761,17 +942,17 @@ function CatchRow({
       </div>
       <button
         type="button"
-        className="h-11 w-11 rounded-xl bg-rose-500 text-lg font-black text-white disabled:opacity-40"
+        className={`${roomy ? "h-14 w-14 shrink-0 rounded-2xl text-2xl" : "h-11 w-11 rounded-xl text-lg"} bg-rose-500 font-black text-white disabled:opacity-40`}
         disabled={disabled || editing || count === 0}
         onClick={onMinus}
         aria-label={`Минус, ${title}`}
       >
         −
       </button>
-      <p className="w-8 text-center text-2xl font-black tabular-nums">{count}</p>
+      <p className={`${roomy ? "w-12 text-3xl" : "w-8 text-2xl"} text-center font-black tabular-nums`}>{count}</p>
       <button
         type="button"
-        className="h-11 w-11 rounded-xl bg-emerald-400 text-lg font-black text-slate-950 disabled:opacity-40"
+        className={`${roomy ? "h-14 w-14 shrink-0 rounded-2xl text-2xl" : "h-11 w-11 rounded-xl text-lg"} bg-emerald-400 font-black text-slate-950 disabled:opacity-40`}
         disabled={disabled || editing}
         onClick={onPlus}
         aria-label={`Плюс, ${title}`}
