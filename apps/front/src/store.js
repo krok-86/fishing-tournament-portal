@@ -1,8 +1,11 @@
 import { create } from "zustand";
-import { buildQuarterfinals, comparisonNeighborFromGrid, emptyPlayoffProjection, generateTournamentGrid, isGhostOpponent, playoffMatches, projectPlayoff, seedsFromRanking, tournamentCalculator, withPlayoffDuel, withPlayoffReport, } from "../../../packages/shared/src/calculator.ts";
+import { buildQuarterfinals, comparisonNeighborFromGrid, emptyPlayoffProjection, generateTournamentGrid, isGhostOpponent, playoffMatches, projectPlayoff, scorePlayoffDuel, seedsFromRanking, tournamentCalculator, withPlayoffDuel, withPlayoffReport, } from "../../../packages/shared/src/calculator.ts";
 import { QUALIFYING_PERIOD_COUNT, QUALIFYING_PERIODS, } from "../../../packages/shared/src/types.ts";
+import { buildTournamentArchive } from "../../../packages/shared/src/archive.ts";
+import { postTournamentArchive } from "./archiveApi.ts";
 import { db } from "./db.ts";
-import { decodeCatchSnapshot, decodePeriodSignal, decodeStartSnapshot, encodeCatchSnapshot, isTournamentDate, encodePlayoffSnapshot, expandCatchEvents, periodStatusLabel, playoffMatchId, playoffStageCode, totalFish, } from "./qrSync.ts";
+import { postMatchReport } from "./matchSync.ts";
+import { decodeCatchSnapshot, decodePeriodSignal, decodeStartSnapshot, encodeCatchSnapshot, isTournamentDate, encodePlayoffSnapshot, periodStatusLabel, playoffMatchId, playoffStageCode, totalFish, } from "./qrSync.ts";
 const PERIODS_PER_ROUND = QUALIFYING_PERIOD_COUNT;
 const emptySector = {
     sectorLabel: "—",
@@ -24,6 +27,12 @@ export const useMatchStore = create((set, get) => ({
     officiallyStarted: false,
     athleteFish: 0,
     opponentFish: 0,
+    athleteExtraFish: 0,
+    opponentExtraFish: 0,
+    athleteGoldenFish: 0,
+    opponentGoldenFish: 0,
+    goldenFirst: null,
+    playoffDraftActive: false,
     pending: [],
     confirmed: false,
     saving: false,
@@ -52,6 +61,9 @@ export const useMatchStore = create((set, get) => ({
     qualifyingSavedCount: 0,
     cupHandoffReady: false,
     signalSaving: false,
+    outboxQueue: [],
+    duelConflicts: [],
+    syncNote: null,
     adjustFish(who, delta) {
         const state = get();
         if (!state.tournamentOpened || state.saving)
@@ -65,6 +77,7 @@ export const useMatchStore = create((set, get) => ({
                 return;
             set({
                 [countKey]: nextCount,
+                playoffDraftActive: true,
                 pending: [],
                 confirmed: false,
                 savedCount: null,
@@ -84,6 +97,43 @@ export const useMatchStore = create((set, get) => ({
         set({
             [countKey]: nextCount,
             pending: [...state.pending, { slotId, delta }],
+            savedCount: null,
+            error: null,
+        });
+    },
+    adjustPlayoffLine(phase, who, delta) {
+        const state = get();
+        if (!state.tournamentOpened || state.saving || !state.playoff.formed || !state.selectedPlayoffMatchId)
+            return;
+        const countKey = phase === "extra"
+            ? who === "athlete"
+                ? "athleteExtraFish"
+                : "opponentExtraFish"
+            : who === "athlete"
+                ? "athleteGoldenFish"
+                : "opponentGoldenFish";
+        const nextCount = state[countKey] + delta;
+        if (nextCount < 0)
+            return;
+        set({
+            [countKey]: nextCount,
+            goldenFirst: phase === "golden" ? null : state.goldenFirst,
+            playoffDraftActive: true,
+            pending: [],
+            confirmed: false,
+            savedCount: null,
+            error: null,
+        });
+    },
+    setGoldenFirst(side) {
+        const state = get();
+        if (!state.playoff.formed || state.saving || !state.selectedPlayoffMatchId)
+            return;
+        set({
+            goldenFirst: side,
+            playoffDraftActive: true,
+            pending: [],
+            confirmed: false,
             savedCount: null,
             error: null,
         });
@@ -183,7 +233,7 @@ export const useMatchStore = create((set, get) => ({
         }
         if (!state.tournamentOpened || state.confirmed || state.saving || state.signalSaving || !state.athleteSlotId)
             return;
-        set({ saving: true, error: null });
+        set({ saving: true, error: null, syncNote: null });
         const timestamp = Date.now();
         const slotIds = [state.athleteSlotId, state.opponentSlotId].filter((slotId) => slotId.length > 0);
         const events = absoluteCatches(state, slotIds, timestamp);
@@ -206,11 +256,19 @@ export const useMatchStore = create((set, get) => ({
         });
         try {
             await replacePeriodCatches(state.tournamentId, state.round, state.period, slotIds, events);
+            let syncNote = LOCAL_SAVE_NOTE;
+            try {
+                syncNote = await enqueuePeriodReport(state);
+            }
+            catch {
+                syncNote = LOCAL_SAVE_NOTE;
+            }
             set({
                 saving: false,
                 confirmed: true,
                 pending: [],
                 savedCount: events.length,
+                syncNote,
             });
             await get().loadLeaderboard();
             await get().refreshHandoff();
@@ -254,6 +312,10 @@ export const useMatchStore = create((set, get) => ({
         try {
             const rows = await db.events.where("tournamentId").equals(tournamentId).sortBy("timestamp");
             const stored = rows.map((row) => row.event);
+            const [outboxQueue, duelConflicts] = await Promise.all([
+                db.outboxQueue.orderBy("createdAt").toArray(),
+                db.duelConflicts.toArray(),
+            ]);
             const snapshot = readSetup(stored);
             const participants = snapshot.tournamentOpened
                 ? snapshot.participants
@@ -283,6 +345,9 @@ export const useMatchStore = create((set, get) => ({
                 ...cupPatch(stored, participants, grid),
                 selectedPlayoffMatchId: "",
                 playoffEntryOpen: false,
+                outboxQueue,
+                duelConflicts,
+                syncNote: null,
             });
             await get().loadLeaderboard();
             const opening = playoffMatches(playoff).find((match) => match.slotIdA && match.slotIdB && !match.winnerSlotId)
@@ -378,6 +443,54 @@ export const useMatchStore = create((set, get) => ({
         }
         return appendRegisteredParticipants(set, state, parsed.batch.participants);
     },
+    async importOnlineRoster(names) {
+        const state = get();
+        if (state.tournamentOpened) {
+            return { ok: false, error: "Турнир уже открыт — лист больше не меняется" };
+        }
+        if (state.setupSaving) {
+            return { ok: false, error: "Стартовый лист сейчас записывается" };
+        }
+        const roster = denseStartList(state.participants);
+        const taken = new Set(roster.map((participant) => registrationKey(participant.displayName)));
+        const fresh = [];
+        let alreadyOnSheet = 0;
+        for (const raw of names) {
+            const displayName = registrationName(raw);
+            if (displayName.length < 3)
+                continue;
+            const key = registrationKey(displayName);
+            if (taken.has(key)) {
+                alreadyOnSheet += 1;
+                continue;
+            }
+            taken.add(key);
+            fresh.push(displayName);
+        }
+        if (fresh.length === 0) {
+            if (names.length === 0)
+                return { ok: false, error: "На сервере пока нет заявок" };
+            if (alreadyOnSheet > 0)
+                return { ok: false, error: "Эти спортсмены уже есть в стартовом листе" };
+            return { ok: false, error: "В онлайн-списке нет ФИО" };
+        }
+        const fromBib = roster.length + 1;
+        const entries = fresh.map((displayName, index) => ({
+            bibNumber: fromBib + index,
+            displayName,
+            groupId: "A",
+        }));
+        const saved = await appendRegisteredParticipants(set, get(), entries);
+        if (!saved)
+            return { ok: false, error: get().setupError ?? "Не удалось записать участников" };
+        return {
+            ok: true,
+            added: fresh.length,
+            alreadyOnSheet,
+            fromBib,
+            toBib: fromBib + fresh.length - 1,
+        };
+    },
     async replaceParticipant(slotId, displayName) {
         const name = displayName.trim().replace(/\s+/g, " ");
         const state = get();
@@ -456,6 +569,8 @@ export const useMatchStore = create((set, get) => ({
         set({ setupSaving: true, setupError: null });
         try {
             await db.events.clear();
+            await db.outboxQueue.clear();
+            await db.duelConflicts.clear();
             set({
                 ...emptySector,
                 round: 1,
@@ -493,6 +608,9 @@ export const useMatchStore = create((set, get) => ({
                 qualifyingSavedCount: 0,
                 cupHandoffReady: false,
                 playerNamedSlotIds: [],
+                outboxQueue: [],
+                duelConflicts: [],
+                syncNote: null,
             });
             return true;
         }
@@ -690,6 +808,45 @@ export const useMatchStore = create((set, get) => ({
             return false;
         }
     },
+    async archiveTournament() {
+        const state = get();
+        if (!state.tournamentOpened)
+            return { ok: false, error: "Сначала откройте турнир" };
+        try {
+            const rows = await db.events.where("tournamentId").equals(state.tournamentId).sortBy("timestamp");
+            const events = rows.map((row) => row.event);
+            const qualifyingLeaderboard = tournamentCalculator.generateLeaderboard(events);
+            const playoff = projectPlayoff(events);
+            const snapshot = buildTournamentArchive({
+                tournament: {
+                    id: state.tournamentId,
+                    name: state.tournamentName,
+                    date: state.tournamentDate,
+                    sectorCount: state.sectorCount,
+                    periodsCount: state.periodsCount,
+                },
+                participants: state.participants.map((participant) => ({
+                    slotId: participant.slotId,
+                    bibNumber: participant.bibNumber,
+                    displayName: participant.displayName,
+                    groupId: participant.groupId,
+                    ghost: participant.ghost,
+                })),
+                qualifyingLeaderboard,
+                playoff,
+                events,
+            });
+            if (!snapshot)
+                return { ok: false, error: "Сначала завершите финал и матч за 3-е место" };
+            return await postTournamentArchive(snapshot);
+        }
+        catch (error) {
+            return {
+                ok: false,
+                error: error instanceof Error ? error.message : "Не удалось собрать архив турнира",
+            };
+        }
+    },
     selectPlayoffMatch(matchId) {
         const state = get();
         if (!state.playoff.formed || state.saving)
@@ -703,6 +860,12 @@ export const useMatchStore = create((set, get) => ({
             selectedPlayoffMatchId: matchId,
             athleteFish: scored ? match.fishA ?? 0 : 0,
             opponentFish: scored ? match.fishB ?? 0 : 0,
+            athleteExtraFish: scored ? match.extraFishA ?? 0 : 0,
+            opponentExtraFish: scored ? match.extraFishB ?? 0 : 0,
+            athleteGoldenFish: scored ? match.goldenFishA ?? 0 : 0,
+            opponentGoldenFish: scored ? match.goldenFishB ?? 0 : 0,
+            goldenFirst: scored ? match.goldenFirst : null,
+            playoffDraftActive: false,
             pending: [],
             confirmed: scored,
             savedCount: null,
@@ -872,29 +1035,31 @@ export const useMatchStore = create((set, get) => ({
         if (decoded.mode === "playoff") {
             return importPlayoffSnapshot(get, set, athlete, decoded.cells, markLabel);
         }
-        const covered = new Set(decoded.cells.map((cell) => periodKey(cell)));
-        const started = Date.now();
-        const events = expandCatchEvents(state.tournamentId, participant.slotId, decoded.cells, started);
-        const closures = closeQualifyingCells(state.tournamentId, participant.slotId, decoded.cells, started + events.length);
+        let disputes = 0;
         try {
-            await db.transaction("rw", db.events, async () => {
-                const rows = await db.events.where("tournamentId").equals(state.tournamentId).toArray();
-                const staleIds = rows.flatMap((row) => {
-                    const event = row.event;
-                    if (event.type !== "CATCH_RECORDED")
-                        return [];
-                    if (event.payload.slotId !== participant.slotId)
-                        return [];
-                    if (!covered.has(periodKey(event.payload)))
-                        return [];
-                    return [row.id];
+            for (const cell of decoded.cells) {
+                if (cell.round !== 1 || !isQualifyingPeriod(cell.period))
+                    continue;
+                const seat = periodSeat(get().grid, get().participants, participant.slotId, cell.period);
+                const opponent = seat?.opponentSlotId
+                    ? get().participants.find((item) => item.slotId === seat.opponentSlotId)
+                    : undefined;
+                const result = await ingestMatch(get, {
+                    period: cell.period,
+                    status: "PENDING",
+                    reports: [
+                        {
+                            bibNumber: participant.bibNumber,
+                            opponentBib: opponent && !opponent.ghost ? opponent.bibNumber : null,
+                            ownFish: cell.fish,
+                            opponentFish: null,
+                        },
+                    ],
                 });
-                if (staleIds.length > 0)
-                    await db.events.bulkDelete(staleIds);
-                const written = [...events, ...closures];
-                if (written.length > 0)
-                    await db.events.bulkAdd(written.map(toSyncedRecord));
-            });
+                disputes += result.conflicts;
+            }
+            const duelConflicts = await db.duelConflicts.toArray();
+            set({ duelConflicts });
             await get().loadLeaderboard();
             await get().refreshHandoff();
             return {
@@ -905,6 +1070,7 @@ export const useMatchStore = create((set, get) => ({
                     fish: totalFish(decoded.cells),
                     periods: decoded.cells.length,
                     mark: markLabel,
+                    disputes,
                 },
             };
         }
@@ -1010,6 +1176,7 @@ export const useMatchStore = create((set, get) => ({
                     error: null,
                 });
             }
+            await resolveSlots([slotId, opponentSlotId].filter((id) => id !== null && id.length > 0), period);
             await get().loadLeaderboard();
             await get().refreshHandoff();
             return null;
@@ -1018,7 +1185,72 @@ export const useMatchStore = create((set, get) => ({
             return error instanceof Error ? error.message : "Не удалось записать поимки";
         }
     },
+    async flushOutbox() {
+        if (typeof navigator !== "undefined" && !navigator.onLine)
+            return { sent: 0 };
+        try {
+            const items = await db.outboxQueue.orderBy("createdAt").toArray();
+            let sent = 0;
+            for (const item of items) {
+                const ok = await postMatchReport({
+                    bibNumber: item.bibNumber,
+                    opponentBib: item.opponentBib,
+                    period: item.period,
+                    ownFish: item.ownFish,
+                    opponentFish: item.opponentFish,
+                });
+                if (!ok)
+                    break;
+                await db.outboxQueue.delete(item.id);
+                sent += 1;
+            }
+            set({ outboxQueue: await db.outboxQueue.orderBy("createdAt").toArray() });
+            return { sent };
+        }
+        catch {
+            return { sent: 0 };
+        }
+    },
+    async applyOnlineMatches(matches) {
+        return enqueueOnlineApply(async () => {
+            if (!get().tournamentOpened || matches.length === 0)
+                return true;
+            try {
+                let filled = 0;
+                for (const match of matches) {
+                    const result = await ingestMatch(get, {
+                        period: match.period,
+                        status: match.status,
+                        reports: match.reports.map((report) => ({
+                            bibNumber: report.bibNumber,
+                            opponentBib: report.opponentBib,
+                            ownFish: report.ownFish,
+                            opponentFish: report.opponentFish,
+                        })),
+                    });
+                    filled += result.filled;
+                }
+                set({ duelConflicts: await db.duelConflicts.toArray() });
+                if (filled > 0) {
+                    await get().loadLeaderboard();
+                    await get().refreshHandoff();
+                }
+                return true;
+            }
+            catch {
+                // Сеть или журнал заняты. Следующий опрос повторит те же пакеты.
+                return false;
+            }
+        });
+    },
 }));
+/** Ручное обновление и фоновый опрос не пишут один и тот же период одновременно. */
+let onlineApplyChain = Promise.resolve();
+function enqueueOnlineApply(job) {
+    const run = onlineApplyChain.then(job, job);
+    onlineApplyChain = run.then(() => undefined, () => undefined);
+    return run;
+}
 function readSetup(events) {
     const participants = [];
     let tournamentOpened = false;
@@ -1423,6 +1655,12 @@ function denseStartList(participants) {
         return { ...participant, bibNumber, displayName, ghost: false };
     });
 }
+function registrationName(value) {
+    return value.trim().replace(/\s+/g, " ");
+}
+function registrationKey(value) {
+    return registrationName(value).toLocaleLowerCase("ru");
+}
 function isAutoName(displayName, bibNumber) {
     return displayName === numberedAthleteName(bibNumber) || displayName === phantomName(bibNumber);
 }
@@ -1767,7 +2005,7 @@ function catchEventsForCounts(tournamentId, period, counts, timestamp) {
     }
     return events;
 }
-async function replacePeriodCatches(tournamentId, round, period, slotIds, events) {
+async function replacePeriodCatches(tournamentId, round, period, slotIds, events, synced = false) {
     const replacing = new Set(slotIds);
     await db.transaction("rw", db.events, async () => {
         const rows = await db.events.where("tournamentId").equals(tournamentId).toArray();
@@ -1783,8 +2021,9 @@ async function replacePeriodCatches(tournamentId, round, period, slotIds, events
         });
         if (staleIds.length > 0)
             await db.events.bulkDelete(staleIds);
-        if (events.length > 0)
-            await db.events.bulkAdd(events.map(toRecord));
+        if (events.length > 0) {
+            await db.events.bulkAdd(events.map((event) => (synced ? toSyncedRecord(event) : toRecord(event))));
+        }
     });
 }
 function isQualifyingPeriod(period) {
@@ -1802,19 +2041,6 @@ function closedQualifyingPeriods(events, slotId) {
             closed.add(event.payload.period);
     }
     return closed;
-}
-function closeQualifyingCells(tournamentId, slotId, cells, timestamp) {
-    return cells.map((cell, index) => ({
-        id: crypto.randomUUID(),
-        tournamentId,
-        type: "PERIOD_COMPLETED",
-        timestamp: timestamp + index,
-        payload: {
-            round: cell.round,
-            period: cell.period,
-            protocols: [{ slotIdA: slotId, slotIdB: null, signed: true }],
-        },
-    }));
 }
 function cupPatch(events, participants, grid) {
     return {
@@ -1851,8 +2077,14 @@ function viewFromPlayoff(participants, match) {
     const byId = new Map(participants.map((participant) => [participant.slotId, participant]));
     const athlete = match.slotIdA ? byId.get(match.slotIdA) : undefined;
     const opponent = match.slotIdB ? byId.get(match.slotIdB) : undefined;
-    const stage = match.stage === "quarterfinal" ? "1/4 финала" : match.stage === "semifinal" ? "1/2 финала" : "Финал";
-    const stageShort = match.stage === "quarterfinal" ? "1/4" : match.stage === "semifinal" ? "1/2" : "ФИНАЛ";
+    const stage = match.stage === "quarterfinal"
+        ? "1/4 финала"
+        : match.stage === "semifinal"
+            ? "1/2 финала"
+            : match.stage === "third"
+                ? "Матч за 3-е место"
+                : "Финал";
+    const stageShort = match.stage === "quarterfinal" ? "1/4" : match.stage === "semifinal" ? "1/2" : match.stage === "third" ? "3-е" : "ФИНАЛ";
     return {
         sectorLabel: stageShort,
         sideLabel: "СЛЕВА",
@@ -1860,7 +2092,7 @@ function viewFromPlayoff(participants, match) {
         opponentSlotId: match.slotIdB ?? "",
         athleteName: athleteLabel(athlete),
         opponentName: athleteLabel(opponent),
-        briefing: `${stage}: ${athlete?.displayName ?? "—"} (место ${match.placeA ?? "—"}) против ${opponent?.displayName ?? "—"} (место ${match.placeB ?? "—"}). При равных поимках побеждает более высокое место отбора.`,
+        briefing: `${stage}: ${athlete?.displayName ?? "—"} (место ${match.placeA ?? "—"}) против ${opponent?.displayName ?? "—"} (место ${match.placeB ?? "—"}). Ничья основного времени решается доп. 5-минуткой, затем «Золотой рыбой». Если за 10 минут никто не поймал, проходит более высокое место группы.`,
         neighborLabel: "",
     };
 }
@@ -1869,8 +2101,25 @@ async function savePlayoffDuel(get, set) {
     if (state.saving || !state.playoff.formed || !state.selectedPlayoffMatchId)
         return;
     const match = playoffMatches(state.playoff).find((item) => item.matchId === state.selectedPlayoffMatchId);
-    if (!match?.slotIdA || !match.slotIdB) {
+    if (!match?.slotIdA || !match.slotIdB || match.placeA === null || match.placeB === null || match.seedA === null || match.seedB === null) {
         set({ error: "Эта пара ещё не собрана" });
+        return;
+    }
+    const decision = scorePlayoffDuel({
+        fishA: state.athleteFish,
+        fishB: state.opponentFish,
+        extraFishA: state.athleteExtraFish,
+        extraFishB: state.opponentExtraFish,
+        goldenFishA: state.athleteGoldenFish,
+        goldenFishB: state.opponentGoldenFish,
+        goldenFirst: state.goldenFirst,
+        placeA: match.placeA,
+        seedA: match.seedA,
+        placeB: match.placeB,
+        seedB: match.seedB,
+    });
+    if (!decision.winner || !decision.decidedBy) {
+        set({ error: "Отметьте, кто первым поймал золотую рыбу" });
         return;
     }
     const event = {
@@ -1882,8 +2131,13 @@ async function savePlayoffDuel(get, set) {
             matchId: match.matchId,
             slotIdA: match.slotIdA,
             slotIdB: match.slotIdB,
-            fishA: state.athleteFish,
-            fishB: state.opponentFish,
+            fishA: decision.fishA,
+            fishB: decision.fishB,
+            extraFishA: decision.extraFishA ?? 0,
+            extraFishB: decision.extraFishB ?? 0,
+            goldenFishA: decision.goldenFishA ?? 0,
+            goldenFishB: decision.goldenFishB ?? 0,
+            goldenFirst: decision.goldenFirst,
         },
     };
     set({ saving: true, error: null });
@@ -2003,8 +2257,14 @@ function describeCupImport(participants, playoff, cells) {
         const winner = participants.find((item) => item.slotId === match.winnerSlotId);
         const winnerName = winner?.displayName ?? "победитель";
         const score = `${match.fishA}:${match.fishB}`;
+        if (match.decidedBy === "extraTime") {
+            return `${title}: ${score}, доп. ${match.extraFishA ?? 0}:${match.extraFishB ?? 0}. Дальше ${winnerName} — победа в доп. время.`;
+        }
+        if (match.decidedBy === "goldenFish") {
+            return `${title}: ${score}. Дальше ${winnerName} — победа по золотой рыбе.`;
+        }
         if (match.decidedBy === "qualifyingPlace") {
-            return `${title}: ничья ${score}. Дальше ${winnerName} — более высокое место отбора.`;
+            return `${title}: ничья ${score}. Дальше ${winnerName} — по рейтингу группы.`;
         }
         return `${title}: ${score}. Дальше ${winnerName}.`;
     });
@@ -2015,6 +2275,8 @@ function cupStageLabel(stage) {
         return "Четвертьфинал";
     if (stage === "SF")
         return "Полуфинал";
+    if (stage === "TF")
+        return "Матч за 3-е место";
     return "Финал";
 }
 function fishWord(count) {
@@ -2051,8 +2313,214 @@ function toRecord(event) {
 function toSyncedRecord(event) {
     return { ...toRecord(event), isSynced: true };
 }
-function periodKey(cell) {
-    return `${cell.round}.${cell.period}`;
+const LOCAL_SAVE_NOTE = "Результат сохранен локально";
+const NETWORK_SAVE_NOTE = "Результат синхронизирован по сети";
+/** Сначала журнал, потом очередь. Сеть только пытается отдать уже сохранённый пакет. */
+async function enqueuePeriodReport(state) {
+    const athlete = state.participants.find((item) => item.slotId === state.athleteSlotId);
+    if (!athlete || athlete.ghost)
+        return LOCAL_SAVE_NOTE;
+    const opponent = state.opponentSlotId
+        ? state.participants.find((item) => item.slotId === state.opponentSlotId)
+        : undefined;
+    const item = {
+        id: crypto.randomUUID(),
+        createdAt: Date.now(),
+        bibNumber: athlete.bibNumber,
+        opponentBib: opponent && !opponent.ghost ? opponent.bibNumber : null,
+        period: state.period,
+        ownFish: state.athleteFish,
+        opponentFish: state.opponentFish,
+    };
+    await db.outboxQueue.add(item);
+    useMatchStore.setState({ outboxQueue: await db.outboxQueue.orderBy("createdAt").toArray() });
+    if (typeof navigator === "undefined" || !navigator.onLine)
+        return LOCAL_SAVE_NOTE;
+    const sent = await postMatchReport({
+        bibNumber: item.bibNumber,
+        opponentBib: item.opponentBib,
+        period: item.period,
+        ownFish: item.ownFish,
+        opponentFish: item.opponentFish,
+    });
+    if (!sent)
+        return LOCAL_SAVE_NOTE;
+    await db.outboxQueue.delete(item.id);
+    useMatchStore.setState({ outboxQueue: await db.outboxQueue.orderBy("createdAt").toArray() });
+    return NETWORK_SAVE_NOTE;
+}
+async function ingestMatch(get, match) {
+    const state = get();
+    if (!state.tournamentOpened || !isQualifyingPeriod(match.period))
+        return { filled: 0, conflicts: 0 };
+    const period = match.period;
+    const slots = duelSlotIds(state, match, period);
+    if (slots.length === 0)
+        return { filled: 0, conflicts: 0 };
+    const fingerprint = matchFingerprint(match);
+    if (match.status === "CONFLICT") {
+        const opened = await flagDuel(slots, period, fingerprint, scoreDetail(match.reports));
+        return { filled: 0, conflicts: opened > 0 ? 1 : 0 };
+    }
+    const targets = fishTargets(state, match, period);
+    let events = await loadTournamentEvents(state.tournamentId);
+    let filled = 0;
+    const differs = [];
+    for (const target of targets) {
+        const current = playedFish(events, target.slotId, period);
+        if (current.played && current.fish !== target.fish) {
+            differs.push({ bib: target.bibNumber, was: current.fish, incoming: target.fish });
+            continue;
+        }
+        if (current.played)
+            continue;
+        const written = buildSlotEvents(state.tournamentId, period, target.slotId, target.fish);
+        await replacePeriodCatches(state.tournamentId, 1, period, [target.slotId], written, true);
+        events = events.concat(written);
+        filled += 1;
+    }
+    if (differs.length > 0) {
+        const detail = fullScoreDetail(match.reports) ??
+            differs.map((item) => `№${item.bib}: в таблице ${item.was}, пришло ${item.incoming}`).join(", ");
+        const opened = await flagDuel(slots, period, fingerprint, detail);
+        return { filled, conflicts: opened > 0 ? 1 : 0 };
+    }
+    if (match.status === "CONFIRMED")
+        await resolveSlots(slots, period);
+    return { filled, conflicts: 0 };
+}
+function fishTargets(state, match, period) {
+    const targets = [];
+    const push = (bibNumber, fish) => {
+        const player = livingByBib(state, bibNumber);
+        if (!player || targets.some((item) => item.slotId === player.slotId))
+            return;
+        targets.push({ slotId: player.slotId, bibNumber, fish });
+    };
+    if (match.status === "CONFIRMED") {
+        for (const report of match.reports)
+            push(report.bibNumber, report.ownFish);
+        return targets;
+    }
+    const report = match.reports[0];
+    if (!report)
+        return targets;
+    push(report.bibNumber, report.ownFish);
+    if (report.opponentFish === null || report.opponentBib === null)
+        return targets;
+    const player = livingByBib(state, report.bibNumber);
+    const opponent = livingByBib(state, report.opponentBib);
+    if (!player || !opponent || !mutualPair(state, player.slotId, opponent.slotId, period))
+        return targets;
+    push(report.opponentBib, report.opponentFish);
+    return targets;
+}
+function duelSlotIds(state, match, period) {
+    const ids = [];
+    const push = (slotId) => {
+        if (!slotId || ids.includes(slotId))
+            return;
+        ids.push(slotId);
+    };
+    for (const report of match.reports) {
+        const player = livingByBib(state, report.bibNumber);
+        if (!player)
+            continue;
+        push(player.slotId);
+        if (report.opponentBib !== null)
+            push(livingByBib(state, report.opponentBib)?.slotId);
+        else
+            push(periodSeat(state.grid, state.participants, player.slotId, period)?.opponentSlotId);
+    }
+    return ids;
+}
+function livingByBib(state, bibNumber) {
+    return state.participants.find((item) => item.bibNumber === bibNumber && !item.ghost);
+}
+function mutualPair(state, slotId, opponentSlotId, period) {
+    const seat = periodSeat(state.grid, state.participants, slotId, period);
+    const back = periodSeat(state.grid, state.participants, opponentSlotId, period);
+    if (!seat || !back)
+        return false;
+    if (seat.opponentSlotId !== opponentSlotId || back.opponentSlotId !== slotId)
+        return false;
+    return !isGhostOpponent(seat.bergerOpponentSlotId) && !isGhostOpponent(back.bergerOpponentSlotId);
+}
+function playedFish(events, slotId, period) {
+    const entry = tournamentCalculator.generateLeaderboard(events).find((item) => item.slotId === slotId);
+    const cell = entry?.periods.find((item) => item.period === period);
+    if (!cell?.played)
+        return { played: false, fish: 0 };
+    return { played: true, fish: cell.fish };
+}
+function buildSlotEvents(tournamentId, period, slotId, fish) {
+    const timestamp = Date.now();
+    const catches = catchEventsForCounts(tournamentId, period, new Map([[slotId, fish]]), timestamp);
+    const closed = {
+        id: crypto.randomUUID(),
+        tournamentId,
+        type: "PERIOD_COMPLETED",
+        timestamp: timestamp + catches.length,
+        payload: {
+            round: 1,
+            period,
+            protocols: [{ slotIdA: slotId, slotIdB: null, signed: true }],
+        },
+    };
+    return [...catches, closed];
+}
+async function loadTournamentEvents(tournamentId) {
+    const rows = await db.events.where("tournamentId").equals(tournamentId).sortBy("timestamp");
+    return rows.map((row) => row.event);
+}
+function matchFingerprint(match) {
+    const body = match.reports
+        .map((report) => `${report.bibNumber}=${report.ownFish}:${report.opponentFish ?? "-"}`)
+        .sort()
+        .join("|");
+    return `${match.status}|${body}`;
+}
+function fullScoreDetail(reports) {
+    const scored = reports.filter((report) => report.opponentFish !== null);
+    if (scored.length < 2)
+        return null;
+    return scored.map((report) => `№${report.bibNumber} ввёл ${report.ownFish}:${report.opponentFish}`).join(", ");
+}
+function scoreDetail(reports) {
+    return fullScoreDetail(reports) ?? "Расхождение в счёте дуэли";
+}
+function conflictId(period, slotId) {
+    return `${period}:${slotId}`;
+}
+async function flagDuel(slots, period, fingerprint, detail) {
+    let opened = 0;
+    for (const slotId of slots) {
+        const id = conflictId(period, slotId);
+        const prev = await db.duelConflicts.get(id);
+        if (prev?.status === "resolved" && prev.fingerprint === fingerprint)
+            continue;
+        if (prev?.status === "open" && prev.fingerprint === fingerprint && prev.detail === detail) {
+            opened += 1;
+            continue;
+        }
+        await db.duelConflicts.put({ id, period, slotId, fingerprint, status: "open", detail });
+        opened += 1;
+    }
+    return opened;
+}
+async function resolveSlots(slotIds, period) {
+    let changed = false;
+    for (const slotId of slotIds) {
+        const id = conflictId(period, slotId);
+        const prev = await db.duelConflicts.get(id);
+        if (!prev || prev.status === "resolved")
+            continue;
+        await db.duelConflicts.put({ ...prev, status: "resolved" });
+        changed = true;
+    }
+    if (!changed)
+        return;
+    useMatchStore.setState({ duelConflicts: await db.duelConflicts.toArray() });
 }
 function currentPeriodMark(state) {
     return { period: state.period, phase: state.periodPhase };

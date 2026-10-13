@@ -9,6 +9,7 @@ import {
   type PeriodPhase,
   type PeriodResult,
 } from "../../../../packages/shared/src/types.ts";
+import { fetchMatchSync } from "../matchSync.ts";
 import { facingFish, formatDrawName, ProtocolExportButtons } from "../protocolExport.tsx";
 import { periodSeat, useMatchStore, type RegisteredParticipant } from "../store.ts";
 import { toast } from "../toast.ts";
@@ -66,6 +67,7 @@ export function Leaderboard() {
   const participants = useMatchStore((state) => state.participants);
   const duelConflicts = useMatchStore((state) => state.duelConflicts);
   const [edit, setEdit] = useState<{ slotId: string; period: PeriodIndex } | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   const [cardSlotId, setCardSlotId] = useState<string | null>(null);
   const [archiving, setArchiving] = useState(false);
   const [archiveUrl, setArchiveUrl] = useState<string | null>(null);
@@ -82,27 +84,59 @@ export function Leaderboard() {
 
   const periodAction = playoffFormed ? null : nextPeriodAction(activePeriod, phase);
 
+  async function refreshOnline() {
+    if (refreshing) return;
+    setRefreshing(true);
+    const result = await fetchMatchSync();
+    if (!result.ok) {
+      setRefreshing(false);
+      toast("err", "Не удалось обновить данные. Проверьте сеть.");
+      return;
+    }
+    const applied = await useMatchStore.getState().applyOnlineMatches(result.matches);
+    if (!applied) {
+      setRefreshing(false);
+      toast("err", "Не удалось записать свежие уловы.");
+      return;
+    }
+    await loadLeaderboard();
+    setRefreshing(false);
+    const message = useMatchStore.getState().error;
+    if (message) toast("err", message);
+    else toast("ok", "Данные обновлены");
+  }
+
   return (
     <section className="mt-4 min-w-0 flex-1">
       {tournamentOpened && !playoffFormed && (
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-2xl bg-slate-900 px-4 py-3">
           <p className="min-w-0 text-lg leading-tight font-black sm:text-xl">Статус: {periodStatusText(activePeriod, phase)}</p>
-          {periodAction && (
+          <div className="flex shrink-0 flex-wrap items-center gap-2">
             <button
               type="button"
-              className="h-12 shrink-0 rounded-xl bg-amber-400 px-4 text-sm font-black text-slate-950 disabled:bg-slate-700 disabled:text-slate-400"
-              disabled={signalSaving}
-              onClick={() => {
-                const action = periodAction;
-                void signalPeriod(action.period, action.phase).then((ok) => {
-                  if (ok) toast("ok", periodStatusText(action.period, action.phase));
-                  else toast("err", useMatchStore.getState().error ?? "Не удалось записать сигнал периода");
-                });
-              }}
+              className="h-12 rounded-xl border border-white/15 bg-slate-800 px-4 text-sm font-black text-white disabled:text-slate-400"
+              disabled={refreshing}
+              onClick={() => void refreshOnline()}
             >
-              {signalSaving ? "Записываем…" : periodAction.label}
+              {refreshing ? "Обновляем…" : "🔄 Обновить данные"}
             </button>
-          )}
+            {periodAction && (
+              <button
+                type="button"
+                className="h-12 rounded-xl bg-amber-400 px-4 text-sm font-black text-slate-950 disabled:bg-slate-700 disabled:text-slate-400"
+                disabled={signalSaving}
+                onClick={() => {
+                  const action = periodAction;
+                  void signalPeriod(action.period, action.phase).then((ok) => {
+                    if (ok) toast("ok", periodStatusText(action.period, action.phase));
+                    else toast("err", useMatchStore.getState().error ?? "Не удалось записать сигнал периода");
+                  });
+                }}
+              >
+                {signalSaving ? "Записываем…" : periodAction.label}
+              </button>
+            )}
+          </div>
         </div>
       )}
       <div className="mb-3 flex flex-wrap items-end justify-between gap-2">
@@ -117,7 +151,18 @@ export function Leaderboard() {
         </p>
       </div>
       <div className="mb-3">
-        <ProtocolExportButtons />
+        <ProtocolExportButtons
+          middle={
+            <button
+              type="button"
+              className="h-12 rounded-2xl border border-white/15 bg-slate-900 px-3 text-sm font-black text-white disabled:text-slate-500"
+              disabled={refreshing}
+              onClick={() => void refreshOnline()}
+            >
+              {refreshing ? "Обновляем…" : "🔄 Обновить данные"}
+            </button>
+          }
+        />
       </div>
       {pendingCount > 0 && (
         <p className="mb-3 text-xs font-semibold text-cyan-200">Учтены поимки текущего периода до подтверждения.</p>

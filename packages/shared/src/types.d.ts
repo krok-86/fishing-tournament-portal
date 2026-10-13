@@ -256,7 +256,11 @@ export interface PlayoffFormedEvent extends TournamentEventBase {
         quarterfinals: readonly PlayoffPairing[];
     };
 }
-/** Поимки одной кубковой пары. Победитель считается заново, в событии его нет. */
+/**
+ * Поимки одной кубковой пары. Победитель считается заново, в событии его нет.
+ * fish — основное время. Доп. 5 минут и золотая рыба пишутся, даже если фаза не игралась (тогда 0).
+ * Старые события без овертайма читаются как 0:0 и при ничьей уходят в рейтинг группы.
+ */
 export interface PlayoffDuelScoredEvent extends TournamentEventBase {
     type: "PLAYOFF_DUEL_SCORED";
     payload: {
@@ -269,6 +273,7 @@ export interface PlayoffDuelScoredEvent extends TournamentEventBase {
         extraFishB?: FishCount;
         goldenFishA?: FishCount;
         goldenFishB?: FishCount;
+        /** Кто первым поймал золотую рыбу, если в этой фазе счёт равный и не 0:0. */
         goldenFirst?: "a" | "b" | null;
     };
 }
@@ -281,7 +286,9 @@ export interface PlayoffSideReportedEvent extends TournamentEventBase {
         fish: FishCount;
     };
 }
+/** Как закрылась кубковая дуэль. Рейтинг группы — только после 0:0 в «Золотой рыбе». */
 export type PlayoffTieBreak = "regulation" | "extraTime" | "goldenFish" | "qualifyingPlace";
+/** Строки дуэли для калькулятора. Незаполненный овертайм считается нулём. */
 export interface PlayoffDuelInput {
     fishA: FishCount;
     fishB: FishCount;
@@ -295,6 +302,10 @@ export interface PlayoffDuelInput {
     placeB: number;
     seedB: number;
 }
+/**
+ * Победитель кубковой дуэли.
+ * winner = null, только если в «Золотой рыбе» равный ненулевой счёт и не отмечен первый поймавший.
+ */
 export interface PlayoffDecision {
     winner: "a" | "b" | null;
     fishA: FishCount;
@@ -316,10 +327,13 @@ export interface PlayoffBracketMatch {
     seedB: number | null;
     placeA: number | null;
     placeB: number | null;
+    /** Основное время. null, пока дуэль не введена. */
     fishA: number | null;
     fishB: number | null;
+    /** Доп. 5 минут. null, если фаза не игралась. */
     extraFishA: number | null;
     extraFishB: number | null;
+    /** Золотая рыба. null, если фаза не игралась. */
     goldenFishA: number | null;
     goldenFishB: number | null;
     goldenFirst: "a" | "b" | null;
@@ -332,6 +346,7 @@ export interface PlayoffProjection {
     quarterfinals: readonly PlayoffBracketMatch[];
     semifinals: readonly PlayoffBracketMatch[];
     final: PlayoffBracketMatch | null;
+    /** Матч за 3-е место. Пара собирается из проигравших полуфиналов. */
     thirdPlace: PlayoffBracketMatch | null;
 }
 export interface ProtocolSignature {
@@ -488,11 +503,11 @@ export interface TournamentCalculator {
     /** Читает матрицу. Пары не выдумывает. */
     readTransitionGrid(events: readonly TournamentEvent[]): GridSlot[];
     /**
-     * Кубковая дуэль. При равных поимках побеждает более высокое место отбора.
-     * Ничьи нет: при одном месте решает меньший seed.
+     * Кубковая дуэль PAL Trout: основное время, доп. 5 минут, золотая рыба.
+     * Рейтинг группы решает только 0:0 в золотой рыбе. Выше место — меньший place, затем меньший seed.
      */
     scorePlayoffDuel(input: PlayoffDuelInput): PlayoffDecision;
-    /** Четвертьфинал из FORM_PLAYOFF, полуфинал и финал — из победителей. */
+    /** Четвертьфинал из FORM_PLAYOFF. Полуфинал и финал — из победителей, матч за 3-е — из проигравших полуфиналов. */
     projectPlayoff(events: readonly TournamentEvent[]): PlayoffProjection;
     /**
      * Виртуальный результат одиночки.

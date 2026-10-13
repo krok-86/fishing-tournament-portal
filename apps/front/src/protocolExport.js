@@ -1,5 +1,7 @@
+import { useState } from "react";
 import { isGhostOpponent } from "../../../packages/shared/src/calculator.ts";
 import { QUALIFYING_PERIODS, } from "../../../packages/shared/src/types.ts";
+import { downloadParticipantCardsPdf, downloadTournamentWorkbook } from "./protocolDownload.ts";
 import { periodSeat, useMatchStore } from "./store.ts";
 import { toast } from "./toast.ts";
 /** «[№3] Бакладоров К.» — номер жеребьёвки и ФИО. */
@@ -53,7 +55,7 @@ export function buildParticipantCards(participants, grid, leaderboard) {
 export function prepareParticipantCardsPdf(cards) {
     return {
         library: "jspdf",
-        integrated: false,
+        integrated: true,
         filename: "kartochki-uchastnikov.pdf",
         pageCount: cards.length,
         cards: cards.map((card) => ({ ...card, periods: card.periods.map((period) => ({ ...period })) })),
@@ -75,41 +77,59 @@ export function prepareTournamentGridXlsx(cards) {
     })));
     return {
         library: "xlsx",
-        integrated: false,
+        integrated: true,
         filename: "setka-turnira.xlsx",
         sheetName: "Сетка",
         rows,
     };
 }
-export function ProtocolExportButtons({ grid }) {
+export function ProtocolExportButtons({ grid, middle }) {
     const participants = useMatchStore((state) => state.participants);
     const leaderboard = useMatchStore((state) => state.leaderboard);
     const storeGrid = useMatchStore((state) => state.grid);
     const draw = grid ?? storeGrid;
     const ready = participants.some((participant) => !participant.ghost) && draw.length > 0;
+    const [busy, setBusy] = useState(null);
     function cards() {
         return buildParticipantCards(participants, draw, leaderboard);
     }
-    return (<div className="grid gap-2 sm:grid-cols-2">
-      <button type="button" className="h-12 rounded-2xl border border-white/15 bg-slate-900 px-3 text-sm font-black text-white disabled:text-slate-500" disabled={!ready} onClick={() => {
-            const pdf = prepareParticipantCardsPdf(cards());
-            if (pdf.pageCount === 0) {
+    return (<div className={`grid gap-2 ${middle ? "sm:grid-cols-3" : "sm:grid-cols-2"}`}>
+      <button type="button" className="h-12 rounded-2xl border border-white/15 bg-slate-900 px-3 text-sm font-black text-white disabled:text-slate-500" disabled={!ready || busy !== null} onClick={() => {
+            const list = cards();
+            if (list.length === 0) {
                 toast("err", "Нет участников для карточек");
                 return;
             }
-            toast("ok", `Карточки собраны: ${pdf.pageCount}. Запись PDF через jspdf ещё не подключена.`);
+            setBusy("pdf");
+            void downloadParticipantCardsPdf(list)
+                .then(() => {
+                toast("ok", `Карточки скачаны: ${list.length}`);
+            })
+                .catch(() => {
+                toast("err", "Не удалось собрать PDF");
+            })
+                .finally(() => setBusy(null));
         }}>
-        Скачать карточки участников (PDF)
+        {busy === "pdf" ? "Собираем PDF…" : "Скачать карточки участников (PDF)"}
       </button>
-      <button type="button" className="h-12 rounded-2xl border border-white/15 bg-slate-900 px-3 text-sm font-black text-white disabled:text-slate-500" disabled={!ready} onClick={() => {
-            const book = prepareTournamentGridXlsx(cards());
-            if (book.rows.length === 0) {
+      {middle}
+      <button type="button" className="h-12 rounded-2xl border border-white/15 bg-slate-900 px-3 text-sm font-black text-white disabled:text-slate-500" disabled={!ready || busy !== null} onClick={() => {
+            const list = cards();
+            if (list.length === 0) {
                 toast("err", "Сетка турнира пуста");
                 return;
             }
-            toast("ok", `Сетка собрана: ${book.rows.length} строк. Запись Excel через xlsx ещё не подключена.`);
+            setBusy("xlsx");
+            void downloadTournamentWorkbook(participants, draw)
+                .then(() => {
+                toast("ok", "Сетка турнира скачана");
+            })
+                .catch(() => {
+                toast("err", "Не удалось собрать Excel");
+            })
+                .finally(() => setBusy(null));
         }}>
-        Скачать сетку турнира (Excel)
+        {busy === "xlsx" ? "Собираем Excel…" : "Скачать сетку турнира (Excel)"}
       </button>
     </div>);
 }

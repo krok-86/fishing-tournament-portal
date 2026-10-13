@@ -5,9 +5,13 @@ export declare function formatDrawName(bibNumber: number, displayName: string): 
 export interface ParticipantCardPeriod {
     period: PeriodIndex;
     sectorId: string;
+    /** «л» — левый борт, «п» — правый. На бланке стоит в углу ячейки сектора. */
+    bank: "л" | "п" | null;
     /** ID соперника в сетке Бергера. `GHOST`, если в секторе один спортсмен. */
     opponentSlotId: string | null;
     opponentBib: number | null;
+    /** Номер соседа, с кем сравнивают одиночку. На бланке: `- (5)`. */
+    compareBib: number | null;
     ownFish: number;
     opponentFish: number;
     points: PeriodPoints;
@@ -34,33 +38,18 @@ export interface TournamentGridRow {
     points: PeriodPoints;
     played: boolean;
 }
-/**
- * Заготовка PDF. Сюда подключается jspdf:
- *   const { jsPDF } = await import("jspdf");
- *   const doc = new jsPDF();
- *   for (const card of stub.cards) { ...страница бланка... }
- *   doc.save(stub.filename);
- * Пока библиотеки нет: файл не пишется, наружу уходят готовые страницы.
- */
+/** Собранные страницы карточек. Файл пишет `downloadParticipantCardsPdf`. */
 export interface PdfCardStub {
     library: "jspdf";
-    integrated: false;
+    integrated: true;
     filename: string;
     pageCount: number;
     cards: ParticipantCard[];
 }
-/**
- * Заготовка книги Excel. Сюда подключается xlsx:
- *   const XLSX = await import("xlsx");
- *   const sheet = XLSX.utils.json_to_sheet(stub.rows);
- *   const book = XLSX.utils.book_new();
- *   XLSX.utils.book_append_sheet(book, sheet, stub.sheetName);
- *   XLSX.writeFile(book, stub.filename);
- * Пока библиотеки нет: файл не пишется, наружу уходят строки сетки.
- */
+/** Строки сетки до записи книги. Файл пишет `downloadTournamentWorkbook`: стартовый список и матрица переходов. */
 export interface XlsxGridStub {
     library: "xlsx";
-    integrated: false;
+    integrated: true;
     filename: string;
     sheetName: string;
     rows: TournamentGridRow[];
@@ -74,6 +63,7 @@ export declare function facingFish(leaderboard: readonly LeaderboardEntry[], slo
 export declare function buildParticipantCards(participants: readonly RegisteredParticipant[], grid: readonly GridSlot[], leaderboard: readonly LeaderboardEntry[]): ParticipantCard[];
 export declare function prepareParticipantCardsPdf(cards: readonly ParticipantCard[]): PdfCardStub;
 export declare function prepareTournamentGridXlsx(cards: readonly ParticipantCard[]): XlsxGridStub;
-export declare function ProtocolExportButtons({ grid }: {
+export declare function ProtocolExportButtons({ grid, middle }: {
     grid?: readonly GridSlot[];
+    middle?: import("react").ReactNode;
 }): import("react").JSX.Element;

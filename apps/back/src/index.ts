@@ -145,6 +145,7 @@ export function attachMatchRoutes(app: MatchApp): void {
         updatedAt: match.updatedAt,
       };
     });
+    res.set("Cache-Control", "no-store");
     res.json({ matches });
   });
 }

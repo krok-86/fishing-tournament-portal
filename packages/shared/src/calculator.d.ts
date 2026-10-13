@@ -7,9 +7,11 @@ export declare function scoreDuel(fishA: FishCount, fishB: FishCount): DuelPoint
 /** Очки спортсмена против соперника. 4 победа, 2 ничья, 1 поражение с рыбой, 0 ноль поимок. */
 export declare function pointsAgainst(ownFish: FishCount, opponentFish: FishCount): PeriodPoints;
 /**
- * Плей-офф не знает ничьей.
- * Больше поимок — победа. Поровну, включая 0:0 и 2:2, — побеждает более высокое место отбора.
- * Одинаковое место отбора разводит меньший seed: это порядок строк таблицы.
+ * Кубковая дуэль PAL Trout 2026.
+ * 1. Больше рыб в основное время.
+ * 2. Ничья основного времени — доп. 5 минут.
+ * 3. Ничья доп. времени — «Золотая рыба»: больше рыб, либо кто поймал первым при равном ненулевом счёте.
+ * 4. Только 0:0 в золотой рыбе отдаёт победу более высокому месту группы (меньший place, затем меньший seed).
  */
 export declare function scorePlayoffDuel(input: PlayoffDuelInput): PlayoffDecision;
 export declare function calculateDuels(events: readonly TournamentEvent[]): DuelResult[];
@@ -57,11 +59,7 @@ export declare function buildQuarterfinals(seeds: readonly PlayoffSeed[]): Playo
 export declare function playoffMatches(projection: PlayoffProjection): PlayoffBracketMatch[];
 /** Сетка кубка. Очки отбора не меняет: события плей-офф в таблицу не входят. */
 export declare function projectPlayoff(events: readonly TournamentEvent[]): PlayoffProjection;
-/**
- * Черновик поимок поверх уже собранной сетки.
- * Победитель и следующий раунд считаются тем же тай-брейком, что и при записи дуэли.
- * Счёт следующего раунда сохраняется, только если в паре остались те же спортсмены.
- */
+/** Черновик строк дуэли, пока окно ввода ещё не подтверждено. */
 export interface PlayoffDraftLines {
     fishA: FishCount;
     fishB: FishCount;
@@ -71,6 +69,11 @@ export interface PlayoffDraftLines {
     goldenFishB?: FishCount;
     goldenFirst?: "a" | "b" | null;
 }
+/**
+ * Черновик поимок поверх уже собранной сетки.
+ * Победитель, финал и матч за 3-е место считаются тем же регламентом, что и при записи дуэли.
+ * Счёт следующего раунда сохраняется, только если в паре остались те же спортсмены.
+ */
 export declare function previewPlayoffScore(projection: PlayoffProjection, matchId: string, lines: PlayoffDraftLines): PlayoffProjection;
 export declare function calculateLoneResult(events: readonly TournamentEvent[], loneId: string, neighbor: LoneNeighborInput): VirtualDuelResult;
 export declare const tournamentCalculator: TournamentCalculator;
@@ -84,14 +87,14 @@ export interface PlayoffSideReport {
 }
 /**
  * Полный счёт пары, как при ручном подтверждении.
- * Ничья разбирается внутри projectPlayoff: больше рыб или более высокое место отбора.
+ * Ничья разбирается внутри projectPlayoff: доп. 5 минут, золотая рыба, затем рейтинг группы.
  */
 export declare function withPlayoffDuel(events: readonly TournamentEvent[], duel: Extract<TournamentEvent, {
     type: "PLAYOFF_DUEL_SCORED";
 }>): readonly TournamentEvent[];
 /**
  * Одна сторона пары. Вторая уже известная сторона сохраняется.
- * Когда известны обе, пишется PLAYOFF_DUEL_SCORED и победитель считается тем же тай-брейком.
+ * Когда известны обе, пишется PLAYOFF_DUEL_SCORED. QR несёт только основное время: уже введённый овертайм сохраняется.
  * Если пару записать нельзя, возвращается тот же массив.
  */
 export declare function withPlayoffReport(events: readonly TournamentEvent[], report: PlayoffSideReport): readonly TournamentEvent[];

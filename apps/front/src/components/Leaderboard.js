@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { isGhostOpponent, pointsAgainst } from "../../../../packages/shared/src/calculator.ts";
 import { QUALIFYING_PERIOD_COUNT, QUALIFYING_PERIODS, } from "../../../../packages/shared/src/types.ts";
+import { fetchMatchSync } from "../matchSync.ts";
 import { facingFish, formatDrawName, ProtocolExportButtons } from "../protocolExport.tsx";
 import { periodSeat, useMatchStore } from "../store.ts";
 import { toast } from "../toast.ts";
@@ -51,8 +52,12 @@ export function Leaderboard() {
     const signalPeriod = useMatchStore((state) => state.signalPeriod);
     const signalSaving = useMatchStore((state) => state.signalSaving);
     const participants = useMatchStore((state) => state.participants);
+    const duelConflicts = useMatchStore((state) => state.duelConflicts);
     const [edit, setEdit] = useState(null);
+    const [refreshing, setRefreshing] = useState(false);
     const [cardSlotId, setCardSlotId] = useState(null);
+    const [archiving, setArchiving] = useState(false);
+    const [archiveUrl, setArchiveUrl] = useState(null);
     const ghostIds = new Set(participants.filter((participant) => participant.ghost).map((participant) => participant.slotId));
     const editing = edit ? rows.find((entry) => entry.slotId === edit.slotId) ?? null : null;
     const cardEntry = cardSlotId ? rows.find((entry) => entry.slotId === cardSlotId) ?? null : null;
@@ -64,10 +69,38 @@ export function Leaderboard() {
         });
     }, [loadLeaderboard]);
     const periodAction = playoffFormed ? null : nextPeriodAction(activePeriod, phase);
+    async function refreshOnline() {
+        if (refreshing)
+            return;
+        setRefreshing(true);
+        const result = await fetchMatchSync();
+        if (!result.ok) {
+            setRefreshing(false);
+            toast("err", "Не удалось обновить данные. Проверьте сеть.");
+            return;
+        }
+        const applied = await useMatchStore.getState().applyOnlineMatches(result.matches);
+        if (!applied) {
+            setRefreshing(false);
+            toast("err", "Не удалось записать свежие уловы.");
+            return;
+        }
+        await loadLeaderboard();
+        setRefreshing(false);
+        const message = useMatchStore.getState().error;
+        if (message)
+            toast("err", message);
+        else
+            toast("ok", "Данные обновлены");
+    }
     return (<section className="mt-4 min-w-0 flex-1">
       {tournamentOpened && !playoffFormed && (<div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-2xl bg-slate-900 px-4 py-3">
           <p className="min-w-0 text-lg leading-tight font-black sm:text-xl">Статус: {periodStatusText(activePeriod, phase)}</p>
-          {periodAction && (<button type="button" className="h-12 shrink-0 rounded-xl bg-amber-400 px-4 text-sm font-black text-slate-950 disabled:bg-slate-700 disabled:text-slate-400" disabled={signalSaving} onClick={() => {
+          <div className="flex shrink-0 flex-wrap items-center gap-2">
+            <button type="button" className="h-12 rounded-xl border border-white/15 bg-slate-800 px-4 text-sm font-black text-white disabled:text-slate-400" disabled={refreshing} onClick={() => void refreshOnline()}>
+              {refreshing ? "Обновляем…" : "🔄 Обновить данные"}
+            </button>
+            {periodAction && (<button type="button" className="h-12 rounded-xl bg-amber-400 px-4 text-sm font-black text-slate-950 disabled:bg-slate-700 disabled:text-slate-400" disabled={signalSaving} onClick={() => {
                     const action = periodAction;
                     void signalPeriod(action.period, action.phase).then((ok) => {
                         if (ok)
@@ -76,14 +109,15 @@ export function Leaderboard() {
                             toast("err", useMatchStore.getState().error ?? "Не удалось записать сигнал периода");
                     });
                 }}>
-              {signalSaving ? "Записываем…" : periodAction.label}
-            </button>)}
+                {signalSaving ? "Записываем…" : periodAction.label}
+              </button>)}
+          </div>
         </div>)}
       <div className="mb-3 flex flex-wrap items-end justify-between gap-2">
         <div>
           <h2 className="text-lg font-black tracking-tight sm:text-2xl">Таблица лидеров</h2>
           <p className="text-xs text-slate-400 sm:text-sm">
-            Ячейка периода: свои рыбы : рыбы соперника (очки). Имя открывает карточку, ячейка — правку поимок. Баллы считает калькулятор.
+            Ячейка периода: свои рыбы : рыбы соперника (очки). Имя открывает карточку, ячейка — правку поимок. Оранжевая ячейка — расхождение в дуэли.
           </p>
         </div>
         <p className="rounded-full border border-amber-300/40 bg-amber-300/10 px-3 py-1 text-[11px] font-bold tracking-wide text-amber-100 uppercase">
@@ -91,7 +125,9 @@ export function Leaderboard() {
         </p>
       </div>
       <div className="mb-3">
-        <ProtocolExportButtons />
+        <ProtocolExportButtons middle={<button type="button" className="h-12 rounded-2xl border border-white/15 bg-slate-900 px-3 text-sm font-black text-white disabled:text-slate-500" disabled={refreshing} onClick={() => void refreshOnline()}>
+            {refreshing ? "Обновляем…" : "🔄 Обновить данные"}
+          </button>}/>
       </div>
       {pendingCount > 0 && (<p className="mb-3 text-xs font-semibold text-cyan-200">Учтены поимки текущего периода до подтверждения.</p>)}
       {error && <p className="mb-3 text-sm text-rose-300">{error}</p>}
@@ -120,7 +156,7 @@ export function Leaderboard() {
                   В логе событий пока нет участников.
                 </td>
               </tr>)}
-            {rows.map((entry) => (<LeaderboardRow key={entry.slotId} entry={entry} activePeriod={activePeriod} editable={tournamentOpened && !ghostIds.has(entry.slotId)} onEdit={(period) => setEdit({ slotId: entry.slotId, period })} onOpenCard={() => setCardSlotId(entry.slotId)}/>))}
+            {rows.map((entry) => (<LeaderboardRow key={entry.slotId} entry={entry} activePeriod={activePeriod} editable={tournamentOpened && !ghostIds.has(entry.slotId)} conflictPeriods={conflictPeriodsFor(duelConflicts, entry.slotId)} onEdit={(period) => setEdit({ slotId: entry.slotId, period })} onOpenCard={() => setCardSlotId(entry.slotId)}/>))}
           </tbody>
         </table>
       </div>
@@ -140,12 +176,32 @@ export function Leaderboard() {
             </p>)}
           {playoffError && <p className="mt-2 text-sm text-rose-300">{playoffError}</p>}
         </div>)}
-      <PlayoffBracket />
+      <PlayoffBracket onArchive={() => {
+            if (archiving)
+                return;
+            setArchiving(true);
+            void useMatchStore
+                .getState()
+                .archiveTournament()
+                .then((result) => {
+                setArchiving(false);
+                if (!result.ok) {
+                    toast("err", result.error);
+                    return;
+                }
+                setArchiveUrl(new URL(result.path, window.location.origin).href);
+                toast("ok", "Турнир записан в архив");
+            })
+                .catch(() => {
+                setArchiving(false);
+                toast("err", "Не удалось собрать архив турнира");
+            });
+        }} archiving={archiving} archiveUrl={archiveUrl}/>
       {editing && edit && (<PeriodScoreDialog key={`${edit.slotId}-${edit.period}`} entry={editing} period={edit.period} rows={rows} participants={participants} onClose={() => setEdit(null)}/>)}
       {cardEntry && (<ParticipantCardDialog key={cardEntry.slotId} entry={cardEntry} rows={rows} participants={participants} editable={tournamentOpened && !ghostIds.has(cardEntry.slotId)} onClose={() => setCardSlotId(null)}/>)}
     </section>);
 }
-function LeaderboardRow({ entry, activePeriod, editable, onEdit, onOpenCard, }) {
+function LeaderboardRow({ entry, activePeriod, editable, conflictPeriods, onEdit, onOpenCard, }) {
     const blank = entry.fishCount === 0 && entry.periods.some((cell) => cell.played);
     const playoff = entry.place <= PLAYOFF_PLACES;
     return (<tr className={`${rowTone(entry.place)} ${blank ? "opacity-45" : ""}`}>
@@ -163,8 +219,13 @@ function LeaderboardRow({ entry, activePeriod, editable, onEdit, onOpenCard, }) 
       </td>
       {PERIODS.map((period) => {
             const cell = entry.periods.find((item) => item.period === period);
-            return (<td key={period} className={`px-1 py-2 text-center text-xs font-semibold tabular-nums whitespace-nowrap ${period === activePeriod ? "bg-cyan-300/10 text-cyan-50" : ""}`}>
-            {editable ? (<button type="button" className="min-h-11 min-w-11 rounded-lg px-1 font-semibold text-inherit" aria-label={`Период ${period}, ${formatDrawName(entry.bibNumber, entry.displayName)}, изменить поимки`} onClick={() => onEdit(period)}>
+            const conflict = conflictPeriods.has(period);
+            return (<td key={period} className={`px-1 py-2 text-center text-xs font-semibold tabular-nums whitespace-nowrap ${conflict
+                    ? "bg-red-700/90 text-white shadow-[inset_0_0_0_2px_#fb923c]"
+                    : period === activePeriod
+                        ? "bg-cyan-300/10 text-cyan-50"
+                        : ""}`}>
+            {editable ? (<button type="button" className={`min-h-11 min-w-11 rounded-lg px-1 font-semibold ${conflict ? "bg-orange-500 font-black text-slate-950 ring-2 ring-red-500" : "text-inherit"}`} aria-label={`Период ${period}, ${formatDrawName(entry.bibNumber, entry.displayName)}, ${conflict ? "расхождение, изменить поимки" : "изменить поимки"}`} onClick={() => onEdit(period)}>
                 {formatPeriod(cell)}
               </button>) : (formatPeriod(cell))}
           </td>);
@@ -186,6 +247,7 @@ function PeriodScoreDialog({ entry, period, rows, participants, onClose, }) {
     const [saving, setSaving] = useState(false);
     const [error, setError] = useState(null);
     const points = opponentId ? pointsAgainst(ownFish, opponentFish) : null;
+    const dispute = useMatchStore((state) => state.duelConflicts.find((item) => item.status === "open" && item.slotId === entry.slotId && item.period === period));
     async function save() {
         if (saving)
             return;
@@ -216,6 +278,9 @@ function PeriodScoreDialog({ entry, period, rows, participants, onClose, }) {
             ? "Одиночка. Поимки соперника — рыба соседа по сектору. Баллы после записи посчитает калькулятор."
             : "Меняются только поимки. Баллы 4, 2, 1 или 0 после записи посчитает калькулятор."}
         </p>
+        {dispute && (<p className="mt-3 rounded-2xl bg-orange-500/20 px-3 py-2 text-sm font-bold text-orange-100">
+            Расхождение: {dispute.detail}. Утвердите финальный счёт.
+          </p>)}
         <div className="mt-4 grid gap-3">
           <FishStepper label="Поимки игрока" value={ownFish} disabled={saving} onChange={setOwnFish}/>
           <FishStepper label="Поимки соперника" value={opponentId ? opponentFish : 0} disabled={saving || !opponentId} onChange={setOpponentFish}/>
@@ -356,6 +421,18 @@ function CardStat({ label, value }) {
       <p className="text-[10px] font-bold tracking-[0.14em] text-slate-500 uppercase">{label}</p>
       <p className="text-lg font-black tabular-nums">{value}</p>
     </div>);
+}
+function conflictPeriodsFor(conflicts, slotId) {
+    const periods = new Set();
+    for (const item of conflicts) {
+        if (item.status !== "open" || item.slotId !== slotId)
+            continue;
+        const period = item.period;
+        if (!PERIODS.includes(period))
+            continue;
+        periods.add(period);
+    }
+    return periods;
 }
 function formatPeriod(cell) {
     if (!cell?.played)

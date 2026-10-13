@@ -1,50 +1,109 @@
 import { useEffect, useState } from "react";
-import { previewPlayoffScore, scorePlayoffDuel } from "../../../../packages/shared/src/calculator.ts";
+import { playoffMatches, previewPlayoffScore, scorePlayoffDuel } from "../../../../packages/shared/src/calculator.ts";
+import { buildFinalStandings } from "../../../../packages/shared/src/finalStandings.ts";
 import { useMatchStore } from "../store.ts";
 import { confirmAndToast, toast } from "../toast.ts";
+import { FinalStandingsTable } from "./FinalStandingsTable.tsx";
+import { Podium } from "./Podium.tsx";
 export function playoffStageTitle(stage) {
     if (stage === "quarterfinal")
         return "1/4 финала";
     if (stage === "semifinal")
         return "1/2 финала";
+    if (stage === "third")
+        return "Матч за 3-е место";
     return "Финал";
 }
-export function PlayoffBracket() {
+function waitingName(stage) {
+    if (stage === "third")
+        return "Проигравший полуфинала";
+    if (stage === "final")
+        return "Победитель полуфинала";
+    if (stage === "semifinal")
+        return "Победитель четвертьфинала";
+    return "Победитель пары";
+}
+function overtimeMarker(decidedBy) {
+    if (decidedBy === "extraTime")
+        return "победа в доп. время";
+    if (decidedBy === "goldenFish")
+        return "победа по золотой рыбе";
+    if (decidedBy === "qualifyingPlace")
+        return "по рейтингу группы";
+    return null;
+}
+export function PlayoffBracket({ snapshot = null, onArchive, archiving = false, archiveUrl = null, } = {}) {
     const stored = useMatchStore((state) => state.playoff);
     const participants = useMatchStore((state) => state.participants);
+    const leaderboard = useMatchStore((state) => state.leaderboard);
+    const tournamentName = useMatchStore((state) => state.tournamentName);
+    const tournamentDate = useMatchStore((state) => state.tournamentDate);
     const playoffEntryOpen = useMatchStore((state) => state.playoffEntryOpen);
     const selectedPlayoffMatchId = useMatchStore((state) => state.selectedPlayoffMatchId);
     const athleteFish = useMatchStore((state) => state.athleteFish);
     const opponentFish = useMatchStore((state) => state.opponentFish);
+    const athleteExtraFish = useMatchStore((state) => state.athleteExtraFish);
+    const opponentExtraFish = useMatchStore((state) => state.opponentExtraFish);
+    const athleteGoldenFish = useMatchStore((state) => state.athleteGoldenFish);
+    const opponentGoldenFish = useMatchStore((state) => state.opponentGoldenFish);
+    const goldenFirst = useMatchStore((state) => state.goldenFirst);
+    const playoffDraftActive = useMatchStore((state) => state.playoffDraftActive);
     const confirmed = useMatchStore((state) => state.confirmed);
     const openPlayoffEntry = useMatchStore((state) => state.openPlayoffEntry);
-    const drafting = playoffEntryOpen && !confirmed && (athleteFish > 0 || opponentFish > 0);
-    const playoff = drafting
-        ? previewPlayoffScore(stored, selectedPlayoffMatchId, athleteFish, opponentFish)
-        : stored;
-    if (!playoff.formed || !playoff.final || playoff.quarterfinals.length < 4 || playoff.semifinals.length < 2) {
+    const drafting = !snapshot && playoffEntryOpen && !confirmed && playoffDraftActive;
+    const playoff = snapshot
+        ? snapshot.playoff
+        : drafting
+            ? previewPlayoffScore(stored, selectedPlayoffMatchId, {
+                fishA: athleteFish,
+                fishB: opponentFish,
+                extraFishA: athleteExtraFish,
+                extraFishB: opponentExtraFish,
+                goldenFishA: athleteGoldenFish,
+                goldenFishB: opponentGoldenFish,
+                goldenFirst,
+            })
+            : stored;
+    const people = snapshot ? snapshot.participants : participants;
+    const standings = snapshot
+        ? snapshot.finalStandings
+        : buildFinalStandings({ playoff: stored, leaderboard, participants });
+    const ceremonyName = snapshot?.tournament.name ?? tournamentName;
+    const ceremonyDate = snapshot?.tournament.date ?? tournamentDate;
+    const champion = standings?.find((row) => row.place === 1) ?? null;
+    const finalist = standings?.find((row) => row.place === 2) ?? null;
+    const bronzeMedalist = standings?.find((row) => row.place === 3) ?? null;
+    const crowned = champion && finalist && bronzeMedalist ? { champion, finalist, third: bronzeMedalist } : null;
+    if (!playoff.formed ||
+        !playoff.final ||
+        !playoff.thirdPlace ||
+        playoff.quarterfinals.length < 4 ||
+        playoff.semifinals.length < 2) {
         return null;
     }
-    const nameOf = (slotId) => {
+    const nameOf = (slotId, stage) => {
         if (!slotId)
-            return "Победитель пары";
-        const person = participants.find((participant) => participant.slotId === slotId);
+            return waitingName(stage);
+        const person = people.find((participant) => participant.slotId === slotId);
         return person ? `${person.bibNumber}. ${person.displayName}` : "—";
     };
     const quarter = playoff.quarterfinals;
     const semi = playoff.semifinals;
-    const championId = playoff.final.winnerSlotId;
+    const activeMatchId = snapshot || !playoffEntryOpen ? "" : selectedPlayoffMatchId;
     const openMatch = (match) => {
-        if (!match.slotIdA || !match.slotIdB)
+        if (snapshot || !match.slotIdA || !match.slotIdB)
             return undefined;
         return () => openPlayoffEntry(match.matchId);
     };
+    const podium = crowned ? (<div className="mb-8">
+      <Podium champion={crowned.champion} finalist={crowned.finalist} third={crowned.third} tournamentName={ceremonyName} tournamentDate={ceremonyDate}/>
+    </div>) : null;
     return (<section className="mt-6" aria-label="Сетка плей-офф">
       <div className="mb-3 flex flex-wrap items-end justify-between gap-2">
         <div>
           <h2 className="text-lg font-black tracking-tight sm:text-2xl">Плей-офф</h2>
           <p className="text-xs text-slate-400 sm:text-sm">
-            1/4, 1/2 и финал. Нажмите пару, чтобы ввести поимки. При равенстве дальше идёт более высокое место отбора.
+            1/4, 1/2, финал и матч за 3-е место. Ничья основного времени решается доп. 5-минуткой, затем «Золотой рыбой», и только потом рейтингом группы.
           </p>
         </div>
         <p className="rounded-full border border-cyan-300/40 bg-cyan-300/10 px-3 py-1 text-[11px] font-bold tracking-wide text-cyan-100 uppercase">
@@ -52,21 +111,43 @@ export function PlayoffBracket() {
         </p>
       </div>
 
-      <div className="overflow-x-auto rounded-3xl border border-white/10 bg-slate-950/80 p-3 shadow-xl shadow-black/30 sm:p-5">
-        <div className="flex min-w-[820px] items-center">
-          <div className="flex flex-1 flex-col gap-6">
-            <BracketHalf left={[quarter[0], quarter[3]]} right={semi[0]} nameOf={nameOf} activeMatchId={playoffEntryOpen ? selectedPlayoffMatchId : ""} openMatch={openMatch}/>
-            <BracketHalf left={[quarter[1], quarter[2]]} right={semi[1]} nameOf={nameOf} activeMatchId={playoffEntryOpen ? selectedPlayoffMatchId : ""} openMatch={openMatch}/>
+      {podium}
+
+      <div className="overflow-x-auto rounded-3xl border border-white/10 bg-slate-950/80 p-3 shadow-xl shadow-black/30 sm:p-6">
+        <div className="flex w-max items-center gap-x-8 pb-16">
+          <div className="relative flex flex-col gap-8">
+            <BracketHalf left={[quarter[0], quarter[3]]} right={semi[0]} nameOf={nameOf} activeMatchId={activeMatchId} openMatch={openMatch}/>
+            <BracketHalf left={[quarter[1], quarter[2]]} right={semi[1]} nameOf={nameOf} activeMatchId={activeMatchId} openMatch={openMatch}/>
+            <BracketJoin />
           </div>
-          <BracketJoin />
-          <div className="w-60 shrink-0">
-            <MatchCard match={playoff.final} nameOf={nameOf} featured active={playoffEntryOpen && selectedPlayoffMatchId === playoff.final.matchId} onOpen={openMatch(playoff.final)}/>
+          <div className="relative w-80 shrink-0">
+            <MatchCard match={playoff.final} nameOf={nameOf} featured active={activeMatchId === playoff.final.matchId} onOpen={openMatch(playoff.final)}/>
+            {/* Малый финал сидит под главным и не растягивает колонку, чтобы линия сетки целилась в финал. */}
+            <div className="absolute top-[calc(100%+1.25rem)] right-0 left-0">
+              <p className="mb-2 text-center text-[11px] font-black tracking-[0.2em] text-amber-200 uppercase">Малый финал</p>
+              <MatchCard match={playoff.thirdPlace} nameOf={nameOf} bronze active={activeMatchId === playoff.thirdPlace.matchId} onOpen={openMatch(playoff.thirdPlace)}/>
+            </div>
           </div>
         </div>
       </div>
 
-      {championId && (<p className="mt-4 rounded-2xl bg-gradient-to-r from-amber-200 via-amber-400 to-orange-400 px-4 py-3 text-center text-lg font-black text-slate-950">
-          Победитель турнира: {nameOf(championId)}
+      {standings && standings.length > 0 && <FinalStandingsTable rows={standings}/>}
+
+      {crowned && onArchive && (<div className="mt-6">
+          <button type="button" className={`h-14 w-full rounded-2xl text-base font-black tracking-wide ${archiving
+                ? "bg-slate-700 text-slate-400"
+                : "bg-gradient-to-r from-amber-200 via-amber-400 to-orange-400 text-slate-950"}`} disabled={archiving} onClick={onArchive}>
+            {archiving ? "Отправляем в архив..." : "Завершить и архивировать турнир"}
+          </button>
+          {archiveUrl && (<p className="mt-3 text-center text-sm text-slate-300">
+              Вечная страница итогов:{" "}
+              <a className="font-bold break-all text-cyan-200 underline" href={archiveUrl}>
+                {archiveUrl}
+              </a>
+            </p>)}
+        </div>)}
+      {!snapshot && !crowned && (<p className="mt-4 rounded-2xl border border-white/10 bg-slate-900 px-4 py-3 text-sm text-slate-300">
+          Подиум, итоговая таблица и кнопка «Завершить и архивировать турнир» появятся, когда будут сыграны финал и матч за 3-е место.
         </p>)}
     </section>);
 }
@@ -80,19 +161,27 @@ export function PlayoffEntryDialog({ organizer = false } = {}) {
     const opponentName = useMatchStore((state) => state.opponentName);
     const athleteFish = useMatchStore((state) => state.athleteFish);
     const opponentFish = useMatchStore((state) => state.opponentFish);
+    const athleteExtraFish = useMatchStore((state) => state.athleteExtraFish);
+    const opponentExtraFish = useMatchStore((state) => state.opponentExtraFish);
+    const athleteGoldenFish = useMatchStore((state) => state.athleteGoldenFish);
+    const opponentGoldenFish = useMatchStore((state) => state.opponentGoldenFish);
+    const goldenFirst = useMatchStore((state) => state.goldenFirst);
     const saving = useMatchStore((state) => state.saving);
     const confirmed = useMatchStore((state) => state.confirmed);
     const error = useMatchStore((state) => state.error);
     const adjustFish = useMatchStore((state) => state.adjustFish);
+    const adjustPlayoffLine = useMatchStore((state) => state.adjustPlayoffLine);
+    const setGoldenFirst = useMatchStore((state) => state.setGoldenFirst);
     const confirmPeriod = useMatchStore((state) => state.confirmPeriod);
     const closePlayoffEntry = useMatchStore((state) => state.closePlayoffEntry);
+    const [regulationReadyId, setRegulationReadyId] = useState("");
     useEffect(() => {
         if (!organizer || !open)
             return;
         if (useMatchStore.getState().error === NAME_REQUIRED)
             useMatchStore.setState({ error: null });
     }, [organizer, open]);
-    const match = [...playoff.quarterfinals, ...playoff.semifinals, ...(playoff.final ? [playoff.final] : [])].find((item) => item.matchId === selectedPlayoffMatchId);
+    const match = playoffMatches(playoff).find((item) => item.matchId === selectedPlayoffMatchId);
     if (!open || !match?.slotIdA || !match.slotIdB || match.placeA === null || match.placeB === null || match.seedA === null || match.seedB === null) {
         return null;
     }
@@ -100,13 +189,43 @@ export function PlayoffEntryDialog({ organizer = false } = {}) {
     const opponent = participants.find((participant) => participant.slotId === match.slotIdB);
     const athleteTitle = athlete ? `${athlete.bibNumber}. ${athlete.displayName}` : athleteName;
     const opponentTitle = opponent ? `${opponent.bibNumber}. ${opponent.displayName}` : opponentName;
-    const decision = scorePlayoffDuel(athleteFish, opponentFish, match.placeA, match.seedA, match.placeB, match.seedB);
-    const winnerName = decision.winner === "a" ? athleteTitle : opponentTitle;
-    const tied = athleteFish === opponentFish;
-    const started = athleteFish > 0 || opponentFish > 0 || confirmed;
+    const athletePerson = athlete?.displayName ?? athleteTitle;
+    const opponentPerson = opponent?.displayName ?? opponentTitle;
+    const regulationReady = regulationReadyId === match.matchId || match.winnerSlotId !== null || confirmed;
+    const regulationTied = athleteFish === opponentFish;
+    const extraTied = athleteExtraFish === opponentExtraFish;
+    const goldenTied = athleteGoldenFish === opponentGoldenFish;
+    const showExtra = regulationReady && regulationTied;
+    const showGolden = showExtra && extraTied;
+    const showRanking = showGolden && athleteGoldenFish === 0 && opponentGoldenFish === 0;
+    const needsFirst = showGolden && goldenTied && athleteGoldenFish > 0 && goldenFirst === null;
+    const decision = scorePlayoffDuel({
+        fishA: athleteFish,
+        fishB: opponentFish,
+        extraFishA: athleteExtraFish,
+        extraFishB: opponentExtraFish,
+        goldenFishA: athleteGoldenFish,
+        goldenFishB: opponentGoldenFish,
+        goldenFirst,
+        placeA: match.placeA,
+        seedA: match.seedA,
+        placeB: match.placeB,
+        seedB: match.seedB,
+    });
+    const winnerName = decision.winner === "a" ? athletePerson : decision.winner === "b" ? opponentPerson : "";
+    const ranking = scorePlayoffDuel({
+        fishA: 0,
+        fishB: 0,
+        placeA: match.placeA,
+        seedA: match.seedA,
+        placeB: match.placeB,
+        seedB: match.seedB,
+    });
+    const rankingName = ranking.winner === "a" ? athletePerson : ranking.winner === "b" ? opponentPerson : "";
     const visibleError = organizer && error === NAME_REQUIRED ? null : error;
+    const markRegulation = () => setRegulationReadyId(match.matchId);
     return (<div className="pointer-events-none fixed inset-x-0 bottom-0 z-50 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
-      <section role="dialog" aria-labelledby="playoff-entry-title" className="pointer-events-auto mx-auto w-full max-w-lg rounded-3xl border border-cyan-300/40 bg-slate-900 p-4 shadow-2xl shadow-black/60">
+      <section role="dialog" aria-labelledby="playoff-entry-title" className="pointer-events-auto mx-auto max-h-[min(92dvh,44rem)] w-full max-w-lg overflow-y-auto rounded-3xl border border-cyan-300/40 bg-slate-900 p-4 shadow-2xl shadow-black/60">
         <div className="flex items-start justify-between gap-3">
           <div>
             <p className="text-[11px] font-bold tracking-[0.16em] text-cyan-200 uppercase">Поимки этапа</p>
@@ -119,59 +238,125 @@ export function PlayoffEntryDialog({ organizer = false } = {}) {
           </button>
         </div>
 
-        <div className="mt-3 grid gap-2">
-          <CatchRow slotId={match.slotIdA} bibNumber={athlete?.bibNumber ?? 0} displayName={athlete?.displayName ?? athleteTitle} place={match.placeA} count={athleteFish} disabled={saving} canRename={organizer && athlete !== undefined} onPlus={() => adjustFish("athlete", 1)} onMinus={() => adjustFish("athlete", -1)}/>
-          <CatchRow slotId={match.slotIdB} bibNumber={opponent?.bibNumber ?? 0} displayName={opponent?.displayName ?? opponentTitle} place={match.placeB} count={opponentFish} disabled={saving} canRename={organizer && opponent !== undefined} onPlus={() => adjustFish("opponent", 1)} onMinus={() => adjustFish("opponent", -1)}/>
+        <p className="mt-2 text-xs font-semibold tracking-wide text-slate-400 uppercase">Основное время</p>
+        <div className="mt-2 grid gap-2">
+          <CatchRow slotId={match.slotIdA} bibNumber={athlete?.bibNumber ?? 0} displayName={athlete?.displayName ?? athleteTitle} place={match.placeA} count={athleteFish} disabled={saving} canRename={organizer && athlete !== undefined} onPlus={() => {
+            markRegulation();
+            adjustFish("athlete", 1);
+        }} onMinus={() => {
+            markRegulation();
+            adjustFish("athlete", -1);
+        }}/>
+          <CatchRow slotId={match.slotIdB} bibNumber={opponent?.bibNumber ?? 0} displayName={opponent?.displayName ?? opponentTitle} place={match.placeB} count={opponentFish} disabled={saving} canRename={organizer && opponent !== undefined} onPlus={() => {
+            markRegulation();
+            adjustFish("opponent", 1);
+        }} onMinus={() => {
+            markRegulation();
+            adjustFish("opponent", -1);
+        }}/>
         </div>
 
-        <p className={`mt-3 rounded-2xl px-3 py-2 text-sm font-semibold ${started && tied ? "bg-amber-300/15 text-amber-100" : "bg-cyan-300/10 text-cyan-50"}`}>
-          {started
-            ? tied
-                ? `Ничья ${athleteFish}:${opponentFish}. Дальше проходит ${winnerName}: место отбора выше.`
-                : `Дальше проходит ${winnerName} по поимкам.`
-            : "Введите поимки. При ничьей дальше идёт более высокое место отбора."}
-        </p>
+        {!regulationReady && regulationTied && (<button type="button" className="mt-3 w-full rounded-2xl bg-amber-300/15 px-3 py-2 text-left text-sm font-semibold text-amber-50" onClick={markRegulation}>
+            Равный счет. Введите результат дополнительной 5-минутки
+          </button>)}
 
-        <button type="button" className="mt-3 h-14 w-full rounded-2xl bg-amber-400 text-base font-black tracking-wide text-slate-950 disabled:bg-slate-700 disabled:text-slate-400" disabled={saving || confirmed} onClick={() => void confirmAndToast(() => confirmPeriod(organizer))}>
+        {regulationReady && !regulationTied && winnerName && (<p className="mt-3 rounded-2xl bg-cyan-300/10 px-3 py-2 text-sm font-semibold text-cyan-50">
+            Дальше проходит {winnerName} по основному времени.
+          </p>)}
+
+        <Reveal open={showExtra}>
+          <div className="rounded-2xl border border-amber-300/30 bg-amber-300/10 p-3">
+            <p className="text-sm font-semibold text-amber-50">Равный счет. Введите результат дополнительной 5-минутки</p>
+            <div className="mt-2 grid gap-2">
+              <CatchRow slotId={match.slotIdA} bibNumber={athlete?.bibNumber ?? 0} displayName={athletePerson} place={match.placeA} count={athleteExtraFish} disabled={saving} canRename={false} onPlus={() => adjustPlayoffLine("extra", "athlete", 1)} onMinus={() => adjustPlayoffLine("extra", "athlete", -1)}/>
+              <CatchRow slotId={match.slotIdB} bibNumber={opponent?.bibNumber ?? 0} displayName={opponentPerson} place={match.placeB} count={opponentExtraFish} disabled={saving} canRename={false} onPlus={() => adjustPlayoffLine("extra", "opponent", 1)} onMinus={() => adjustPlayoffLine("extra", "opponent", -1)}/>
+            </div>
+            {!extraTied && winnerName && (<p className="mt-2 text-sm font-semibold text-amber-50">Дальше проходит {winnerName}: победа в доп. время.</p>)}
+          </div>
+        </Reveal>
+
+        <Reveal open={showGolden}>
+          <div className="rounded-2xl border border-yellow-200/40 bg-yellow-200/10 p-3">
+            <p className="text-sm font-semibold text-yellow-50">Ничья в овертайме. Введите результат игры "Золотая рыба"</p>
+            <div className="mt-2 grid gap-2">
+              <CatchRow slotId={match.slotIdA} bibNumber={athlete?.bibNumber ?? 0} displayName={athletePerson} place={match.placeA} count={athleteGoldenFish} disabled={saving} canRename={false} onPlus={() => adjustPlayoffLine("golden", "athlete", 1)} onMinus={() => adjustPlayoffLine("golden", "athlete", -1)}/>
+              <CatchRow slotId={match.slotIdB} bibNumber={opponent?.bibNumber ?? 0} displayName={opponentPerson} place={match.placeB} count={opponentGoldenFish} disabled={saving} canRename={false} onPlus={() => adjustPlayoffLine("golden", "opponent", 1)} onMinus={() => adjustPlayoffLine("golden", "opponent", -1)}/>
+            </div>
+            {goldenTied && athleteGoldenFish > 0 && (<div className="mt-2 grid grid-cols-2 gap-2">
+                <button type="button" className={`rounded-xl px-2 py-2 text-sm font-bold ${goldenFirst === "a" ? "bg-yellow-200 text-slate-950" : "bg-slate-950 text-yellow-50"}`} aria-pressed={goldenFirst === "a"} onClick={() => setGoldenFirst("a")}>
+                  Первым поймал {athletePerson}
+                </button>
+                <button type="button" className={`rounded-xl px-2 py-2 text-sm font-bold ${goldenFirst === "b" ? "bg-yellow-200 text-slate-950" : "bg-slate-950 text-yellow-50"}`} aria-pressed={goldenFirst === "b"} onClick={() => setGoldenFirst("b")}>
+                  Первым поймал {opponentPerson}
+                </button>
+              </div>)}
+            {decision.decidedBy === "goldenFish" && winnerName && (<p className="mt-2 text-sm font-semibold text-yellow-50">Дальше проходит {winnerName}: победа по золотой рыбе.</p>)}
+          </div>
+        </Reveal>
+
+        <Reveal open={showRanking}>
+          <p className="rounded-2xl bg-rose-400/15 px-3 py-2 text-sm font-semibold text-rose-50">
+            Внимание! Победитель будет определен по итогам группы. Проходит {rankingName}
+          </p>
+        </Reveal>
+
+        <button type="button" className="mt-3 h-14 w-full rounded-2xl bg-amber-400 text-base font-black tracking-wide text-slate-950 disabled:bg-slate-700 disabled:text-slate-400" disabled={saving || confirmed || needsFirst || (regulationTied && !regulationReady)} onClick={() => void confirmAndToast(() => confirmPeriod(organizer))}>
           {saving ? "Сохраняем..." : confirmed ? "Дуэль сохранена" : "Подтвердить поимки"}
         </button>
         {visibleError && <p className="mt-2 text-center text-sm text-rose-300">{visibleError}</p>}
       </section>
     </div>);
 }
+function Reveal({ open, children }) {
+    return (<div className={`grid transition-[grid-template-rows,opacity,margin] duration-300 ease-out ${open ? "mt-3 grid-rows-[1fr] opacity-100" : "pointer-events-none mt-0 grid-rows-[0fr] opacity-0"}`} aria-hidden={open ? undefined : true}>
+      <div className="overflow-hidden">{children}</div>
+    </div>);
+}
 function BracketHalf({ left, right, nameOf, activeMatchId, openMatch, }) {
-    return (<div className="flex items-center">
-      <div className="flex w-60 shrink-0 flex-col gap-3">
+    return (<div className="flex items-center gap-x-8">
+      <div className="relative flex w-80 shrink-0 flex-col gap-4">
         <MatchCard match={left[0]} nameOf={nameOf} active={activeMatchId === left[0].matchId} onOpen={openMatch(left[0])}/>
         <MatchCard match={left[1]} nameOf={nameOf} active={activeMatchId === left[1].matchId} onOpen={openMatch(left[1])}/>
+        <BracketJoin />
       </div>
-      <BracketJoin />
-      <div className="w-60 shrink-0">
+      <div className="w-80 shrink-0">
         <MatchCard match={right} nameOf={nameOf} active={activeMatchId === right.matchId} onOpen={openMatch(right)}/>
       </div>
     </div>);
 }
 function BracketJoin() {
-    return (<div className="relative mx-1 w-8 shrink-0 self-stretch" aria-hidden="true">
-      <div className="absolute top-[22%] bottom-[22%] left-0 w-4 rounded-r-2xl border-y-2 border-r-2 border-cyan-200/40"/>
-      <div className="absolute top-1/2 left-4 h-0.5 w-4 -translate-y-1/2 bg-cyan-200/40"/>
+    return (<div className="pointer-events-none absolute inset-y-0 left-full w-8" aria-hidden="true">
+      <div className="absolute top-[18%] bottom-[18%] left-0 w-4 rounded-r-2xl border-y-2 border-r-2 border-cyan-300 shadow-[0_0_12px_rgba(34,211,238,0.4)]"/>
+      <div className="absolute top-1/2 left-4 h-0.5 w-4 -translate-y-1/2 bg-cyan-300 shadow-[0_0_10px_rgba(34,211,238,0.65)]"/>
     </div>);
 }
-function MatchCard({ match, nameOf, featured = false, active = false, onOpen, }) {
+function MatchCard({ match, nameOf, featured = false, bronze = false, active = false, onOpen, }) {
+    const marker = overtimeMarker(match.decidedBy);
+    const goldenTie = match.decidedBy === "goldenFish" &&
+        match.fishA !== null &&
+        match.fishB !== null &&
+        match.fishA === match.fishB &&
+        match.winnerSlotId !== null;
     const className = `w-full overflow-hidden rounded-2xl border bg-slate-900 text-left ${active
         ? "border-cyan-300 ring-2 ring-cyan-300"
         : featured
-            ? "border-amber-300/50 shadow-lg shadow-amber-400/10"
-            : "border-white/10"} ${onOpen ? "cursor-pointer hover:border-cyan-200/50" : ""}`;
+            ? "border-amber-300 shadow-xl shadow-amber-400/20"
+            : bronze
+                ? "border-amber-700/50"
+                : "border-white/10"} ${onOpen ? "cursor-pointer hover:border-cyan-200/50" : ""}`;
     const body = (<>
-      <p className="bg-slate-950 px-3 py-1.5 text-[10px] font-bold tracking-[0.16em] text-slate-400 uppercase">
+      <p className="bg-slate-950 px-4 py-2.5 text-[11px] font-bold tracking-[0.16em] text-slate-300 uppercase">
         {playoffStageTitle(match.stage)}
-        {match.seedA !== null && match.seedB !== null ? ` · ${match.seedA}—${match.seedB}` : ""}
+        {match.stage !== "third" && match.seedA !== null && match.seedB !== null ? ` · ${match.seedA}—${match.seedB}` : ""}
       </p>
-      <MatchSide name={nameOf(match.slotIdA)} place={match.placeA} fish={match.fishA} winner={match.winnerSlotId !== null && match.winnerSlotId === match.slotIdA} waiting={match.slotIdA === null}/>
-      <MatchSide name={nameOf(match.slotIdB)} place={match.placeB} fish={match.fishB} winner={match.winnerSlotId !== null && match.winnerSlotId === match.slotIdB} waiting={match.slotIdB === null} divider/>
-      {match.decidedBy === "qualifyingPlace" && (<p className="border-t border-amber-300/20 bg-amber-300/10 px-3 py-1.5 text-[11px] font-semibold text-amber-100">
-          Ничья по поимкам · тай-брейк отбора
+      <MatchSide name={nameOf(match.slotIdA, match.stage)} place={match.placeA} fish={match.fishA} winner={match.winnerSlotId !== null && match.winnerSlotId === match.slotIdA} waiting={match.slotIdA === null} goldenTie={goldenTie} trophy={featured && match.winnerSlotId !== null && match.winnerSlotId === match.slotIdA}/>
+      <MatchSide name={nameOf(match.slotIdB, match.stage)} place={match.placeB} fish={match.fishB} winner={match.winnerSlotId !== null && match.winnerSlotId === match.slotIdB} waiting={match.slotIdB === null} goldenTie={goldenTie} trophy={featured && match.winnerSlotId !== null && match.winnerSlotId === match.slotIdB} divider/>
+      {marker && (<p className={`border-t px-3 py-1.5 text-[11px] font-semibold ${match.decidedBy === "goldenFish"
+                ? "border-yellow-200/30 bg-yellow-200/10 text-yellow-50"
+                : match.decidedBy === "extraTime"
+                    ? "border-cyan-300/30 bg-cyan-300/10 text-cyan-50"
+                    : "border-amber-300/20 bg-amber-300/10 text-amber-100"}`}>
+          {marker}
         </p>)}
     </>);
     if (!onOpen) {
@@ -179,16 +364,28 @@ function MatchCard({ match, nameOf, featured = false, active = false, onOpen, })
         {body}
       </article>);
     }
-    return (<button type="button" className={className} data-match-id={match.matchId} aria-label={`Ввести поимки, ${playoffStageTitle(match.stage)}: ${nameOf(match.slotIdA)} — ${nameOf(match.slotIdB)}`} aria-pressed={active} onClick={onOpen}>
+    return (<button type="button" className={className} data-match-id={match.matchId} aria-label={`Ввести поимки, ${playoffStageTitle(match.stage)}: ${nameOf(match.slotIdA, match.stage)} — ${nameOf(match.slotIdB, match.stage)}`} aria-pressed={active} onClick={onOpen}>
       {body}
     </button>);
 }
-function MatchSide({ name, place, fish, winner, waiting, divider = false, }) {
-    return (<div className={`flex items-center justify-between gap-2 px-3 py-2 ${divider ? "border-t border-white/10" : ""} ${winner ? "bg-cyan-300/15 text-cyan-50" : "text-slate-200"}`} data-advanced={winner ? "true" : "false"}>
-      <span className={`min-w-0 truncate text-sm font-semibold ${waiting ? "text-slate-500" : ""}`}>{name}</span>
+function MatchSide({ name, place, fish, winner, waiting, goldenTie = false, trophy = false, divider = false, }) {
+    const tone = goldenTie && winner
+        ? "bg-gradient-to-r from-emerald-400/50 to-amber-300/55 text-amber-50"
+        : goldenTie && !winner && !waiting
+            ? "text-slate-100 opacity-50"
+            : winner
+                ? "bg-cyan-300/15 text-cyan-50"
+                : "text-slate-100";
+    return (<div className={`flex items-center justify-between gap-3 px-4 py-3 ${divider ? "border-t border-white/10" : ""} ${tone}`} data-advanced={winner ? "true" : "false"}>
+      <span className={`line-clamp-2 min-w-0 text-base font-bold leading-snug ${waiting ? "text-slate-500" : ""}`}>
+        {trophy && (<span className="mr-1 inline-block align-[-1px] text-sm leading-none" aria-hidden="true">
+            🏆
+          </span>)}
+        {name}
+      </span>
       <span className="flex shrink-0 items-center gap-2">
-        {place !== null && <span className="text-[10px] font-bold text-slate-400">#{place}</span>}
-        <span className="w-6 text-right text-base font-black tabular-nums">{fish === null ? "–" : fish}</span>
+        {place !== null && <span className="text-[11px] font-bold text-slate-400">#{place}</span>}
+        <span className="w-8 text-right text-xl font-black tabular-nums">{fish === null ? "–" : fish}</span>
       </span>
     </div>);
 }

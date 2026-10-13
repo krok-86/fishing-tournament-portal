@@ -62,28 +62,31 @@ export function AthleteQrButton() {
     }
   }
 
-  if (!ready) {
+  if (cupMode && !ready) {
     return (
       <p className="mt-3 text-center text-sm font-semibold text-slate-300">
-        {cupMode
-          ? "QR-код матча появится сразу после сохранения дуэли."
-          : `Периоды 1–7 остаются в памяти телефона. Кнопка QR появится после 8-го периода.${
-              qualifyingSavedCount > 0 ? ` Уже сохранено: ${qualifyingSavedCount} из 8.` : ""
-            }`}
+        QR-код матча появится сразу после сохранения дуэли.
       </p>
     );
   }
+
+  const resultsLocked = !cupMode && !qualifyingHandoffReady;
 
   return (
     <>
       <button
         type="button"
         className="mt-3 min-h-20 w-full rounded-2xl bg-white px-3 py-3 text-lg leading-tight font-black text-slate-950 disabled:bg-slate-700 disabled:text-slate-400"
-        disabled={saving || busy}
+        disabled={saving || busy || resultsLocked}
         onClick={() => void generate()}
       >
         {busy ? "Собираем результаты…" : cupMode ? "Сгенерировать QR-код матча" : "Сгенерировать QR-код результатов"}
       </button>
+      {resultsLocked && (
+        <p className="mt-2 text-center text-sm font-semibold text-slate-300">
+          Кнопка включится, когда в телефоне подтверждены все 8 периодов. Уже сохранено: {qualifyingSavedCount} из 8.
+        </p>
+      )}
       {error && <p className="mt-2 text-center text-sm text-rose-300">{error}</p>}
       {packet && (
         <div className="fixed inset-0 z-30 flex items-end justify-center bg-slate-950/80 p-3 sm:items-center" role="presentation">

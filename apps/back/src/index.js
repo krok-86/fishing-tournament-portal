@@ -83,7 +83,7 @@ function attachMatchRoutes(app) {
         }
         const key = duelKey(parsed.period, parsed.side.bibNumber, parsed.side.opponentBib);
         const current = exports.inMemoryMatches[key];
-        const match = current !== null && current !== void 0 ? current : {
+        const match = current ?? {
             id: key,
             period: parsed.period,
             opponentBib: parsed.side.opponentBib,
@@ -113,6 +113,7 @@ function attachMatchRoutes(app) {
                 updatedAt: match.updatedAt,
             };
         });
+        res.set("Cache-Control", "no-store");
         res.json({ matches });
     });
 }

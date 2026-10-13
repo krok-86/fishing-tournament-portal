@@ -12,7 +12,7 @@ export interface LiveCatch {
 export type PlayoffStageCode = "QF" | "SF" | "F" | "TF";
 export interface QrPlayoffCell {
     stage: PlayoffStageCode;
-    /** Номер пары с 1: четвертьфинал 1–4, полуфинал 1–2, финал 1. */
+    /** Номер пары с 1: четвертьфинал 1–4, полуфинал 1–2, финал и матч за 3-е место — 1. */
     pair: number;
     fish: number;
 }
@@ -47,6 +47,8 @@ export interface PlayerQrImport {
     cup?: string;
     /** Период, который телефон игрока вложил в код при сдаче. Сирену орга не перебивает. */
     mark?: string;
+    /** Сколько периодов QR не совпали с уже записанным счётом. */
+    disputes?: number;
 }
 export type PlayerQrImportResult = {
     ok: true;

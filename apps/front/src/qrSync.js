@@ -2,7 +2,7 @@ import { QUALIFYING_PERIOD_COUNT } from "../../../packages/shared/src/types.ts";
 /**
  * Короткая строка поимок одного номера: FTP1|<номер>|<тур>.<период>=<рыбы>;...|N<ФИО>
  * Плей-офф вместо периода: FTP1|<номер>|QF|<пара>=<рыбы>|N<ФИО>
- * QF — четвертьфинал, пары 1–4. SF — полуфинал, пары 1–2. F — финал, пара 1.
+ * QF — четвертьфинал, пары 1–4. SF — полуфинал, пары 1–2. F — финал, пара 1. TF — матч за 3-е место, пара 1.
  * Пример: FTP1|4|QF|1=3 — номер 4, первая четвертьфинальная пара, 3 рыбы.
  * Хвост S1F — период и сирена с телефона, который сдал код. На очки не влияет.
  * В коде номер жеребьёвки, не slotId: на телефоне организатора слоты другие.
@@ -12,9 +12,9 @@ import { QUALIFYING_PERIOD_COUNT } from "../../../packages/shared/src/types.ts";
  */
 const PREFIX = "FTP1";
 const MAX_FISH = 9999;
-const PLAYOFF_CELL = /^(QF|SF|F)\|([1-4])=(\d{1,4})$/;
-const PAIR_LIMIT = { QF: 4, SF: 2, F: 1 };
-const STAGE_ORDER = { QF: 0, SF: 1, F: 2 };
+const PLAYOFF_CELL = /^(QF|SF|F|TF)\|([1-4])=(\d{1,4})$/;
+const PAIR_LIMIT = { QF: 4, SF: 2, F: 1, TF: 1 };
+const STAGE_ORDER = { QF: 0, SF: 1, F: 2, TF: 3 };
 /** Сумма несинхронизированных дельт. Закрытый период без поимок уходит как ноль. */
 export function snapshotFromEvents(records, slotId, live) {
     const anyCatch = new Set();
@@ -64,6 +64,8 @@ export function encodePlayoffSnapshot(bibNumber, cells, mark, displayName) {
 export function playoffMatchId(stage, pair) {
     if (stage === "F")
         return "final";
+    if (stage === "TF")
+        return "third";
     if (stage === "SF")
         return `sf-${pair - 1}`;
     return `qf-${pair - 1}`;
@@ -73,6 +75,8 @@ export function playoffStageCode(stage) {
         return "QF";
     if (stage === "semifinal")
         return "SF";
+    if (stage === "third")
+        return "TF";
     return "F";
 }
 export function decodeCatchSnapshot(raw) {
@@ -174,10 +178,10 @@ function decodePlayoffBody(bibNumber, body) {
 }
 function isPlayoffBody(body) {
     const head = body.split(";")[0] ?? "";
-    return /^(QF|SF|F)\|/.test(head);
+    return /^(QF|SF|F|TF)\|/.test(head);
 }
 function isPlayoffStage(value) {
-    return value === "QF" || value === "SF" || value === "F";
+    return value === "QF" || value === "SF" || value === "F" || value === "TF";
 }
 function comparePlayoffCells(left, right) {
     return STAGE_ORDER[left.stage] - STAGE_ORDER[right.stage] || left.pair - right.pair;

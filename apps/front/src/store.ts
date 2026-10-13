@@ -194,7 +194,7 @@ interface MatchStore extends SectorView {
   exportAthleteResults: () => Promise<PlayerQrExportResult>;
   /** Вписывает строку QR в журнал и помечает эти поимки синхронизированными. */
   importAthleteResults: (payload: string) => Promise<PlayerQrImportResult>;
-  /** Этот номер закрыл 8-й период: один QR может унести весь отбор. */
+  /** Все 8 периодов отбора этого номера подтверждены в журнале телефона. */
   qualifyingHandoffReady: boolean;
   /** Сколько периодов 1–8 этот номер уже сохранил на телефоне. */
   qualifyingSavedCount: number;
@@ -223,7 +223,7 @@ interface MatchStore extends SectorView {
   /** По очереди отправляет всё, что зависло, пока есть сеть. */
   flushOutbox: () => Promise<{ sent: number }>;
   /** Вносит онлайн-результаты в пустые ячейки и помечает расхождения. */
-  applyOnlineMatches: (matches: readonly SyncMatch[]) => Promise<void>;
+  applyOnlineMatches: (matches: readonly SyncMatch[]) => Promise<boolean>;
 }
 
 const emptySector: SectorView = {
@@ -1195,8 +1195,10 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
       }
 
       const stored = rows.map((row) => row.event);
-      if (!closedQualifyingPeriods(stored, slotId).has(QUALIFYING_PERIOD_COUNT)) {
-        return { ok: false, error: "QR отбора собирается после 8-го периода" };
+      const closed = closedQualifyingPeriods(stored, slotId);
+      if (!allQualifyingPeriodsClosed(closed)) {
+        const saved = QUALIFYING_PERIODS.filter((period) => closed.has(period)).length;
+        return { ok: false, error: `Сначала подтвердите все 8 периодов. Уже сохранено: ${saved} из 8.` };
       }
       const entry = tournamentCalculator.generateLeaderboard(stored).find((item) => item.slotId === slotId);
       const cells: QrCatchCell[] = QUALIFYING_PERIODS.map((period) => ({
@@ -1326,7 +1328,7 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
         slotId,
       );
       set({
-        qualifyingHandoffReady: closed.has(QUALIFYING_PERIOD_COUNT),
+        qualifyingHandoffReady: allQualifyingPeriodsClosed(closed),
         qualifyingSavedCount: QUALIFYING_PERIODS.filter((period) => closed.has(period)).length,
         cupHandoffReady: false,
       });
@@ -1436,32 +1438,48 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
   },
 
   async applyOnlineMatches(matches) {
-    if (!get().tournamentOpened || matches.length === 0) return;
-    try {
-      let filled = 0;
-      for (const match of matches) {
-        const result = await ingestMatch(get, {
-          period: match.period,
-          status: match.status,
-          reports: match.reports.map((report) => ({
-            bibNumber: report.bibNumber,
-            opponentBib: report.opponentBib,
-            ownFish: report.ownFish,
-            opponentFish: report.opponentFish,
-          })),
-        });
-        filled += result.filled;
+    return enqueueOnlineApply(async () => {
+      if (!get().tournamentOpened || matches.length === 0) return true;
+      try {
+        let filled = 0;
+        for (const match of matches) {
+          const result = await ingestMatch(get, {
+            period: match.period,
+            status: match.status,
+            reports: match.reports.map((report) => ({
+              bibNumber: report.bibNumber,
+              opponentBib: report.opponentBib,
+              ownFish: report.ownFish,
+              opponentFish: report.opponentFish,
+            })),
+          });
+          filled += result.filled;
+        }
+        set({ duelConflicts: await db.duelConflicts.toArray() });
+        if (filled > 0) {
+          await get().loadLeaderboard();
+          await get().refreshHandoff();
+        }
+        return true;
+      } catch {
+        // Сеть или журнал заняты. Следующий опрос повторит те же пакеты.
+        return false;
       }
-      set({ duelConflicts: await db.duelConflicts.toArray() });
-      if (filled > 0) {
-        await get().loadLeaderboard();
-        await get().refreshHandoff();
-      }
-    } catch {
-      // Сеть или журнал заняты. Следующий опрос повторит те же пакеты.
-    }
+    });
   },
 }));
+
+/** Ручное обновление и фоновый опрос не пишут один и тот же период одновременно. */
+let onlineApplyChain: Promise<unknown> = Promise.resolve();
+
+function enqueueOnlineApply<T>(job: () => Promise<T>): Promise<T> {
+  const run = onlineApplyChain.then(job, job);
+  onlineApplyChain = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
 
 interface SetupSnapshot {
   participants: RegisteredParticipant[];
@@ -2414,6 +2432,10 @@ async function replacePeriodCatches(
 
 function isQualifyingPeriod(period: PeriodIndex): boolean {
   return (QUALIFYING_PERIODS as readonly PeriodIndex[]).includes(period);
+}
+
+function allQualifyingPeriodsClosed(closed: ReadonlySet<PeriodIndex>): boolean {
+  return QUALIFYING_PERIODS.every((period) => closed.has(period));
 }
 
 function closedQualifyingPeriods(events: readonly TournamentEvent[], slotId: string): Set<PeriodIndex> {

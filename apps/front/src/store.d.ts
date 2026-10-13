@@ -1,4 +1,7 @@
 import { type FishDelta, type GridSlot, type GroupId, type LeaderboardEntry, type MatrixDuel, type PeriodIndex, type PeriodPhase, type PlayoffProjection, type RoundIndex, type Side } from "../../../packages/shared/src/types.ts";
+import { type ArchivePostResult } from "./archiveApi.ts";
+import { type DuelConflictRecord, type OutboxItem } from "./db.ts";
+import { type SyncMatch } from "./matchSync.ts";
 import { type PlayerQrExportResult, type PlayerQrImportResult } from "./qrSync.ts";
 export interface RegisteredParticipant {
     slotId: string;
@@ -34,11 +37,15 @@ interface MatchStore extends SectorView {
     officiallyStarted: boolean;
     athleteFish: number;
     opponentFish: number;
+    /** Доп. 5 минут выбранной кубковой пары. */
     athleteExtraFish: number;
     opponentExtraFish: number;
+    /** Золотая рыба выбранной кубковой пары. */
     athleteGoldenFish: number;
     opponentGoldenFish: number;
+    /** Кто первым поймал золотую рыбу. Сторона A — спортсмен слева в паре. */
     goldenFirst: "a" | "b" | null;
+    /** Организатор уже менял счёт открытой пары: сетка показывает черновик. */
     playoffDraftActive: boolean;
     pending: PendingCatch[];
     confirmed: boolean;
@@ -73,6 +80,7 @@ interface MatchStore extends SectorView {
     playoffSaving: boolean;
     playoffError: string | null;
     adjustFish: (who: "athlete" | "opponent", delta: FishDelta) => void;
+    /** Доп. 5 минут или золотая рыба в открытой кубковой паре. */
     adjustPlayoffLine: (phase: "extra" | "golden", who: "athlete" | "opponent", delta: FishDelta) => void;
     setGoldenFirst: (side: "a" | "b") => void;
     /** Период отбора 1–8. Пишет тот же сигнал, что и сирена орга. */
@@ -107,6 +115,11 @@ interface MatchStore extends SectorView {
      * Форма файла: { "participants": [{ "bibNumber": 1, "displayName": "Иванов", "groupId": "A" }] }
      */
     importRegistrationBatch: (value: unknown) => Promise<boolean>;
+    /**
+     * ФИО с `GET /api/participants` в порядке заявок.
+     * Новые имена дописываются в лист и получают следующие номера: 1, 2, 3 без пропусков.
+     */
+    importOnlineRoster: (names: readonly string[]) => Promise<OnlineRosterImportResult>;
     replaceParticipant: (slotId: string, displayName: string) => Promise<boolean>;
     /**
      * До открытия турнира фантома не создаёт: строка снимается целиком, номера смыкаются.
@@ -134,7 +147,7 @@ interface MatchStore extends SectorView {
     exportAthleteResults: () => Promise<PlayerQrExportResult>;
     /** Вписывает строку QR в журнал и помечает эти поимки синхронизированными. */
     importAthleteResults: (payload: string) => Promise<PlayerQrImportResult>;
-    /** Этот номер закрыл 8-й период: один QR может унести весь отбор. */
+    /** Все 8 периодов отбора этого номера подтверждены в журнале телефона. */
     qualifyingHandoffReady: boolean;
     /** Сколько периодов 1–8 этот номер уже сохранил на телефоне. */
     qualifyingSavedCount: number;
@@ -148,10 +161,24 @@ interface MatchStore extends SectorView {
     correctPeriodFish: (slotId: string, period: PeriodIndex, ownFish: number, opponentFish: number) => Promise<string | null>;
     /** Топ-8 после 8-го периода: пары 1–8, 2–7, 3–6, 4–5. Пишет FORM_PLAYOFF. */
     formPlayoff: () => Promise<boolean>;
+    /** Финал и матч за 3-е место уже есть: снимок уходит в PostgreSQL. */
+    archiveTournament: () => Promise<ArchivePostResult>;
     selectPlayoffMatch: (matchId: string) => void;
     /** Открывает окно поимок четвертьфинала, полуфинала или финала. */
     openPlayoffEntry: (matchId: string) => void;
     closePlayoffEntry: () => void;
+    /** Пакеты улова, которые сервер ещё не принял. */
+    outboxQueue: OutboxItem[];
+    /** Открытые расхождения дуэлей. Ячейка таблицы орга красится по этому списку. */
+    duelConflicts: DuelConflictRecord[];
+    /** Тихий итог последней отправки периода: сеть или только телефон. */
+    syncNote: string | null;
+    /** По очереди отправляет всё, что зависло, пока есть сеть. */
+    flushOutbox: () => Promise<{
+        sent: number;
+    }>;
+    /** Вносит онлайн-результаты в пустые ячейки и помечает расхождения. */
+    applyOnlineMatches: (matches: readonly SyncMatch[]) => Promise<boolean>;
 }
 export declare const useMatchStore: import("zustand").UseBoundStore<import("zustand").StoreApi<MatchStore>>;
 /** Одна строка пачки. Так выглядит участник в JSON онлайн-регистрации. */
@@ -167,6 +194,17 @@ export interface RegistrationBatch {
 export type RegistrationBatchResult = {
     ok: true;
     batch: RegistrationBatch;
+} | {
+    ok: false;
+    error: string;
+};
+/** Результат кнопки «Импортировать список из онлайна». Номера — место в стартовом листе. */
+export type OnlineRosterImportResult = {
+    ok: true;
+    added: number;
+    alreadyOnSheet: number;
+    fromBib: number;
+    toBib: number;
 } | {
     ok: false;
     error: string;

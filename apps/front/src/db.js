@@ -1,6 +1,8 @@
 import Dexie from "dexie";
 class TournamentDatabase extends Dexie {
     events;
+    outboxQueue;
+    duelConflicts;
     constructor() {
         super("FishingTournamentPortal");
         this.version(1).stores({
@@ -30,6 +32,12 @@ class TournamentDatabase extends Dexie {
             events: "id, tournamentId, type, timestamp, isSynced",
         })
             .upgrade((tx) => tx.table("events").clear());
+        // Очередь отправки и споры дуэлей. Журнал турнира не трогаем.
+        this.version(6).stores({
+            events: "id, tournamentId, type, timestamp, isSynced",
+            outboxQueue: "id, createdAt",
+            duelConflicts: "id, period, slotId, status",
+        });
     }
 }
 export const db = new TournamentDatabase();

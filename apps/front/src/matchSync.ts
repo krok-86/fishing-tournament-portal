@@ -41,7 +41,8 @@ export async function fetchMatchSync(): Promise<{ ok: true; matches: SyncMatch[]
   const timer = window.setTimeout(() => controller.abort(), REPORT_TIMEOUT_MS);
   try {
     const response = await fetch("/api/matches/sync", {
-      headers: { Accept: "application/json" },
+      headers: { Accept: "application/json", "Cache-Control": "no-cache" },
+      cache: "no-store",
       signal: controller.signal,
     });
     if (!response.ok) return { ok: false };

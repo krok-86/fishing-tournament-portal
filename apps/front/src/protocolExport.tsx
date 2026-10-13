@@ -1,3 +1,4 @@
+import { useState, type ReactNode } from "react";
 import { isGhostOpponent } from "../../../packages/shared/src/calculator.ts";
 import {
   QUALIFYING_PERIODS,
@@ -6,6 +7,7 @@ import {
   type PeriodIndex,
   type PeriodPoints,
 } from "../../../packages/shared/src/types.ts";
+import { downloadParticipantCardsPdf, downloadTournamentWorkbook } from "./protocolDownload.ts";
 import { periodSeat, useMatchStore, type RegisteredParticipant } from "./store.ts";
 import { toast } from "./toast.ts";
 
@@ -17,9 +19,13 @@ export function formatDrawName(bibNumber: number, displayName: string): string {
 export interface ParticipantCardPeriod {
   period: PeriodIndex;
   sectorId: string;
+  /** «л» — левый борт, «п» — правый. На бланке стоит в углу ячейки сектора. */
+  bank: "л" | "п" | null;
   /** ID соперника в сетке Бергера. `GHOST`, если в секторе один спортсмен. */
   opponentSlotId: string | null;
   opponentBib: number | null;
+  /** Номер соседа, с кем сравнивают одиночку. На бланке: `- (5)`. */
+  compareBib: number | null;
   ownFish: number;
   opponentFish: number;
   points: PeriodPoints;
@@ -49,34 +55,19 @@ export interface TournamentGridRow {
   played: boolean;
 }
 
-/**
- * Заготовка PDF. Сюда подключается jspdf:
- *   const { jsPDF } = await import("jspdf");
- *   const doc = new jsPDF();
- *   for (const card of stub.cards) { ...страница бланка... }
- *   doc.save(stub.filename);
- * Пока библиотеки нет: файл не пишется, наружу уходят готовые страницы.
- */
+/** Собранные страницы карточек. Файл пишет `downloadParticipantCardsPdf`. */
 export interface PdfCardStub {
   library: "jspdf";
-  integrated: false;
+  integrated: true;
   filename: string;
   pageCount: number;
   cards: ParticipantCard[];
 }
 
-/**
- * Заготовка книги Excel. Сюда подключается xlsx:
- *   const XLSX = await import("xlsx");
- *   const sheet = XLSX.utils.json_to_sheet(stub.rows);
- *   const book = XLSX.utils.book_new();
- *   XLSX.utils.book_append_sheet(book, sheet, stub.sheetName);
- *   XLSX.writeFile(book, stub.filename);
- * Пока библиотеки нет: файл не пишется, наружу уходят строки сетки.
- */
+/** Строки сетки до записи книги. Файл пишет `downloadTournamentWorkbook`: стартовый список и матрица переходов. */
 export interface XlsxGridStub {
   library: "xlsx";
-  integrated: false;
+  integrated: true;
   filename: string;
   sheetName: string;
   rows: TournamentGridRow[];
@@ -119,16 +110,24 @@ export function buildParticipantCards(
       displayName: participant.displayName,
       periods: QUALIFYING_PERIODS.map((period) => {
         const seat = periodSeat(grid, participants, participant.slotId, period);
+        const drawn = grid.find(
+          (slot) => slot.round === 1 && slot.period === period && slot.slotId === participant.slotId,
+        );
         const bergerId = seat?.bergerOpponentSlotId ?? null;
         const scoringId = seat?.opponentSlotId ?? null;
         const fish = facingFish(leaderboard, participant.slotId, period, scoringId);
-        const opponentBib =
-          bergerId && !isGhostOpponent(bergerId) ? (bibOf.get(bergerId) ?? null) : null;
+        const berger = bergerId ? participants.find((person) => person.slotId === bergerId) : undefined;
+        const opponentMissing = !berger || berger.ghost || isGhostOpponent(bergerId);
+        const opponentBib = !opponentMissing && berger ? berger.bibNumber : null;
+        const compareBib =
+          opponentMissing && scoringId && !isGhostOpponent(scoringId) ? (bibOf.get(scoringId) ?? null) : null;
         return {
           period,
           sectorId: seat?.sectorId ?? "",
+          bank: drawn?.side === "left" ? "л" : drawn?.side === "right" ? "п" : null,
           opponentSlotId: bergerId,
           opponentBib,
+          compareBib,
           ownFish: fish.ownFish,
           opponentFish: fish.opponentFish,
           points: fish.points,
@@ -141,7 +140,7 @@ export function buildParticipantCards(
 export function prepareParticipantCardsPdf(cards: readonly ParticipantCard[]): PdfCardStub {
   return {
     library: "jspdf",
-    integrated: false,
+    integrated: true,
     filename: "kartochki-uchastnikov.pdf",
     pageCount: cards.length,
     cards: cards.map((card) => ({ ...card, periods: card.periods.map((period) => ({ ...period })) })),
@@ -166,55 +165,79 @@ export function prepareTournamentGridXlsx(cards: readonly ParticipantCard[]): Xl
   );
   return {
     library: "xlsx",
-    integrated: false,
+    integrated: true,
     filename: "setka-turnira.xlsx",
     sheetName: "Сетка",
     rows,
   };
 }
 
-export function ProtocolExportButtons({ grid }: { grid?: readonly GridSlot[] }) {
+export function ProtocolExportButtons({
+  grid,
+  middle,
+}: {
+  grid?: readonly GridSlot[];
+  middle?: ReactNode;
+}) {
   const participants = useMatchStore((state) => state.participants);
   const leaderboard = useMatchStore((state) => state.leaderboard);
   const storeGrid = useMatchStore((state) => state.grid);
   const draw = grid ?? storeGrid;
   const ready = participants.some((participant) => !participant.ghost) && draw.length > 0;
+  const [busy, setBusy] = useState<"pdf" | "xlsx" | null>(null);
 
   function cards(): ParticipantCard[] {
     return buildParticipantCards(participants, draw, leaderboard);
   }
 
   return (
-    <div className="grid gap-2 sm:grid-cols-2">
+    <div className={`grid gap-2 ${middle ? "sm:grid-cols-3" : "sm:grid-cols-2"}`}>
       <button
         type="button"
         className="h-12 rounded-2xl border border-white/15 bg-slate-900 px-3 text-sm font-black text-white disabled:text-slate-500"
-        disabled={!ready}
+        disabled={!ready || busy !== null}
         onClick={() => {
-          const pdf = prepareParticipantCardsPdf(cards());
-          if (pdf.pageCount === 0) {
+          const list = cards();
+          if (list.length === 0) {
             toast("err", "Нет участников для карточек");
             return;
           }
-          toast("ok", `Карточки собраны: ${pdf.pageCount}. Запись PDF через jspdf ещё не подключена.`);
+          setBusy("pdf");
+          void downloadParticipantCardsPdf(list)
+            .then(() => {
+              toast("ok", `Карточки скачаны: ${list.length}`);
+            })
+            .catch(() => {
+              toast("err", "Не удалось собрать PDF");
+            })
+            .finally(() => setBusy(null));
         }}
       >
-        Скачать карточки участников (PDF)
+        {busy === "pdf" ? "Собираем PDF…" : "Скачать карточки участников (PDF)"}
       </button>
+      {middle}
       <button
         type="button"
         className="h-12 rounded-2xl border border-white/15 bg-slate-900 px-3 text-sm font-black text-white disabled:text-slate-500"
-        disabled={!ready}
+        disabled={!ready || busy !== null}
         onClick={() => {
-          const book = prepareTournamentGridXlsx(cards());
-          if (book.rows.length === 0) {
+          const list = cards();
+          if (list.length === 0) {
             toast("err", "Сетка турнира пуста");
             return;
           }
-          toast("ok", `Сетка собрана: ${book.rows.length} строк. Запись Excel через xlsx ещё не подключена.`);
+          setBusy("xlsx");
+          void downloadTournamentWorkbook(participants, draw)
+            .then(() => {
+              toast("ok", "Сетка турнира скачана");
+            })
+            .catch(() => {
+              toast("err", "Не удалось собрать Excel");
+            })
+            .finally(() => setBusy(null));
         }}
       >
-        Скачать сетку турнира (Excel)
+        {busy === "xlsx" ? "Собираем Excel…" : "Скачать сетку турнира (Excel)"}
       </button>
     </div>
   );
