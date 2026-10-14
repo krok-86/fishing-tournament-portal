@@ -1,3 +1,5 @@
+import { apiUrl } from "./apiUrl.ts";
+
 /** Атомарная отправка улова периода. Очередь и повтор живут на телефоне, не здесь. */
 
 export interface MatchSideReport {
@@ -21,7 +23,7 @@ export async function postMatchReport(report: MatchSideReport & { period: number
   const controller = new AbortController();
   const timer = window.setTimeout(() => controller.abort(), REPORT_TIMEOUT_MS);
   try {
-    const response = await fetch("/api/matches/report", {
+    const response = await fetch(apiUrl("/api/matches/report"), {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify(report),
@@ -40,7 +42,7 @@ export async function fetchMatchSync(): Promise<{ ok: true; matches: SyncMatch[]
   const controller = new AbortController();
   const timer = window.setTimeout(() => controller.abort(), REPORT_TIMEOUT_MS);
   try {
-    const response = await fetch("/api/matches/sync", {
+    const response = await fetch(apiUrl("/api/matches/sync"), {
       headers: { Accept: "application/json", "Cache-Control": "no-cache" },
       cache: "no-store",
       signal: controller.signal,

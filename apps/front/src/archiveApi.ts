@@ -1,4 +1,5 @@
 import type { TournamentArchiveSnapshot } from "../../../packages/shared/src/archive.ts";
+import { apiUrl } from "./apiUrl.ts";
 
 export type ArchivePostResult = { ok: true; id: string; path: string } | { ok: false; error: string };
 
@@ -15,7 +16,7 @@ export async function postTournamentArchive(
 ): Promise<ArchivePostResult> {
   const id = tournamentId.trim();
   try {
-    const response = await fetch("/api/tournaments/archive", {
+    const response = await fetch(apiUrl("/api/tournaments/archive"), {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify({ ...snapshot, tournamentId: id }),
@@ -38,7 +39,7 @@ export async function listTournamentArchives(): Promise<
   { ok: true; archives: ArchiveListItem[] } | { ok: false; error: string }
 > {
   try {
-    const response = await fetch("/api/tournaments/archive", {
+    const response = await fetch(apiUrl("/api/tournaments/archive"), {
       headers: { Accept: "application/json" },
     });
     const body: unknown = await response.json().catch(() => null);
@@ -53,7 +54,7 @@ export async function listTournamentArchives(): Promise<
 
 export async function deleteTournamentArchive(id: string): Promise<{ ok: true } | { ok: false; error: string }> {
   try {
-    const response = await fetch(`/api/tournaments/archive/${encodeURIComponent(id)}`, {
+    const response = await fetch(apiUrl(`/api/tournaments/archive/${encodeURIComponent(id)}`), {
       method: "DELETE",
       headers: { Accept: "application/json" },
     });
@@ -69,7 +70,7 @@ export async function loadTournamentArchive(
   id: string,
 ): Promise<{ ok: true; snapshot: TournamentArchiveSnapshot } | { ok: false; error: string }> {
   try {
-    const response = await fetch(`/api/tournaments/archive/${encodeURIComponent(id)}`, {
+    const response = await fetch(apiUrl(`/api/tournaments/archive/${encodeURIComponent(id)}`), {
       headers: { Accept: "application/json" },
     });
     const body: unknown = await response.json().catch(() => null);

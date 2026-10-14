@@ -1,9 +1,11 @@
+import { apiUrl } from "./apiUrl.ts";
+
 /** Заявка игрока до выезда. Утром на берегу интернет уже не нужен: вход по стартовому QR. */
 export async function registerOnline(
   fullName: string,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   try {
-    const response = await fetch("/api/register", {
+    const response = await fetch(apiUrl("/api/register"), {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify({ fullName }),
@@ -19,7 +21,7 @@ export async function registerOnline(
 /** Список ФИО в порядке заявок. Номера 1, 2, 3 лист назначает сам при импорте. */
 export async function loadOnlineNames(): Promise<{ ok: true; names: string[] } | { ok: false; error: string }> {
   try {
-    const response = await fetch("/api/participants", { headers: { Accept: "application/json" } });
+    const response = await fetch(apiUrl("/api/participants"), { headers: { Accept: "application/json" } });
     const body: unknown = await response.json().catch(() => null);
     if (!response.ok) return { ok: false, error: readError(body) ?? "Сервер не отдал список заявок" };
     const names = namesFromPayload(body);
