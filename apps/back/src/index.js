@@ -5,6 +5,7 @@ exports.attachMatchRoutes = attachMatchRoutes;
 /**
  * Точка обмена уловами периода. Данные живут в памяти процесса:
  * перезапуск сервера их стирает, постоянной базы здесь нет.
+ * // trigger deploy fix
  */
 exports.inMemoryMatches = {};
 const MAX_FISH = 9999;
