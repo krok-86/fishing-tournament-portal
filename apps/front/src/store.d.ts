@@ -101,6 +101,18 @@ interface MatchStore extends SectorView {
         error: string;
     }>;
     /**
+     * Телефон финалиста принимает стартовый QR кубка.
+     * Пишет топ-8 и пары 1/4 в IndexedDB и открывает кубковые матчи.
+     */
+    acceptPlayoffGrid: (payload: string) => Promise<{
+        ok: true;
+        fresh: boolean;
+        label: string;
+    } | {
+        ok: false;
+        error: string;
+    }>;
+    /**
      * Подтверждение периода игрока или дуэли.
      * `asOrganizer` — ввод поимок в сетке кубка: ФИО на этом телефоне не требуется.
      */

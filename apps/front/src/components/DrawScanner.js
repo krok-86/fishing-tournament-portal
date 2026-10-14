@@ -13,7 +13,7 @@ function cameraFailureNote(error) {
     const detail = [name, message].filter(Boolean).join(": ");
     return detail ? `Камера не включилась. ${detail}` : "Камера не включилась.";
 }
-export function DrawScanner({ title, hint, onCode, onClose, }) {
+export function DrawScanner({ title, hint, onCode, onClose, placeholder = "FTPS1.…", }) {
     const [draft, setDraft] = useState("");
     const [cameraNote, setCameraNote] = useState("Нажмите «Включить камеру». Запрос должен идти от кнопки, иначе телефон её не отдаёт.");
     const [cameraOn, setCameraOn] = useState(false);
@@ -163,7 +163,7 @@ export function DrawScanner({ title, hint, onCode, onClose, }) {
         <label className="text-sm font-bold tracking-wide text-cyan-100/80 uppercase" htmlFor="draw-qr-paste">
           Строка QR, если камера не берёт экран
         </label>
-        <textarea id="draw-qr-paste" className="mt-2 min-h-20 w-full resize-none rounded-xl border border-white/10 bg-slate-950 px-3 py-2 font-mono text-xs text-white outline-none placeholder:text-slate-500 focus:border-cyan-300" value={draft} placeholder="FTPS1.…" onChange={(event) => setDraft(event.target.value)}/>
+        <textarea id="draw-qr-paste" className="mt-2 min-h-20 w-full resize-none rounded-xl border border-white/10 bg-slate-950 px-3 py-2 font-mono text-xs text-white outline-none placeholder:text-slate-500 focus:border-cyan-300" value={draft} placeholder={placeholder} onChange={(event) => setDraft(event.target.value)}/>
         <button type="submit" className="mt-3 h-14 w-full rounded-2xl bg-cyan-300 text-base font-black text-slate-950 disabled:opacity-40" disabled={busy || draft.trim().length === 0}>
           {busy ? "Записываем…" : "Принять строку"}
         </button>

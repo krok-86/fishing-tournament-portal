@@ -266,6 +266,21 @@ function rememberTournamentId(tournamentId: string): void {
   }
 }
 
+const PLAYER_DEVICE_ID = "player" as const;
+
+function rememberAthleteSlot(slotId: string): void {
+  const athleteSlotId = slotId.trim();
+  void db.deviceState.put({ id: PLAYER_DEVICE_ID, athleteSlotId }).catch(() => {
+    /* номер можно выбрать снова, журнал поимок уже в IndexedDB */
+  });
+}
+
+function forgetAthleteSlot(): void {
+  void db.deviceState.delete(PLAYER_DEVICE_ID).catch(() => {
+    /* пустой телефон просто откроет выбор номера */
+  });
+}
+
 function initialTournamentId(): string {
   return readStoredTournamentId() ?? "local-session";
 }
@@ -288,6 +303,7 @@ async function resolveTournamentId(preferred: string): Promise<string> {
  * Живой журнал переезжает на свой id, чтобы новая архивация не затирала уже сданный отчёт.
  */
 let placeholderMigration: Promise<string> | null = null;
+let hydration: Promise<void> | null = null;
 
 function separatePlaceholderTournament(): Promise<string> {
   if (!placeholderMigration) placeholderMigration = movePlaceholderTournament();
@@ -605,62 +621,11 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
   },
 
   async hydrate() {
-    let tournamentId = await resolveTournamentId(get().tournamentId);
-    if (tournamentId === "local-session") tournamentId = await separatePlaceholderTournament();
-    if (tournamentId !== get().tournamentId) set({ tournamentId });
-    try {
-      const rows = await db.events.where("tournamentId").equals(tournamentId).sortBy("timestamp");
-      const stored = rows.map((row) => row.event);
-      const [outboxQueue, duelConflicts] = await Promise.all([
-        db.outboxQueue.orderBy("createdAt").toArray(),
-        db.duelConflicts.toArray(),
-      ]);
-      const snapshot = readSetup(stored);
-      const participants = snapshot.tournamentOpened
-        ? snapshot.participants
-        : await healedStartList(tournamentId, snapshot.participants);
-      const grid = snapshot.tournamentOpened ? gridOf(participants, snapshot.periodsPerRound) : [];
-      const playoff = projectPlayoff(stored);
-      const signal = snapshot.tournamentOpened
-        ? publishedPeriod(stored)
-        : { period: 1 as PeriodIndex, phase: "waiting" as const, officiallyStarted: false };
-      set({
-        participants,
-        grid,
-        tournamentOpened: snapshot.tournamentOpened,
-        tournamentName: snapshot.tournamentName,
-        tournamentDate: snapshot.tournamentDate,
-        sectorCount: snapshot.tournamentOpened
-          ? snapshot.sectorCount
-          : requiredSectorCount(participants.length),
-        periodsCount: snapshot.periodsPerRound,
-        hydrated: true,
-        setupError: null,
-        period: signal.period,
-        periodPhase: signal.phase,
-        officiallyStarted: signal.officiallyStarted,
-        playerNamedSlotIds: playerNamedFromEvents(stored).filter((slotId) =>
-          participants.some((participant) => participant.slotId === slotId),
-        ),
-        ...emptySector,
-        ...cupPatch(stored, participants, grid),
-        selectedPlayoffMatchId: "",
-        playoffEntryOpen: false,
-        outboxQueue,
-        duelConflicts,
-        syncNote: null,
-      });
-      await get().loadLeaderboard();
-      const opening = playoffMatches(playoff).find((match) => match.slotIdA && match.slotIdB && !match.winnerSlotId)
-        ?? playoffMatches(playoff).find((match) => match.slotIdA && match.slotIdB);
-      if (opening) get().selectPlayoffMatch(opening.matchId);
-      await get().refreshHandoff();
-    } catch (error) {
-      set({
-        hydrated: true,
-        setupError: error instanceof Error ? error.message : "Не удалось прочитать журнал турнира",
-      });
-    }
+    if (hydration) return hydration;
+    hydration = readJournal(get, set).finally(() => {
+      hydration = null;
+    });
+    return hydration;
   },
 
   async registerParticipant(displayName) {
@@ -868,6 +833,7 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
       await db.events.clear();
       await db.outboxQueue.clear();
       await db.duelConflicts.clear();
+      await db.deviceState.clear();
       const tournamentId = crypto.randomUUID();
       rememberTournamentId(tournamentId);
       set({
@@ -1197,12 +1163,14 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
     if (state.playoff.formed) {
       if (!slotId) {
         set({ selfSlotId: "" });
+        forgetAthleteSlot();
         void get().refreshHandoff();
         return;
       }
       const playing = state.participants.find((item) => item.slotId === slotId);
       if (!playing || playing.ghost) return;
       set({ selfSlotId: slotId, error: null });
+      rememberAthleteSlot(slotId);
       void get().refreshHandoff();
       return;
     }
@@ -1217,6 +1185,7 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
         savedCount: null,
         error: null,
       });
+      forgetAthleteSlot();
       void get().refreshHandoff();
       return;
     }
@@ -1232,20 +1201,22 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
     }
 
     const sameAthlete = state.athleteSlotId === slotId;
+    const saved = sameAthlete ? null : journalPeriodScore(state.leaderboard, slotId, state.period);
     set({
       ...viewFromGrid(state.participants, state.grid, slot),
       selfSlotId: slotId,
       error: null,
-      ...(sameAthlete
-        ? {}
-        : {
-            athleteFish: 0,
-            opponentFish: 0,
+      ...(saved
+        ? {
+            athleteFish: saved.athleteFish,
+            opponentFish: saved.opponentFish,
             pending: [],
-            confirmed: false,
+            confirmed: saved.confirmed,
             savedCount: null,
-          }),
+          }
+        : {}),
     });
+    rememberAthleteSlot(slotId);
     void get().refreshHandoff();
   },
 
@@ -1281,10 +1252,9 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
       }
 
       const stored = rows.map((row) => row.event);
-      const closed = closedQualifyingPeriods(stored, slotId);
-      if (!allQualifyingPeriodsClosed(closed)) {
-        const saved = QUALIFYING_PERIODS.filter((period) => closed.has(period)).length;
-        return { ok: false, error: `Сначала подтвердите все 8 периодов. Уже сохранено: ${saved} из 8.` };
+      const journal = qualifyingJournalStatus(stored, slotId);
+      if (!journal.ready) {
+        return { ok: false, error: `Сначала подтвердите все 8 периодов. Уже сохранено: ${journal.saved} из 8.` };
       }
       const entry = tournamentCalculator.generateLeaderboard(stored).find((item) => item.slotId === slotId);
       const cells: QrCatchCell[] = QUALIFYING_PERIODS.map((period) => ({
@@ -1412,13 +1382,13 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
         return;
       }
 
-      const closed = closedQualifyingPeriods(
+      const journal = qualifyingJournalStatus(
         rows.map((row) => row.event),
         slotId,
       );
       set({
-        qualifyingHandoffReady: allQualifyingPeriodsClosed(closed),
-        qualifyingSavedCount: QUALIFYING_PERIODS.filter((period) => closed.has(period)).length,
+        qualifyingHandoffReady: journal.ready,
+        qualifyingSavedCount: journal.saved,
         cupHandoffReady: false,
       });
     } catch {
@@ -2527,6 +2497,126 @@ function allQualifyingPeriodsClosed(closed: ReadonlySet<PeriodIndex>): boolean {
   return QUALIFYING_PERIODS.every((period) => closed.has(period));
 }
 
+/** Период отбора засчитан только если в журнале есть и протокол, и записанные поимки. */
+function qualifyingJournalStatus(
+  events: readonly TournamentEvent[],
+  slotId: string,
+): { ready: boolean; saved: number } {
+  const closed = closedQualifyingPeriods(events, slotId);
+  const entry = tournamentCalculator.generateLeaderboard(events).find((item) => item.slotId === slotId);
+  let saved = 0;
+  for (const period of QUALIFYING_PERIODS) {
+    const cell = entry?.periods.find((item) => item.period === period);
+    if (closed.has(period) && cell?.played) saved += 1;
+  }
+  return { ready: saved === QUALIFYING_PERIODS.length, saved };
+}
+
+function journalPeriodScore(
+  leaderboard: readonly LeaderboardEntry[],
+  slotId: string,
+  period: PeriodIndex,
+): { athleteFish: number; opponentFish: number; confirmed: boolean } {
+  const cell = leaderboard.find((entry) => entry.slotId === slotId)?.periods.find((item) => item.period === period);
+  if (!cell?.played) return { athleteFish: 0, opponentFish: 0, confirmed: false };
+  return { athleteFish: cell.fish, opponentFish: cell.opponentFish, confirmed: true };
+}
+
+async function readJournal(get: () => MatchStore, set: (partial: Partial<MatchStore>) => void): Promise<void> {
+  let tournamentId = await resolveTournamentId(get().tournamentId);
+  if (tournamentId === "local-session") tournamentId = await separatePlaceholderTournament();
+  if (tournamentId !== get().tournamentId) set({ tournamentId });
+  try {
+    const [rows, outboxQueue, duelConflicts, device] = await Promise.all([
+      db.events.where("tournamentId").equals(tournamentId).sortBy("timestamp"),
+      db.outboxQueue.orderBy("createdAt").toArray(),
+      db.duelConflicts.toArray(),
+      db.deviceState.get(PLAYER_DEVICE_ID),
+    ]);
+    const stored = rows.map((row) => row.event);
+    const snapshot = readSetup(stored);
+    const participants = snapshot.tournamentOpened
+      ? snapshot.participants
+      : await healedStartList(tournamentId, snapshot.participants);
+    const grid = snapshot.tournamentOpened ? gridOf(participants, snapshot.periodsPerRound) : [];
+    const signal = snapshot.tournamentOpened
+      ? publishedPeriod(stored)
+      : { period: 1 as PeriodIndex, phase: "waiting" as const, officiallyStarted: false };
+    set({
+      participants,
+      grid,
+      tournamentOpened: snapshot.tournamentOpened,
+      tournamentName: snapshot.tournamentName,
+      tournamentDate: snapshot.tournamentDate,
+      sectorCount: snapshot.tournamentOpened ? snapshot.sectorCount : requiredSectorCount(participants.length),
+      periodsCount: snapshot.periodsPerRound,
+      hydrated: false,
+      setupError: null,
+      period: signal.period,
+      periodPhase: signal.phase,
+      officiallyStarted: signal.officiallyStarted,
+      playerNamedSlotIds: playerNamedFromEvents(stored).filter((slotId) =>
+        participants.some((participant) => participant.slotId === slotId),
+      ),
+      ...emptySector,
+      ...cupPatch(stored, participants, grid),
+      selectedPlayoffMatchId: "",
+      playoffEntryOpen: false,
+      outboxQueue,
+      duelConflicts,
+      syncNote: null,
+      athleteFish: 0,
+      opponentFish: 0,
+      pending: [],
+      confirmed: false,
+      savedCount: null,
+    });
+    await get().loadLeaderboard();
+    restoreRememberedPlayer(get, device?.athleteSlotId ?? "");
+    await get().refreshHandoff();
+    set({ hydrated: true, setupError: null });
+  } catch (error) {
+    set({
+      hydrated: true,
+      setupError: error instanceof Error ? error.message : "Не удалось прочитать журнал турнира",
+    });
+  }
+}
+
+function restoreRememberedPlayer(get: () => MatchStore, slotId: string): void {
+  const remembered = slotId.trim();
+  if (!remembered || !get().tournamentOpened) {
+    openRememberedPlayoff(get);
+    return;
+  }
+  const participant = get().participants.find((item) => item.slotId === remembered && !item.ghost);
+  if (!participant) {
+    forgetAthleteSlot();
+    openRememberedPlayoff(get);
+    return;
+  }
+  get().selectAthlete(remembered);
+  if (!get().playoff.formed) return;
+  const mine =
+    playoffMatches(get().playoff).find(
+      (match) => Boolean(match.slotIdA && match.slotIdB) && (match.slotIdA === remembered || match.slotIdB === remembered),
+    ) ?? firstOpenPlayoffMatch(get);
+  if (mine) get().selectPlayoffMatch(mine.matchId);
+}
+
+function openRememberedPlayoff(get: () => MatchStore): void {
+  const opening = firstOpenPlayoffMatch(get);
+  if (opening) get().selectPlayoffMatch(opening.matchId);
+}
+
+function firstOpenPlayoffMatch(get: () => MatchStore) {
+  const playoff = get().playoff;
+  return (
+    playoffMatches(playoff).find((match) => match.slotIdA && match.slotIdB && !match.winnerSlotId) ??
+    playoffMatches(playoff).find((match) => match.slotIdA && match.slotIdB)
+  );
+}
+
 function closedQualifyingPeriods(events: readonly TournamentEvent[], slotId: string): Set<PeriodIndex> {
   const closed = new Set<PeriodIndex>();
   for (const event of events) {
@@ -3376,6 +3466,7 @@ async function importStartDraw(
       saving: false,
       ...emptySector,
     });
+    forgetAthleteSlot();
     await get().loadLeaderboard();
     await get().refreshHandoff();
     return {

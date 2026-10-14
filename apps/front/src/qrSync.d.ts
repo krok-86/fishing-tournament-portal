@@ -140,4 +140,44 @@ export declare function serializeStartSnapshot(snapshot: StartSnapshot): string;
 export declare function encodeStartSnapshot(snapshot: StartSnapshot): Promise<string>;
 export declare function decodeStartSnapshot(raw: string): Promise<StartDecodeResult>;
 export declare function parseStartSnapshot(plain: string): StartDecodeResult;
+export interface PlayoffGridPlayer {
+    bibNumber: number;
+    displayName: string;
+    place: number;
+    seed: number;
+}
+export interface PlayoffGridPair {
+    /** Номер четвертьфинала с 1. */
+    pair: number;
+    bibA: number;
+    bibB: number;
+}
+export interface PlayoffGridSnapshot {
+    players: readonly PlayoffGridPlayer[];
+    pairs: readonly PlayoffGridPair[];
+}
+export type PlayoffGridDecodeResult = {
+    ok: true;
+    snapshot: PlayoffGridSnapshot;
+} | {
+    ok: false;
+    error: string;
+};
+export declare function playoffGridFromSeeds(participants: readonly {
+    slotId: string;
+    bibNumber: number;
+    displayName: string;
+}[], seeds: readonly {
+    slotId: string;
+    place: number;
+    seed: number;
+}[], quarterfinals: readonly {
+    order: number;
+    slotIdA: string | null;
+    slotIdB: string | null;
+}[]): PlayoffGridSnapshot | null;
+export declare function serializePlayoffGrid(snapshot: PlayoffGridSnapshot): string;
+export declare function encodePlayoffGrid(snapshot: PlayoffGridSnapshot): Promise<string>;
+export declare function decodePlayoffGrid(raw: string): Promise<PlayoffGridDecodeResult>;
+export declare function parsePlayoffGrid(plain: string): PlayoffGridDecodeResult;
 export {};

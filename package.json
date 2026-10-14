@@ -8,6 +8,8 @@
   ],
   "scripts": {
     "front:dev": "npm run dev -w apps/front",
-    "back:dev": "npm run dev -w apps/back"
+    "back:dev": "npm run dev -w apps/back",
+    "build:front": "npm run build -w apps/front",
+    "build:back": "npm run build -w apps/back"
   }
 }

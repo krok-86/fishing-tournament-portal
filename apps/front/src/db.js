@@ -3,6 +3,7 @@ class TournamentDatabase extends Dexie {
     events;
     outboxQueue;
     duelConflicts;
+    deviceState;
     constructor() {
         super("FishingTournamentPortal");
         this.version(1).stores({
@@ -37,6 +38,13 @@ class TournamentDatabase extends Dexie {
             events: "id, tournamentId, type, timestamp, isSynced",
             outboxQueue: "id, createdAt",
             duelConflicts: "id, period, slotId, status",
+        });
+        // Номер игрока на этом телефоне. Журнал поимок не трогаем.
+        this.version(7).stores({
+            events: "id, tournamentId, type, timestamp, isSynced",
+            outboxQueue: "id, createdAt",
+            duelConflicts: "id, period, slotId, status",
+            deviceState: "id",
         });
     }
 }

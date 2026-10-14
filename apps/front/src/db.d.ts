@@ -28,10 +28,16 @@ export interface DuelConflictRecord {
     status: "open" | "resolved";
     detail: string;
 }
+/** Номер, который этот телефон ведёт. Живёт рядом с журналом, чтобы пережить обновление вкладки. */
+export interface DeviceStateRecord {
+    id: "player";
+    athleteSlotId: string;
+}
 declare class TournamentDatabase extends Dexie {
     events: Table<EventRecord, string>;
     outboxQueue: Table<OutboxItem, string>;
     duelConflicts: Table<DuelConflictRecord, string>;
+    deviceState: Table<DeviceStateRecord, string>;
     constructor();
 }
 export declare const db: TournamentDatabase;

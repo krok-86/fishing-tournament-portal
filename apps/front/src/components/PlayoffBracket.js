@@ -1,6 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { QRCodeSVG } from "qrcode.react";
 import { playoffMatches, previewPlayoffScore, scorePlayoffDuel } from "../../../../packages/shared/src/calculator.ts";
 import { buildFinalStandings } from "../../../../packages/shared/src/finalStandings.ts";
+import { encodePlayoffGrid, playoffGridFromSeeds } from "../qrSync.ts";
 import { useMatchStore } from "../store.ts";
 import { confirmAndToast, toast } from "../toast.ts";
 import { FinalStandingsTable } from "./FinalStandingsTable.tsx";
@@ -113,6 +115,8 @@ export function PlayoffBracket({ snapshot = null, onArchive, archiving = false, 
 
       {podium}
 
+      {!snapshot && <PlayoffStartQr />}
+
       <MobilePlayoffRounds quarter={quarter} semi={semi} finalMatch={playoff.final} thirdPlace={playoff.thirdPlace} nameOf={nameOf} activeMatchId={activeMatchId} openMatch={openMatch}/>
 
       <div className="scrollbar-thin hidden overflow-x-auto rounded-3xl border border-white/10 bg-slate-950/80 p-3 shadow-xl shadow-black/30 sm:p-6 lg:block">
@@ -152,6 +156,61 @@ export function PlayoffBracket({ snapshot = null, onArchive, archiving = false, 
           Подиум, итоговая таблица и кнопка «Завершить и архивировать турнир» появятся, когда будут сыграны финал и матч за 3-е место.
         </p>)}
     </section>);
+}
+function PlayoffStartQr() {
+    const playoff = useMatchStore((state) => state.playoff);
+    const participants = useMatchStore((state) => state.participants);
+    const grid = useMemo(() => (playoff.formed ? playoffGridFromSeeds(participants, playoff.seeds, playoff.quarterfinals) : null), [participants, playoff]);
+    const plain = grid ? JSON.stringify(grid) : "";
+    const [packet, setPacket] = useState(null);
+    const [error, setError] = useState(null);
+    const payload = packet?.key === plain ? packet.payload : null;
+    useEffect(() => {
+        if (!grid)
+            return;
+        let cancelled = false;
+        void encodePlayoffGrid(grid)
+            .then((value) => {
+            if (!cancelled) {
+                setPacket({ key: plain, payload: value });
+                setError(null);
+            }
+        })
+            .catch(() => {
+            if (!cancelled)
+                setError("Не удалось сжать сетку плей-офф в QR");
+        });
+        return () => {
+            cancelled = true;
+        };
+    }, [grid, plain]);
+    if (!grid)
+        return null;
+    const tooWide = payload !== null && payload.length > 1800;
+    const nameOf = (slotId) => {
+        if (!slotId)
+            return "—";
+        const person = participants.find((item) => item.slotId === slotId);
+        return person ? `${person.bibNumber}. ${person.displayName}` : "—";
+    };
+    return (<div id="playoff-start-qr" className="mb-6 rounded-3xl border border-cyan-300/40 bg-slate-900 px-4 py-5 sm:px-6">
+      <h3 className="text-xl font-black tracking-tight sm:text-2xl">Стартовый QR-код Плей-офф</h3>
+      <p className="mt-2 text-sm leading-relaxed text-slate-300">
+        В коде сжатый топ-8: номер, ФИО и пары 1/4 финала. Финалист сканирует его один раз — телефон записывает сетку и открывает кубковые матчи.
+      </p>
+      {error && <p className="mt-3 text-sm text-rose-300">{error}</p>}
+      {!payload && !error && <p className="mt-3 text-sm text-slate-400">Собираем код…</p>}
+      {payload && tooWide && (<p className="mt-3 text-sm text-amber-200">Сетка не помещается в один QR. Передайте строку ниже вручную.</p>)}
+      {payload && !tooWide && (<div className="mx-auto mt-4 w-fit rounded-3xl bg-white p-4">
+          <QRCodeSVG value={payload} size={320} level="M" marginSize={4} bgColor="#ffffff" fgColor="#020617" title="Стартовый QR-код Плей-офф"/>
+        </div>)}
+      <ul className="mt-4 grid gap-1 text-sm font-semibold text-cyan-50">
+        {playoff.quarterfinals.map((match) => (<li key={match.matchId}>
+            1/4, пара {match.order + 1}: {nameOf(match.slotIdA)} — {nameOf(match.slotIdB)}
+          </li>))}
+      </ul>
+      {payload && (<textarea className="mt-4 w-full resize-none rounded-xl border border-white/10 bg-slate-950 px-3 py-2 font-mono text-[11px] text-cyan-100 outline-none" readOnly rows={3} value={payload} aria-label="Сжатая строка стартового QR плей-офф" onFocus={(event) => event.currentTarget.select()}/>)}
+    </div>);
 }
 function MobilePlayoffRounds({ quarter, semi, finalMatch, thirdPlace, nameOf, activeMatchId, openMatch, }) {
     const rounds = [

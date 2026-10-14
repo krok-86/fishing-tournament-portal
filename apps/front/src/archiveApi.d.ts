@@ -7,7 +7,26 @@ export type ArchivePostResult = {
     ok: false;
     error: string;
 };
-export declare function postTournamentArchive(snapshot: TournamentArchiveSnapshot): Promise<ArchivePostResult>;
+export type ArchiveListItem = {
+    id: string;
+    name: string;
+    date: string;
+    champion: string;
+};
+export declare function postTournamentArchive(snapshot: TournamentArchiveSnapshot, tournamentId?: string): Promise<ArchivePostResult>;
+export declare function listTournamentArchives(): Promise<{
+    ok: true;
+    archives: ArchiveListItem[];
+} | {
+    ok: false;
+    error: string;
+}>;
+export declare function deleteTournamentArchive(id: string): Promise<{
+    ok: true;
+} | {
+    ok: false;
+    error: string;
+}>;
 export declare function loadTournamentArchive(id: string): Promise<{
     ok: true;
     snapshot: TournamentArchiveSnapshot;

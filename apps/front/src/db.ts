@@ -32,10 +32,17 @@ export interface DuelConflictRecord {
   detail: string;
 }
 
+/** Номер, который этот телефон ведёт. Живёт рядом с журналом, чтобы пережить обновление вкладки. */
+export interface DeviceStateRecord {
+  id: "player";
+  athleteSlotId: string;
+}
+
 class TournamentDatabase extends Dexie {
   events!: Table<EventRecord, string>;
   outboxQueue!: Table<OutboxItem, string>;
   duelConflicts!: Table<DuelConflictRecord, string>;
+  deviceState!: Table<DeviceStateRecord, string>;
 
   constructor() {
     super("FishingTournamentPortal");
@@ -71,6 +78,13 @@ class TournamentDatabase extends Dexie {
       events: "id, tournamentId, type, timestamp, isSynced",
       outboxQueue: "id, createdAt",
       duelConflicts: "id, period, slotId, status",
+    });
+    // Номер игрока на этом телефоне. Журнал поимок не трогаем.
+    this.version(7).stores({
+      events: "id, tournamentId, type, timestamp, isSynced",
+      outboxQueue: "id, createdAt",
+      duelConflicts: "id, period, slotId, status",
+      deviceState: "id",
     });
   }
 }

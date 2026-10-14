@@ -9,6 +9,7 @@ import { Toaster } from "./components/Toaster.tsx";
 import { TournamentHistory } from "./components/TournamentHistory.tsx";
 import { TournamentInit } from "./components/TournamentInit.tsx";
 import { registerOnline } from "./onlineRoster.ts";
+import { registerAppShell } from "./pwa.ts";
 import { fetchMatchSync } from "./matchSync.ts";
 import { primeScanBeep } from "./scanBeep.ts";
 import { isRealAthleteName, useMatchStore } from "./store.ts";
@@ -79,10 +80,20 @@ function App() {
   const hydrate = useMatchStore((state) => state.hydrate);
 
   useEffect(() => {
+    registerAppShell();
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    // Сначала журнал IndexedDB: сетка, период и подтверждённые поимки. Экран ждёт hydrated.
     void hydrate().then(() => {
+      if (!alive) return;
       const message = useMatchStore.getState().setupError;
       if (message) toast("err", message);
     });
+    return () => {
+      alive = false;
+    };
   }, [hydrate]);
 
   useEffect(() => {

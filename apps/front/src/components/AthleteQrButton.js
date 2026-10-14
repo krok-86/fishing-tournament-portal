@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
+import { QUALIFYING_PERIOD_COUNT } from "../../../../packages/shared/src/types.ts";
 import { useMatchStore } from "../store.ts";
 import { toast } from "../toast.ts";
 export function AthleteQrButton() {
@@ -24,6 +25,12 @@ export function AthleteQrButton() {
     if (!selected)
         return null;
     async function generate() {
+        const live = useMatchStore.getState();
+        const qualifyingComplete = live.qualifyingHandoffReady && live.qualifyingSavedCount === QUALIFYING_PERIOD_COUNT;
+        if (!live.playoff.formed && !qualifyingComplete) {
+            toast("err", "Сначала подтвердите все 8 периодов");
+            return;
+        }
         setBusy(true);
         setError(null);
         setCopied(false);
@@ -56,9 +63,10 @@ export function AthleteQrButton() {
         QR-код матча появится сразу после сохранения дуэли.
       </p>);
     }
-    const resultsLocked = !cupMode && !qualifyingHandoffReady;
+    const qualifyingComplete = qualifyingHandoffReady && qualifyingSavedCount === QUALIFYING_PERIOD_COUNT;
+    const resultsLocked = !cupMode && !qualifyingComplete;
     return (<>
-      <button type="button" className="mt-3 min-h-20 w-full rounded-2xl bg-white px-3 py-3 text-lg leading-tight font-black text-slate-950 disabled:bg-slate-700 disabled:text-slate-400" disabled={saving || busy || resultsLocked} onClick={() => void generate()}>
+      <button type="button" className="mt-3 min-h-20 w-full rounded-2xl bg-white px-3 py-3 text-lg leading-tight font-black text-slate-950 disabled:bg-slate-700 disabled:text-slate-400" disabled={saving || busy || resultsLocked} aria-disabled={saving || busy || resultsLocked} onClick={() => void generate()}>
         {busy ? "Собираем результаты…" : cupMode ? "Сгенерировать QR-код матча" : "Сгенерировать QR-код результатов"}
       </button>
       {resultsLocked && (<p className="mt-2 text-center text-sm font-semibold text-slate-300">
