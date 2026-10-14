@@ -34,6 +34,7 @@ interface MatchApp {
 interface MatchResponse {
   status(code: number): { json(body: unknown): void };
   json(body: unknown): void;
+  set(field: string, value: string): void;
 }
 
 function duelKey(period: number, bibNumber: number, opponentBib: number | null): string {
