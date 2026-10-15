@@ -28,7 +28,7 @@ export async function fetchMatchSync() {
     const timer = window.setTimeout(() => controller.abort(), REPORT_TIMEOUT_MS);
     try {
         const response = await fetch("/api/matches/sync", {
-            headers: { Accept: "application/json", "Cache-Control": "no-cache" },
+            headers: { Accept: "application/json" },
             cache: "no-store",
             signal: controller.signal,
         });
