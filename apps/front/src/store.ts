@@ -536,7 +536,7 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
     }
     const identityId = state.playoff.formed ? state.selfSlotId : state.athleteSlotId;
     if (!hasSavedRealName(state, identityId)) {
-      set({ error: "Выберите номер и введите ФИО" });
+      set({ error: "Выберите свой стартовый номер" });
       return;
     }
     if (state.playoff.formed) {
@@ -3490,13 +3490,16 @@ function participantsFromStart(
   entries: readonly { bibNumber: number; displayName: string; groupId: GroupId; ghost: boolean }[],
 ): RegisteredParticipant[] {
   return entries
-    .map((entry) => ({
-      slotId: crypto.randomUUID(),
-      bibNumber: entry.bibNumber,
-      displayName: entry.ghost ? entry.displayName.trim() : numberedAthleteName(entry.bibNumber),
-      groupId: entry.groupId,
-      ghost: entry.ghost,
-    }))
+    .map((entry) => {
+      const fromSheet = entry.displayName.trim().replace(/\s+/g, " ");
+      return {
+        slotId: crypto.randomUUID(),
+        bibNumber: entry.bibNumber,
+        displayName: fromSheet.length > 0 ? fromSheet : numberedAthleteName(entry.bibNumber),
+        groupId: entry.groupId,
+        ghost: entry.ghost,
+      };
+    })
     .sort(byBib);
 }
 

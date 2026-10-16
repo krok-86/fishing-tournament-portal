@@ -1,7 +1,5 @@
 import type { jsPDF } from "jspdf";
 import { QUALIFYING_PERIODS, type GridSlot } from "../../../packages/shared/src/types.ts";
-import robotoBoldUrl from "./fonts/Roboto-Bold.ttf?url";
-import robotoRegularUrl from "./fonts/Roboto-Regular.ttf?url";
 
 /** Печатный бланк: номер, ФИО и восемь строк жеребьёвки. Поимки, подпись и баллы на листе пустые. */
 export interface PrintCard {
@@ -89,32 +87,28 @@ interface RobotoFiles {
 
 let robotoTask: Promise<RobotoFiles> | null = null;
 
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  const size = 0x8000;
-  for (let offset = 0; offset < bytes.length; offset += size) {
-    binary += String.fromCharCode(...bytes.subarray(offset, offset + size));
-  }
-  return btoa(binary);
-}
-
 function loadRoboto(): Promise<RobotoFiles> {
   if (!robotoTask) {
-    robotoTask = Promise.all([fetch(robotoRegularUrl), fetch(robotoBoldUrl)])
-      .then(async ([regular, bold]) => {
-        if (!regular.ok || !bold.ok) throw new Error("Шрифт карточек не загрузился");
-        return {
-          regular: arrayBufferToBase64(await regular.arrayBuffer()),
-          bold: arrayBufferToBase64(await bold.arrayBuffer()),
-        };
-      })
+    robotoTask = import("./robotoFonts.ts")
+      .then((mod) => mod.embeddedRoboto())
       .catch((error: unknown) => {
         robotoTask = null;
         throw error;
       });
   }
   return robotoTask;
+}
+
+function saveBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.rel = "noopener";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 function mountRoboto(doc: jsPDF, fonts: RobotoFiles): void {
@@ -297,7 +291,7 @@ export async function downloadParticipantCardsPdf(cards: readonly PrintCard[]): 
     putOnlyUsedFonts: true,
   });
   renderParticipantCardsPdf(doc, cards, fonts);
-  doc.save(PDF_NAME);
+  saveBlob(doc.output("blob"), PDF_NAME);
 }
 
 function excelText(value: string): string {

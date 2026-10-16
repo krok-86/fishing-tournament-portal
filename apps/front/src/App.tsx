@@ -8,7 +8,7 @@ import { QrIntake } from "./components/QrIntake.tsx";
 import { Toaster } from "./components/Toaster.tsx";
 import { TournamentHistory } from "./components/TournamentHistory.tsx";
 import { TournamentInit } from "./components/TournamentInit.tsx";
-import { registerOnline } from "./onlineRoster.ts";
+import { registerOnline, reportNameCorrection } from "./onlineRoster.ts";
 import { registerAppShell } from "./pwa.ts";
 import { fetchMatchSync } from "./matchSync.ts";
 import { primeScanBeep } from "./scanBeep.ts";
@@ -321,7 +321,7 @@ function AwaitingDraw() {
       <div className="mt-6">
         <h1 className="text-2xl font-black tracking-tight">Турнир ещё не на этом телефоне</h1>
         <p className="mt-2 text-sm leading-relaxed text-slate-300">
-          Сканируйте стартовый QR с ноутбука организатора. Сетка Бергера запишется в телефон, и сразу откроется ввод поимок.
+          Сканируйте стартовый QR с ноутбука организатора. Сетка и ФИО запишутся в телефон, затем выберите свой стартовый номер.
         </p>
         <button
           type="button"
@@ -477,6 +477,9 @@ function JudgeScreen({
     isRealAthleteName(identity.displayName, identity.bibNumber);
   const locked =
     !tournamentOpened || saving || athleteSlotId.length === 0 || (!playoffFormed && (confirmed || !nameReady));
+  if (tournamentOpened && !playoffFormed && !nameReady) {
+    return <BibClaim />;
+  }
   const fishing = participants.filter((participant) => !participant.ghost);
   const alone = tournamentOpened && !playoffFormed && athleteSlotId.length > 0 && !hasOpponent;
   const cupMatches = playoffMatches(playoff);
@@ -687,6 +690,197 @@ function JudgeScreen({
   );
 }
 
+function BibClaim() {
+  const participants = useMatchStore((state) => state.participants);
+  const replaceParticipant = useMatchStore((state) => state.replaceParticipant);
+  const selectAthlete = useMatchStore((state) => state.selectAthlete);
+  const [pendingSlotId, setPendingSlotId] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState(false);
+  const roster = participants
+    .filter((participant) => !participant.ghost)
+    .sort((left, right) => left.bibNumber - right.bibNumber);
+  const pending = roster.find((participant) => participant.slotId === pendingSlotId) ?? null;
+
+  if (pending) {
+    return (
+      <ClaimConfirm
+        slotId={pending.slotId}
+        busy={confirming}
+        onBack={() => {
+          if (!confirming) setPendingSlotId(null);
+        }}
+        onConfirm={() => {
+          const person = useMatchStore.getState().participants.find((item) => item.slotId === pending.slotId);
+          if (!person || !isRealAthleteName(person.displayName, person.bibNumber) || confirming) return;
+          setConfirming(true);
+          void replaceParticipant(person.slotId, person.displayName).then((ok) => {
+            setConfirming(false);
+            if (!ok) {
+              toast("err", "Не удалось записать номер");
+              return;
+            }
+            selectAthlete(person.slotId);
+            const message = useMatchStore.getState().error;
+            if (message) toast("err", message);
+          });
+        }}
+      />
+    );
+  }
+
+  return (
+    <section className="mt-4">
+      <h2 className="text-sm font-bold tracking-wide text-cyan-100/80 uppercase">Выберите ваш стартовый номер</h2>
+      <ul className="mt-3 grid gap-2">
+        {roster.map((participant) => (
+          <li key={participant.slotId}>
+            <button
+              type="button"
+              className="min-h-14 w-full rounded-2xl bg-slate-900 px-4 py-3 text-left text-base font-semibold text-white active:bg-slate-800"
+              onClick={() => setPendingSlotId(participant.slotId)}
+            >
+              №{participant.bibNumber} — {participant.displayName}
+            </button>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function ClaimConfirm({
+  slotId,
+  busy,
+  onBack,
+  onConfirm,
+}: {
+  slotId: string;
+  busy: boolean;
+  onBack: () => void;
+  onConfirm: () => void;
+}) {
+  const participant = useMatchStore((state) => state.participants.find((item) => item.slotId === slotId));
+  const replaceParticipant = useMatchStore((state) => state.replaceParticipant);
+  const [draft, setDraft] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [savingName, setSavingName] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  if (!participant) return null;
+  const realName = isRealAthleteName(participant.displayName, participant.bibNumber);
+
+  return (
+    <section className="mt-4 rounded-3xl bg-slate-900 px-4 py-5">
+      {editing ? (
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            const name = draft.trim().replace(/\s+/g, " ");
+            if (!isRealAthleteName(name, participant.bibNumber)) {
+              setError("Введите ФИО");
+              toast("err", "Введите ФИО");
+              return;
+            }
+            const previous = participant.displayName;
+            setSavingName(true);
+            setError(null);
+            void replaceParticipant(slotId, name).then((ok) => {
+              setSavingName(false);
+              if (!ok) {
+                setError("Не удалось записать ФИО");
+                toast("err", "Не удалось записать ФИО");
+                return;
+              }
+              if (name !== previous) reportNameCorrection(participant.bibNumber, name, previous);
+              setEditing(false);
+              toast("ok", "ФИО сохранено");
+            });
+          }}
+        >
+          <label className="text-sm font-bold tracking-wide text-cyan-100/80 uppercase" htmlFor="claim-name">
+            ФИО
+          </label>
+          <input
+            id="claim-name"
+            className="mt-2 h-12 w-full rounded-xl border border-white/10 bg-slate-950 px-3 text-base font-semibold text-white outline-none placeholder:text-slate-500 focus:border-cyan-300"
+            value={draft}
+            autoComplete="name"
+            required
+            minLength={3}
+            disabled={savingName}
+            onChange={(event) => setDraft(event.target.value)}
+          />
+          <div className="mt-3 flex gap-2">
+            <button
+              type="submit"
+              className="h-12 flex-1 rounded-xl bg-cyan-300 text-sm font-black text-slate-950 disabled:opacity-40"
+              disabled={savingName || !isRealAthleteName(draft, participant.bibNumber)}
+            >
+              {savingName ? "Записываем…" : "Сохранить ФИО"}
+            </button>
+            <button
+              type="button"
+              className="h-12 rounded-xl border border-white/10 px-4 text-sm font-black text-slate-200 disabled:opacity-40"
+              disabled={savingName}
+              onClick={() => {
+                setEditing(false);
+                setError(null);
+              }}
+            >
+              Отмена
+            </button>
+          </div>
+        </form>
+      ) : (
+        <div className="flex items-start gap-2">
+          <p className="min-w-0 flex-1 text-xl leading-snug font-black">{claimSentence(participant.displayName)}</p>
+          <button
+            type="button"
+            className="grid h-11 w-11 shrink-0 place-items-center rounded-xl border border-white/10 bg-slate-950 text-cyan-200"
+            aria-label="Редактировать ФИО"
+            disabled={busy}
+            onClick={() => {
+              setDraft(participant.displayName);
+              setError(null);
+              setEditing(true);
+            }}
+          >
+            <PencilIcon />
+          </button>
+        </div>
+      )}
+      {!realName && !editing && (
+        <p className="mt-3 text-sm leading-relaxed text-amber-200">
+          В стартовом листе служебное имя. Поправьте ФИО карандашом.
+        </p>
+      )}
+      {error && <p className="mt-3 text-sm font-semibold text-rose-300">{error}</p>}
+      <button
+        type="button"
+        className="mt-4 h-14 w-full rounded-2xl bg-cyan-300 text-base font-black text-slate-950 disabled:bg-slate-700 disabled:text-slate-400"
+        disabled={busy || savingName || editing || !realName}
+        onClick={onConfirm}
+      >
+        {busy ? "Записываем…" : "Подтвердить"}
+      </button>
+      <button
+        type="button"
+        className="mt-2 h-12 w-full rounded-xl border border-white/10 text-sm font-black text-slate-200 disabled:opacity-40"
+        disabled={busy || savingName}
+        onClick={onBack}
+      >
+        Другой номер
+      </button>
+    </section>
+  );
+}
+
+function claimSentence(displayName: string): string {
+  const name = displayName.trim().replace(/\s+/g, " ");
+  const sentence = /[.!?…]$/u.test(name) ? name : `${name}.`;
+  return `Вы регистрируетесь как ${sentence} Подтвердить?`;
+}
+
 function AthleteNameField({
   slotId,
   saved,
@@ -747,6 +941,9 @@ function AthleteNameField({
             setError("Не удалось записать ФИО");
             toast("err", "Не удалось записать ФИО");
             return;
+          }
+          if (name !== participant.displayName) {
+            reportNameCorrection(participant.bibNumber, name, participant.displayName);
           }
           setEditing(false);
           toast("ok", "ФИО сохранено");

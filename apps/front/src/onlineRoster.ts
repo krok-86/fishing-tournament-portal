@@ -18,6 +18,21 @@ export async function registerOnline(
   }
 }
 
+/**
+ * Правка опечатки в ФИО после выбора номера.
+ * Телефон уже записал имя в журнал; отчёт уходит в фоне и не держит экран.
+ */
+export function reportNameCorrection(bibNumber: number, displayName: string, previousName: string): void {
+  const name = displayName.trim().replace(/\s+/g, " ");
+  const previous = previousName.trim().replace(/\s+/g, " ");
+  if (!Number.isInteger(bibNumber) || bibNumber < 1 || name.length < 3 || name === previous) return;
+  void fetch(apiUrl("/api/participants/rename"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ bibNumber, displayName: name, previousName: previous }),
+  }).catch(() => undefined);
+}
+
 /** Список ФИО в порядке заявок. Номера 1, 2, 3 лист назначает сам при импорте. */
 export async function loadOnlineNames(): Promise<{ ok: true; names: string[] } | { ok: false; error: string }> {
   try {

@@ -57,6 +57,32 @@ app.post("/api/register", (req, res) => {
 
 attachMatchRoutes(app);
 
+app.post("/api/participants/rename", (req, res) => {
+  const fullName = readFullName(req.body);
+  const previousName = normalizeName(req.body && req.body.previousName);
+  const bibNumber = Number(req.body && req.body.bibNumber);
+  if (fullName.length < 3) {
+    res.status(400).json({ ok: false, error: "Введите ФИО" });
+    return;
+  }
+  if (fullName.length > 120) {
+    res.status(400).json({ ok: false, error: "ФИО слишком длинное" });
+    return;
+  }
+  if (!Number.isInteger(bibNumber) || bibNumber < 1) {
+    res.status(400).json({ ok: false, error: "Неверный номер" });
+    return;
+  }
+
+  const previousKey = previousName.toLocaleLowerCase("ru");
+  const byPrevious = previousKey
+    ? participants.find((item) => item.fullName.toLocaleLowerCase("ru") === previousKey)
+    : undefined;
+  const item = byPrevious ?? participants[bibNumber - 1];
+  if (item) item.fullName = fullName;
+  res.json({ ok: true, bibNumber, fullName });
+});
+
 app.get("/api/participants", (_req, res) => {
   res.json({
     participants: participants.map((item, index) => ({

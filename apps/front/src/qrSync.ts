@@ -476,10 +476,7 @@ export function serializeStartSnapshot(snapshot: StartSnapshot): string {
   const meta = `M\t${escapeField(snapshot.tournamentName.trim())}\t${snapshot.tournamentDate}`;
   const people = [...snapshot.participants]
     .sort((left, right) => left.bibNumber - right.bibNumber)
-    .map(
-      (participant) =>
-        `${participant.bibNumber}\t${escapeField(participant.displayName)}\t${participant.groupId}\t${participant.ghost ? 1 : 0}`,
-    );
+    .map((participant) => rosterPair(participant));
   const lines = new Map<string, string[]>();
   const seats = [...snapshot.seats].sort(
     (left, right) =>
@@ -557,7 +554,9 @@ export function parseStartSnapshot(plain: string): StartDecodeResult {
       tournamentDate = date;
       continue;
     }
-    const [bibText, nameText, groupText, ghostText] = line.split("\t");
+    const roster = readRosterPair(line);
+    if (!roster) return { ok: false, error: "В стартовом коде повреждён участник" };
+    const { bibText, nameText, groupText, ghostText } = roster;
     const bibNumber = Number(bibText);
     const displayName = unescapeField(nameText ?? "").trim();
     if (!Number.isInteger(bibNumber) || bibNumber < 1 || bibNumber > MAX_FISH || displayName.length === 0) {
@@ -630,6 +629,37 @@ export function parseStartSnapshot(plain: string): StartDecodeResult {
       seats,
     },
   };
+}
+
+/** `номер:ФИО`, затем группа и признак фантома. Номер жеребьёвки короче UUID и не раздувает QR. */
+function rosterPair(participant: StartParticipant): string {
+  const name = escapeField(participant.displayName.trim().replace(/\s+/g, " "));
+  return `${participant.bibNumber}:${name}\t${participant.groupId}\t${participant.ghost ? 1 : 0}`;
+}
+
+function readRosterPair(
+  line: string,
+): { bibText: string; nameText: string; groupText: string; ghostText: string } | null {
+  const fields = line.split("\t");
+  const head = fields[0] ?? "";
+  const colon = head.indexOf(":");
+  if (colon > 0 && fields.length >= 3) {
+    return {
+      bibText: head.slice(0, colon),
+      nameText: head.slice(colon + 1),
+      groupText: fields[1] ?? "",
+      ghostText: fields[2] ?? "",
+    };
+  }
+  if (fields.length >= 4 && /^\d+$/.test(head)) {
+    return {
+      bibText: head,
+      nameText: fields[1] ?? "",
+      groupText: fields[2] ?? "",
+      ghostText: fields[3] ?? "",
+    };
+  }
+  return null;
 }
 
 function escapeField(value: string): string {
