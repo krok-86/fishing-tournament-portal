@@ -14,6 +14,52 @@ function connectionString() {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : DEFAULT_URL;
 }
 
+function isLocalDatabase(url) {
+  try {
+    const host = new URL(url).hostname;
+    return host === "localhost" || host === "127.0.0.1";
+  } catch {
+    return /@(?:localhost|127\.0\.0\.1)(?::|\/)/i.test(url);
+  }
+}
+
+function poolConfig(url) {
+  if (isLocalDatabase(url)) return { connectionString: url, max: 5, connectionTimeoutMillis: 8000 };
+  // Supabase требует SSL. sslmode=require в URI у pg проверяет сертификат и рвёт рукопожатие.
+  const connectionString = url.replace(/([?&])sslmode=[^&]*&?/gi, "$1").replace(/[?&]$/, "");
+  return {
+    connectionString,
+    max: 5,
+    connectionTimeoutMillis: 20000,
+    ssl: { rejectUnauthorized: false },
+  };
+}
+
+function openPool(url) {
+  const nextPool = new Pool(poolConfig(url));
+  nextPool.on("error", (error) => {
+    console.error("Archive pool error:", error.message);
+  });
+  return nextPool;
+}
+
+function offlineMessage(error) {
+  const code = error && typeof error === "object" ? error.code : "";
+  const refused =
+    code === "ECONNREFUSED" ||
+    code === "ENOTFOUND" ||
+    code === "ETIMEDOUT" ||
+    code === "ECONNRESET" ||
+    code === "EAI_AGAIN" ||
+    code === "28P01" ||
+    code === "28000" ||
+    code === "3D000" ||
+    code === "53300" ||
+    code === "57P01";
+  if (refused) return "Нет соединения с PostgreSQL. Запустите базу и повторите.";
+  return "Не удалось подготовить таблицу архива. Подробности в журнале сервера.";
+}
+
 function databaseName(url) {
   const match = /\/([^/?]+)(?:\?|$)/.exec(url);
   return match?.[1] ?? "";
@@ -71,6 +117,15 @@ async function ensureDatabase(url) {
   }
 }
 
+async function tableColumns(db) {
+  const found = await db.query(
+    `SELECT column_name
+     FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = 'tournament_archives'`,
+  );
+  return new Set(found.rows.map((row) => row.column_name));
+}
+
 async function ensureTable(nextPool) {
   await nextPool.query(`
     CREATE TABLE IF NOT EXISTS tournament_archives (
@@ -82,6 +137,53 @@ async function ensureTable(nextPool) {
       snapshot JSONB NOT NULL
     )
   `);
+
+  const columns = await tableColumns(nextPool);
+  // Таблица, собранная в редакторе Supabase: date / data / created_at вместо held_on / snapshot / archived_at.
+  if (!columns.has("snapshot")) {
+    await nextPool.query("ALTER TABLE tournament_archives ADD COLUMN snapshot JSONB");
+    if (columns.has("data")) {
+      await nextPool.query(
+        "UPDATE tournament_archives SET snapshot = data WHERE snapshot IS NULL AND data IS NOT NULL",
+      );
+    }
+    await nextPool.query("UPDATE tournament_archives SET snapshot = '{}'::jsonb WHERE snapshot IS NULL");
+    await nextPool.query("ALTER TABLE tournament_archives ALTER COLUMN snapshot SET NOT NULL");
+  }
+  if (!columns.has("archived_at")) {
+    await nextPool.query("ALTER TABLE tournament_archives ADD COLUMN archived_at TIMESTAMPTZ");
+    if (columns.has("created_at")) {
+      await nextPool.query(
+        "UPDATE tournament_archives SET archived_at = created_at WHERE archived_at IS NULL",
+      );
+    }
+    await nextPool.query("UPDATE tournament_archives SET archived_at = NOW() WHERE archived_at IS NULL");
+    await nextPool.query("ALTER TABLE tournament_archives ALTER COLUMN archived_at SET DEFAULT NOW()");
+    await nextPool.query("ALTER TABLE tournament_archives ALTER COLUMN archived_at SET NOT NULL");
+  }
+  if (!columns.has("held_on")) {
+    await nextPool.query("ALTER TABLE tournament_archives ADD COLUMN held_on DATE");
+    if (columns.has("date")) {
+      await nextPool.query(`
+        UPDATE tournament_archives
+        SET held_on = "date"::date
+        WHERE held_on IS NULL AND "date" ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      `);
+    }
+  }
+  // Старые колонки сервер больше не пишет. Иначе INSERT падает, если они NOT NULL.
+  for (const name of ["data", "champion_name"]) {
+    if (!columns.has(name)) continue;
+    await nextPool.query(`ALTER TABLE tournament_archives ALTER COLUMN ${name} DROP NOT NULL`);
+  }
+  if (columns.has("date")) {
+    await nextPool.query(`ALTER TABLE tournament_archives ALTER COLUMN "date" DROP NOT NULL`);
+  }
+  if (columns.has("created_at")) {
+    await nextPool.query("ALTER TABLE tournament_archives ALTER COLUMN created_at SET DEFAULT NOW()");
+    await nextPool.query("ALTER TABLE tournament_archives ALTER COLUMN created_at DROP NOT NULL");
+  }
+
   // Повторная архивация того же соревнования обновляет одну строку, а не копирует её.
   await nextPool.query(`
     DELETE FROM tournament_archives
@@ -98,6 +200,10 @@ async function ensureTable(nextPool) {
     CREATE UNIQUE INDEX IF NOT EXISTS tournament_archives_tournament_id_key
     ON tournament_archives (tournament_id)
   `);
+  // Прямое подключение postgres обходит RLS. Без политик ключ anon из Data API строку не читает.
+  await nextPool.query("ALTER TABLE tournament_archives ENABLE ROW LEVEL SECURITY").catch((error) => {
+    console.error("Archive RLS was not enabled:", error instanceof Error ? error.message : error);
+  });
 }
 
 function readTournamentId(body) {
@@ -173,46 +279,76 @@ async function writeArchive(db, tournamentId, name, heldOn, snapshot) {
   }
 }
 
-async function prepareArchiveStore() {
+/** @type {Promise<void> | null} */
+let connectTask = null;
+
+async function connectArchiveStore() {
   const url = connectionString();
-  const nextPool = new Pool({ connectionString: url, max: 5 });
-  nextPool.on("error", (error) => {
-    console.error("Archive pool error:", error.message);
-  });
+  const nextPool = openPool(url);
   try {
     await ensureTable(nextPool);
   } catch (error) {
     await nextPool.end().catch(() => undefined);
-    if (error && error.code === "3D000") {
-      await ensureDatabase(url);
-      const created = new Pool({ connectionString: url, max: 5 });
-      created.on("error", (poolError) => {
-        console.error("Archive pool error:", poolError.message);
-      });
-      await ensureTable(created);
-      pool = created;
-      ready = true;
-      setupError = "";
-      console.log("Tournament archive table is ready");
-      return;
+    if (error && error.code === "3D000" && isLocalDatabase(url)) {
+      try {
+        await ensureDatabase(url);
+        const created = openPool(url);
+        try {
+          await ensureTable(created);
+        } catch (tableError) {
+          await created.end().catch(() => undefined);
+          throw tableError;
+        }
+        if (pool && pool !== created) await pool.end().catch(() => undefined);
+        pool = created;
+        ready = true;
+        setupError = "";
+        console.log("Tournament archive table is ready");
+        return;
+      } catch (createError) {
+        ready = false;
+        pool = null;
+        setupError = offlineMessage(createError);
+        console.error(
+          "Tournament archive is offline:",
+          createError instanceof Error ? createError.message : createError,
+        );
+        return;
+      }
     }
     ready = false;
-    setupError = "Нет соединения с PostgreSQL. Запустите базу и повторите.";
+    pool = null;
+    setupError = offlineMessage(error);
     console.error("Tournament archive is offline:", error instanceof Error ? error.message : error);
     return;
   }
+  if (pool && pool !== nextPool) await pool.end().catch(() => undefined);
   pool = nextPool;
   ready = true;
   setupError = "";
   console.log("Tournament archive table is ready");
 }
 
+async function prepareArchiveStore() {
+  if (ready && pool) return;
+  if (!connectTask) {
+    connectTask = connectArchiveStore().finally(() => {
+      connectTask = null;
+    });
+  }
+  await connectTask;
+}
+
+async function archiveReady(res) {
+  await prepareArchiveStore();
+  if (ready && pool) return true;
+  res.status(503).json({ ok: false, error: setupError });
+  return false;
+}
+
 function attachArchiveRoutes(app) {
   app.post("/api/tournaments/archive", async (req, res) => {
-    if (!ready || !pool) {
-      res.status(503).json({ ok: false, error: setupError });
-      return;
-    }
+    if (!(await archiveReady(res))) return;
     const problem = snapshotError(req.body);
     if (problem) {
       res.status(400).json({ ok: false, error: problem });
@@ -250,10 +386,7 @@ function attachArchiveRoutes(app) {
   });
 
   app.get("/api/tournaments/archive", async (_req, res) => {
-    if (!ready || !pool) {
-      res.status(503).json({ ok: false, error: setupError });
-      return;
-    }
+    if (!(await archiveReady(res))) return;
     try {
       const found = await pool.query(LIST_SQL);
       res.set("Cache-Control", "no-store");
@@ -273,10 +406,7 @@ function attachArchiveRoutes(app) {
   });
 
   app.delete("/api/tournaments/archive/:id", async (req, res) => {
-    if (!ready || !pool) {
-      res.status(503).json({ ok: false, error: setupError });
-      return;
-    }
+    if (!(await archiveReady(res))) return;
     const id = typeof req.params.id === "string" ? req.params.id : "";
     if (!ID_RE.test(id)) {
       res.status(400).json({ ok: false, error: "Некорректная ссылка на архив" });
@@ -299,10 +429,7 @@ function attachArchiveRoutes(app) {
   });
 
   app.get("/api/tournaments/archive/:id", async (req, res) => {
-    if (!ready || !pool) {
-      res.status(503).json({ ok: false, error: setupError });
-      return;
-    }
+    if (!(await archiveReady(res))) return;
     const id = typeof req.params.id === "string" ? req.params.id : "";
     if (!ID_RE.test(id)) {
       res.status(400).json({ ok: false, error: "Некорректная ссылка на архив" });
