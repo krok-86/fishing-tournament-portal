@@ -7,6 +7,7 @@ import {
   isGhostOpponent,
   playoffMatches,
   projectPlayoff,
+  readTransitionGrid,
   scorePlayoffDuel,
   seedsFromRanking,
   tournamentCalculator,
@@ -960,7 +961,7 @@ export const useMatchStore = create<MatchStore>((set, get) => ({
       if (existing.some((row) => row.event.type === "TOURNAMENT_OPENED")) {
         const stored = existing.map((row) => row.event);
         const snapshot = readSetup(stored);
-        const openedGrid = gridOf(snapshot.participants, snapshot.periodsPerRound);
+        const openedGrid = storedGrid(stored, snapshot.participants, snapshot.periodsPerRound);
         const signal = publishedPeriod(stored);
         set({
           setupSaving: false,
@@ -1847,6 +1848,17 @@ function gridOf(participants: readonly RegisteredParticipant[], periodsCount: nu
   );
 }
 
+/** Пары из журнала. Повторная сборка зависит от внутренних id и на телефоне даёт других соперников. */
+function storedGrid(
+  events: readonly TournamentEvent[],
+  participants: readonly RegisteredParticipant[],
+  periodsCount: number,
+): GridSlot[] {
+  const restored = readTransitionGrid(events);
+  if (restored.length > 0) return restored;
+  return gridOf(participants, periodsCount);
+}
+
 function matrixFromGrid(grid: readonly GridSlot[], participants: readonly RegisteredParticipant[]): MatrixDuel[] {
   const byId = new Map(participants.map((participant) => [participant.slotId, participant]));
   const grouped = new Map<string, GridSlot[]>();
@@ -2538,7 +2550,9 @@ async function readJournal(get: () => MatchStore, set: (partial: Partial<MatchSt
     const participants = snapshot.tournamentOpened
       ? snapshot.participants
       : await healedStartList(tournamentId, snapshot.participants);
-    const grid = snapshot.tournamentOpened ? gridOf(participants, snapshot.periodsPerRound) : [];
+    const grid = snapshot.tournamentOpened
+      ? storedGrid(stored, participants, snapshot.periodsPerRound)
+      : [];
     const signal = snapshot.tournamentOpened
       ? publishedPeriod(stored)
       : { period: 1 as PeriodIndex, phase: "waiting" as const, officiallyStarted: false };
@@ -3241,10 +3255,11 @@ async function importPlayoffGrid(
 
   const rows = await db.events.where("tournamentId").equals(state.tournamentId).sortBy("timestamp");
   const stored = rows.map((row) => row.event);
-  const scored = stored.some((event) => event.type === "PLAYOFF_DUEL_SCORED" || event.type === "PLAYOFF_SIDE_REPORTED");
-  if (state.playoff.formed && scored) {
-    return { ok: false, error: "На телефоне уже другая сетка, в ней есть результаты" };
-  }
+  const replacedTypes = new Set<TournamentEvent["type"]>([
+    "FORM_PLAYOFF",
+    "PLAYOFF_DUEL_SCORED",
+    "PLAYOFF_SIDE_REPORTED",
+  ]);
 
   const timestamp = Date.now();
   const events: TournamentEvent[] = [];
@@ -3275,12 +3290,12 @@ async function importPlayoffGrid(
 
   set({ setupSaving: true, setupError: null, error: null });
   try {
-    const previousForms = rows.filter((row) => row.event.type === "FORM_PLAYOFF").map((row) => row.id);
+    const previousCup = rows.filter((row) => replacedTypes.has(row.event.type)).map((row) => row.id);
     await db.transaction("rw", db.events, async () => {
-      if (previousForms.length > 0) await db.events.bulkDelete(previousForms);
+      if (previousCup.length > 0) await db.events.bulkDelete(previousCup);
       await db.events.bulkAdd(events.map(toRecord));
     });
-    const playoff = projectPlayoff([...stored.filter((event) => event.type !== "FORM_PLAYOFF"), ...events]);
+    const playoff = projectPlayoff([...stored.filter((event) => !replacedTypes.has(event.type)), ...events]);
     set({
       setupSaving: false,
       participants,

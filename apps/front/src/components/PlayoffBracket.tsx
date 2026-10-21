@@ -267,7 +267,7 @@ function PlayoffStartQr() {
     <div id="playoff-start-qr" className="mb-6 rounded-3xl border border-cyan-300/40 bg-slate-900 px-4 py-5 sm:px-6">
       <h3 className="text-xl font-black tracking-tight sm:text-2xl">Стартовый QR-код Плей-офф</h3>
       <p className="mt-2 text-sm leading-relaxed text-slate-300">
-        В коде сжатый топ-8: номер, ФИО и пары 1/4 финала. Финалист сканирует его один раз — телефон записывает сетку и открывает кубковые матчи.
+        В коде сжатый топ-8: номер, ФИО и пары 1/4 финала. Финалист сканирует его, телефон записывает сетку и открывает кубковые матчи. Тот же код можно снять ещё раз: телефон заменит свою сетку плей-офф.
       </p>
       {error && <p className="mt-3 text-sm text-rose-300">{error}</p>}
       {!payload && !error && <p className="mt-3 text-sm text-slate-400">Собираем код…</p>}

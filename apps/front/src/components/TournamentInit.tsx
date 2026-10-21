@@ -463,7 +463,7 @@ function StartQrCard() {
     <div id="start-qr" className="rounded-3xl border border-cyan-300/30 bg-slate-900 px-4 py-4">
       <h3 className="text-lg font-black tracking-tight">Стартовый QR-код турнира</h3>
       <p className="mt-2 text-sm text-slate-300">
-        В коде сжатая сетка Бергера и пары «номер:ФИО» всего стартового листа. Игрок сканирует код один раз и выбирает свой номер — имя подставляется само.
+        В коде сжатая сетка Бергера и пары «номер:ФИО» всего стартового листа. Игрок сканирует код и выбирает свой номер. Если на телефоне сбой, тот же QR можно снять ещё раз: телефон заменит свою сетку.
       </p>
       <p className="mt-2 text-sm font-bold text-cyan-100">
         {officiallyStarted ? periodStatusLabel(period, phase) : "ОЖИДАНИЕ СТАРТА ТУРНИРА (ПЕРИОД 1)"}

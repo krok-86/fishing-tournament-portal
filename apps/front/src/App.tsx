@@ -236,6 +236,7 @@ function PlayerScreen() {
   const adjustFish = useMatchStore((state) => state.adjustFish);
   const confirmPeriod = useMatchStore((state) => state.confirmPeriod);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [drawScan, setDrawScan] = useState<"idle" | "confirm" | "scan">("idle");
 
   return (
     <main className="mx-auto flex min-h-dvh w-full max-w-lg flex-col bg-slate-950 px-3 pt-[max(0.75rem,env(safe-area-inset-top))] pb-[max(0.75rem,env(safe-area-inset-bottom))] text-white sm:px-6">
@@ -258,6 +259,8 @@ function PlayerScreen() {
       ) : tournamentOpened ? (
         <>
         <ConnectedTournament />
+        <RescanDraw mode={drawScan} onMode={setDrawScan} />
+        {drawScan !== "scan" && (
         <JudgeScreen
           sectorLabel={sectorLabel}
           sideLabel={sideLabel}
@@ -275,6 +278,7 @@ function PlayerScreen() {
           adjustFish={adjustFish}
           confirmPeriod={confirmPeriod}
         />
+        )}
         </>
       ) : (
         <AwaitingDraw />
@@ -292,6 +296,67 @@ function ConnectedTournament() {
       <p className="text-lg leading-snug font-black">Успешно подключен к турниру: {tournamentName}</p>
       <p className="mt-1 text-base font-bold">Дата: {formatTournamentDate(tournamentDate)}</p>
     </section>
+  );
+}
+
+function RescanDraw({
+  mode,
+  onMode,
+}: {
+  mode: "idle" | "confirm" | "scan";
+  onMode: (mode: "idle" | "confirm" | "scan") => void;
+}) {
+  const busy = useMatchStore((state) => state.saving || state.setupSaving || state.signalSaving);
+
+  if (mode === "scan") {
+    return (
+      <DrawScanner
+        title="Жеребьёвка заново"
+        hint="Наведите камеру на стартовый QR с ноутбука организатора. Телефон заменит сетку."
+        onCode={takeOrganizerCode}
+        onClose={() => onMode("idle")}
+      />
+    );
+  }
+
+  if (mode === "confirm") {
+    return (
+      <section className="mb-4 rounded-3xl border border-amber-300/40 bg-slate-900 px-4 py-4">
+        <h2 className="text-sm font-bold tracking-wide text-amber-100 uppercase">Сканировать жеребьёвку заново</h2>
+        <p className="mt-2 text-sm leading-relaxed text-slate-300">
+          Телефон забудет текущую сетку, выбранный номер и местные поимки, включая плей-офф. Журнал на ноутбуке организатора не изменится.
+        </p>
+        <button
+          type="button"
+          className="mt-4 h-14 w-full rounded-2xl bg-cyan-300 text-base font-black text-slate-950 disabled:opacity-40"
+          disabled={busy}
+          onClick={() => {
+            primeScanBeep();
+            onMode("scan");
+          }}
+        >
+          Сканировать стартовый QR
+        </button>
+        <button
+          type="button"
+          className="mt-2 h-12 w-full rounded-xl border border-white/10 text-sm font-bold text-slate-300"
+          onClick={() => onMode("idle")}
+        >
+          Отмена
+        </button>
+      </section>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      className="mb-4 h-12 w-full rounded-2xl border border-cyan-300/40 text-sm font-black text-cyan-100 disabled:opacity-40"
+      disabled={busy}
+      onClick={() => onMode("confirm")}
+    >
+      Сканировать жеребьёвку заново
+    </button>
   );
 }
 
@@ -467,6 +532,7 @@ function JudgeScreen({
   const closePlayoffEntry = useMatchStore((state) => state.closePlayoffEntry);
   const qualifyingHandoffReady = useMatchStore((state) => state.qualifyingHandoffReady);
   const [cupScan, setCupScan] = useState(false);
+  const [cupConfirm, setCupConfirm] = useState(false);
   const playoffFormed = playoff.formed;
   const playerNamedSlotIds = useMatchStore((state) => state.playerNamedSlotIds);
   const identitySlotId = playoffFormed ? selfSlotId : athleteSlotId;
@@ -514,37 +580,38 @@ function JudgeScreen({
 
       <PeriodStatus playoffFormed={playoffFormed} period={period} />
 
-      {!playoffFormed && qualifyingHandoffReady && (
+      {!playoffFormed && qualifyingHandoffReady && !cupScan && (
         <div className="mt-4">
-          {cupScan ? (
-            <DrawScanner
-              title="Сетка Плей-офф"
-              hint="Наведите камеру на стартовый QR плей-офф с ноутбука организатора."
-              placeholder="FTPC1.…"
-              onCode={takePlayoffGrid}
-              onClose={() => setCupScan(false)}
-            />
-          ) : (
-            <>
-              <button
-                type="button"
-                className="h-16 w-full rounded-2xl bg-cyan-300 text-lg font-black text-slate-950"
-                onClick={() => {
-                  primeScanBeep();
-                  setCupScan(true);
-                }}
-              >
-                Сканировать сетку Плей-офф
-              </button>
-              <p className="mt-2 text-center text-sm leading-relaxed text-slate-300">
-                8 периодов отбора закрыты. Код с ноутбука орга запишет топ-8 и пары 1/4 в этот телефон.
-              </p>
-            </>
-          )}
+          <button
+            type="button"
+            className="h-16 w-full rounded-2xl bg-cyan-300 text-lg font-black text-slate-950"
+            onClick={() => {
+              primeScanBeep();
+              setCupScan(true);
+            }}
+          >
+            Сканировать сетку Плей-офф
+          </button>
+          <p className="mt-2 text-center text-sm leading-relaxed text-slate-300">
+            8 периодов отбора закрыты. Код с ноутбука орга запишет топ-8 и пары 1/4 в этот телефон.
+          </p>
         </div>
       )}
 
-      {playoffFormed && (
+      {cupScan && (
+        <DrawScanner
+          title={playoffFormed ? "Сетка плей-офф заново" : "Сетка Плей-офф"}
+          hint="Наведите камеру на стартовый QR плей-офф с ноутбука организатора."
+          placeholder="FTPC1.…"
+          onCode={takePlayoffGrid}
+          onClose={() => {
+            setCupScan(false);
+            setCupConfirm(false);
+          }}
+        />
+      )}
+
+      {playoffFormed && !cupScan && (
         <>
         <label className="mt-4 block rounded-3xl bg-slate-900 px-4 py-4" htmlFor="playoff-match">
           <span className="text-sm font-bold tracking-wide text-cyan-100/80 uppercase">Кубковая пара</span>
@@ -578,6 +645,40 @@ function JudgeScreen({
             onClick={() => openPlayoffEntry(selectedPlayoffMatchId)}
           >
             Ввести поимки
+          </button>
+        )}
+        {cupConfirm ? (
+          <section className="mt-4 rounded-3xl border border-amber-300/40 bg-slate-900 px-4 py-4">
+            <p className="text-sm leading-relaxed text-slate-300">
+              Телефон заменит сетку плей-офф. Кубковые поимки на этом телефоне сотрутся. Результаты отбора останутся.
+            </p>
+            <button
+              type="button"
+              className="mt-4 h-14 w-full rounded-2xl bg-cyan-300 text-base font-black text-slate-950 disabled:opacity-40"
+              disabled={saving}
+              onClick={() => {
+                primeScanBeep();
+                setCupScan(true);
+              }}
+            >
+              Сканировать сетку заново
+            </button>
+            <button
+              type="button"
+              className="mt-2 h-12 w-full rounded-xl border border-white/10 text-sm font-bold text-slate-300"
+              onClick={() => setCupConfirm(false)}
+            >
+              Отмена
+            </button>
+          </section>
+        ) : (
+          <button
+            type="button"
+            className="mt-3 h-12 w-full rounded-2xl border border-cyan-300/40 text-sm font-black text-cyan-100 disabled:opacity-40"
+            disabled={saving}
+            onClick={() => setCupConfirm(true)}
+          >
+            Сканировать сетку заново
           </button>
         )}
         </>
